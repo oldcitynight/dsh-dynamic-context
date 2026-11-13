@@ -1,0 +1,38 @@
+name: Direct fake-backend tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22.x', '24.x']
+    env:
+      TMPDIR: ${{ github.workspace }}/.test-tmp
+      DSH_HOME: ${{ github.workspace }}/.test-home/dsh
+      DSH_AGENTS_HOME: ${{ github.workspace }}/.test-home/agents
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Prepare isolated test tools and directories
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap ripgrep util-linux
+          mkdir -p "$TMPDIR" "$DSH_HOME" "$DSH_AGENTS_HOME"
+          # Ubuntu's runner policy can prohibit unprivileged user namespaces.
+          # This only changes the disposable CI machine used for sandbox tests.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci
+      - run: npm test
+      - run: npm pack --dry-run

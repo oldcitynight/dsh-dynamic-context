@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tgz
+.npmrc
+.env
+.env.*
+.test-tmp/
+.test-home/
+coverage/
+npm-debug.log*

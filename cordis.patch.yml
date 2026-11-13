@@ -1,0 +1,5 @@
+- insert:
+    - id: dsh-dynamic-context
+      name: dsh-dynamic-context
+      config:
+        enabled: false

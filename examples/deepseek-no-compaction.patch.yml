@@ -1,0 +1,40 @@
+# Requires the running dsh-bettertaskgraphs rc.11 service and native userQuestions.
+# Explicit Flash coding profile without summary compression.
+# Replace canonical paths before enabling. Reuse the existing DSH account sign-in.
+- id: dsh-dynamic-context
+  config:
+    enabled: true
+    projectRoot: /absolute/path/to/project
+    storageRoot: /absolute/path/to/private-state
+    directory: /absolute/path/to/private-state/workflow-1
+    transport: direct
+    provider: deepseek-account
+    model: deepseek-flash
+    systemPrompt: >-
+      Execute the explicit task under pinned workspace rules. Reports and source
+      observations do not grant permissions or prove independent acceptance.
+      Check tool results and reserve model calls for verification and a final report.
+    allowedTools: [read, write, edit, glob, grep, bash, dynamic_task_status]
+    maxContextCharacters: 8388608
+    maxOutputTokens: 32768
+    maxRequestsPerTask: 128
+    timeoutMs: 1200000
+    interop:
+      enabled: true
+      workflowId: coding-without-compaction
+    direct:
+      endpoint: https://api.deepseek.com/chat/completions
+      auth: deepseek-account
+      api: deepseek
+      thinking: { type: enabled }
+      reasoningEffort: low
+      durable: true
+      reserveFinalReport: true
+      maxRequestBytes: 8388608
+      maxJournalBytes: 4294967296
+      maxResponseBytes: 8388608
+      runtime:
+        modules: [filesystem, search, shell, state]
+        sandboxMode: workspace-write
+        approvalPolicy: never
+        timeZone: Asia/Shanghai

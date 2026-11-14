@@ -9,10 +9,9 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import TaskGraph from 'dsh-bettertaskgraphs'
-import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Filesystem from '@deepseek-ai/dsh-fs-sandbox'
-import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 import * as DynamicContext from '../index.mjs'
 import { startFakeLlama } from './fake-llama.mjs'
 
@@ -50,7 +49,6 @@ export async function createHarness({ projectRoot, directory, respond, config = 
     if (taskGraph && !ctx.get('transactionGraph')) {
       if (!ctx.get('sandboxPolicy')) await ctx.plugin(SandboxPolicy, { mode: 'workspace-write', workspaceRoot: projectRoot })
       if (!ctx.get('fs')) await ctx.plugin(Filesystem, { cwd: projectRoot })
-      if (!ctx.get('workingDirectory')) await ctx.plugin(WorkingDirectory, { defaultDirectory: projectRoot })
       if (!ctx.get('sessionPersistence')) await ctx.plugin(Persistence, { root: directory + '/native-sessions' })
       await ctx.plugin(TaskGraph, { projectRoot })
     }

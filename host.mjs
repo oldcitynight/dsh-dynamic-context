@@ -19,7 +19,7 @@ import Shell from '@deepseek-ai/dsh-bash-sandbox'
 import * as ShellEnv from '@deepseek-ai/dsh-shell-env'
 import Skills from '@deepseek-ai/dsh-skill'
 import * as Observations from '@deepseek-ai/dsh-fs-observation-policy'
-import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TaskGraph from 'dsh-bettertaskgraphs'
 import * as DynamicContext from './index.mjs'
 

@@ -58,6 +58,37 @@ test('interop cannot be disabled to bypass the required base', () => {
   assert.throws(() => validateConfig({ projectRoot: '/tmp', directory: '/tmp/state', provider: 'x', model: 'x', transport: 'direct', systemPrompt: 'x', direct: { endpoint: 'http://127.0.0.1:1/chat/completions' }, interop: { enabled: false } }))
 })
 
+test('forked chats remain controllers while delegated and direct worker sessions are excluded', async t => {
+  const f = await fixture(t, { respond: () => {
+    const worker = f.h.ctx.agents.list().find(agent => agent.session.snapshotEvents()
+      .some(event => event.type === 'plugin:dynamic-context/execution-host-v1'))
+    assert.ok(worker)
+    assert.throws(() => f.h.runner.interaction.exact(worker), /DYNAMIC_CONTEXT_ROOT_CONTROLLER_REQUIRED/)
+    const input = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Synthetic competing input' }] })
+    assert.throws(() => worker.send(input, 'next-turn', true), /DIRECT_RUNTIME_NATIVE_MESSAGE_DISABLED/)
+    return { text: 'Scoped worker result.' }
+  } })
+  const { agent: parent } = await f.agent('controller-parent')
+  const seed = parent.session.snapshotEvents()
+  const fork = await f.h.ctx.agents.create({ sessionId: 'controller-fork', seed, inheritedEventCount: seed.length,
+    agentOptions: { provider: 'dynamic-context-fake', model: 'fake-llama' },
+    meta: { cwd: f.projectRoot, parentSession: parent.id, isSeeded: true } })
+  t.after(() => fork.dispose())
+  const delegated = await f.h.ctx.agents.create({ sessionId: 'controller-delegated',
+    meta: { cwd: f.projectRoot, parentSession: parent.id, origin: 'subagent', delegationDepth: 1 } })
+  t.after(() => delegated.dispose())
+  const initial = agent => f.h.ctx.systemPrompt.assemble({ agent, scope: agent })
+  assert.match(JSON.stringify(await initial(fork.agent)), /任务图与动态上下文使用指引/)
+  assert.doesNotMatch(JSON.stringify(await initial(delegated.agent)), /任务图与动态上下文使用指引/)
+  await assert.rejects(f.call(delegated.agent, 'dynamic_context_select_mode', { reason: '项目级工作' }),
+    /DYNAMIC_CONTEXT_ROOT_CONTROLLER_REQUIRED/)
+  assert.equal(f.questions.length, 0)
+  await f.call(fork.agent, 'dynamic_context_select_mode', { reason: '项目级工作' })
+  await f.call(fork.agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  assert.equal((await f.call(fork.agent, 'dynamic_context_run_next', { expectedRevision: 1 })).revision, 3)
+  assert.equal(f.questions.length, 1)
+})
+
 for (const mode of ['native', 'task-graph', 'full']) test(`human choice ${mode} controls only its own session`, async t => {
   const f = await fixture(t, { choice: mode, revision: true })
   const first = await f.agent('first', 'FIRST_TASK_CONTRACT'), second = await f.agent('second', 'SECOND_TASK_CONTRACT')

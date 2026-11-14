@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { SessionId, appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DynamicContextGraph, fail } from './core.mjs'
@@ -367,8 +368,10 @@ export class DynamicContextRuntime {
       } else {
         handle = await this.ctx.agents.create({ sessionId, signal: control.signal,
           agentOptions: { provider: this.config.provider, model: this.config.model, maxTokens: this.config.maxOutputTokens },
-          setup: agentCtx => {
-            agentCtx.tools.presentAs('native')
+          setup: async (agentCtx, agent) => {
+            await agentCtx.plugin(NativeExecutor)
+            appendPluginRecord(agent.session, 'plugin:dynamic-context/execution-host-v1',
+              { taskId: assembly.task.id, contextVersion: assembly.contextVersion, transport: 'native-guarded' })
             agentCtx.tools.restrict({ allow: assembly.tools })
             agentCtx.tools.guard(exec => contract.checkExecution(exec, agentCtx.tools))
             agentCtx.on('tools/result', (exec, result) => { contract.recordToolResult(exec, result) })

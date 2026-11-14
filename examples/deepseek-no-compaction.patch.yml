@@ -1,4 +1,4 @@
-# Requires the running dsh-bettertaskgraphs rc.11 service and native userQuestions.
+# Requires the running dsh-bettertaskgraphs 0.3.0-rc.13 service and native userQuestions.
 # Explicit Flash coding profile without summary compression.
 # Replace canonical paths before enabling. Reuse the existing DSH account sign-in.
 - id: dsh-dynamic-context

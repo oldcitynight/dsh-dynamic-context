@@ -1,3 +1,13 @@
+# 0.1.1-rc.30 — DSH compatibility line
+
+- Pin this build to its listed DSH releases and pair it with the other plugin on RC slot 0.
+- Use the native Session plugin record API.
+
+# 0.1.0-rc.26 — DSH 0.2.2-rc.3 compatibility (2026-11-14)
+
+- Use scoped native tool execution and per-step tool admission for direct tasks.
+- Mount the current account service, preserve file observation per worker, and verify root controller boundaries.
+
 # 0.1.0-rc.24 — task-graph prerequisite and graph provenance (2026-11-13)
 
 - Require the live task-graph extension contract; move joint revision implementation out of the base plugin.

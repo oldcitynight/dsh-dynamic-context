@@ -115,7 +115,7 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 export const validateConfig = input => configSchema.parse(input)
 function durableConfigHash(config, meter) {
   const files = ['index.mjs', 'core.mjs', 'request-policy.mjs', 'direct-channel.mjs', 'direct-http.mjs', 'native-compaction.mjs', 'dsh-compaction-policy.mjs', 'direct-runtime.mjs', 'execution-privacy.mjs', 'durable-store.mjs', 'checkpoints.mjs',
-    'control-tools.mjs', 'evidence-policy.mjs', 'adapter-bridge.mjs', 'interop.mjs', 'api-protocol.mjs', 'direct-auth.mjs', 'administration.mjs', 'host.mjs', 'revision-runtime.mjs', 'role-context.mjs', 'report-evidence.mjs', 'supervision-state.mjs', 'supervision-semantics.mjs', 'supervision-runtime.mjs', 'revision.mjs', 'revision-host.mjs', 'revision-report.mjs', 'artifacts.mjs', 'interaction.mjs', 'graph-presence.mjs', 'package.json']
+    'control-tools.mjs', 'format-examples.mjs', 'evidence-policy.mjs', 'adapter-bridge.mjs', 'interop.mjs', 'api-protocol.mjs', 'direct-auth.mjs', 'administration.mjs', 'host.mjs', 'revision-runtime.mjs', 'role-context.mjs', 'report-evidence.mjs', 'supervision-state.mjs', 'supervision-semantics.mjs', 'supervision-runtime.mjs', 'revision.mjs', 'revision-host.mjs', 'revision-report.mjs', 'artifacts.mjs', 'interaction.mjs', 'graph-presence.mjs', 'package.json']
   const external = ['dsh-better-task-grapth/core', 'dsh-better-task-grapth/store', 'dsh-better-task-grapth/host', 'dsh-better-task-grapth/interop', 'dsh-better-task-grapth/extensions', '@deepseek-ai/dsh-token-meter/estimate']
   return digest({ config: JSON.parse(JSON.stringify(config)), meter: meter ? { version: meter.version, implementation: sha256(Function.prototype.toString.call(meter.measure)),
     observer: meter.observe ? sha256(Function.prototype.toString.call(meter.observe)) : null } : null, code: [
@@ -243,7 +243,10 @@ export class DynamicContextRuntime {
     if (this.config.supervision && this.config.supervisionContext === 'reports' && !proposal.planningReport) fail('SUPERVISION_PLANNING_REPORT_REQUIRED')
     if (this.closed || this.busy) fail('DYNAMIC_CONTEXT_RUNNER_UNAVAILABLE')
     for (const binding of proposal?.contextGraph?.bindings ?? []) {
-      if ((binding.tools ?? []).some(tool => !this.config.allowedTools.includes(tool))) fail('CONTEXT_CANNOT_GRANT_TOOL_PERMISSION')
+      const unauthorized = (binding.tools ?? []).filter(tool => !this.config.allowedTools.includes(tool))
+      if (unauthorized.length) fail('CONTEXT_CANNOT_GRANT_TOOL_PERMISSION', {
+        task: binding.task, field: 'contextGraph.bindings[].tools', unauthorized, allowedTools: this.config.allowedTools,
+      })
       if (this.config.direct?.compaction && this.config.direct.compaction.strategy !== 'dsh-native' && !(binding.tools ?? []).includes('dynamic_context_source_read')) fail('DIRECT_COMPACTION_REQUIRES_SOURCE_READER_BINDING')
       if (this.config.transport === 'direct' && !this.config.direct.runtime && (binding.tools ?? []).some(tool => !this.config.direct.agentlessTools.includes(tool))) fail('DIRECT_TOOL_REQUIRES_EXPLICIT_AGENTLESS_PERMISSION')
     }

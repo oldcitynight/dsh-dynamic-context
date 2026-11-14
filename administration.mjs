@@ -2,8 +2,8 @@
 import fs from 'node:fs'
 import { supervisionAuthority } from './supervision-runtime.mjs'
 import path from 'node:path'
-import { digest } from 'dsh-bettertaskgraphs/core'
-import { artifactProof } from 'dsh-bettertaskgraphs/host'
+import { digest } from 'dsh-better-task-grapth/core'
+import { artifactProof } from 'dsh-better-task-grapth/host'
 import { DirectJournal, acquireDirectLease } from './durable-store.mjs'
 import { fail } from './core.mjs'
 

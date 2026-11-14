@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import TaskGraphPlugin from 'dsh-bettertaskgraphs'
+import TaskGraphPlugin from 'dsh-better-task-grapth'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 
 async function fixture(t, { late = false, workflowOnly = false, respond, setup } = {}) {

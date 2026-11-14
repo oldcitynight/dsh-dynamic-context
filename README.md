@@ -1,10 +1,10 @@
 # dsh-dynamic-context：动态上下文与受控请求通道
 
-本构建版本为 `0.1.1-rc.39`。适用宿主和配套版本见 [兼容清单](DSH-COMPATIBILITY.json)。
+本构建版本为 `0.1.1-rc.49`。适用宿主和配套版本见 [兼容清单](DSH-COMPATIBILITY.json)。
 
-分支 `0.1.7-rc.1` 对应 npm 标签 `dsh-0.1.7-rc.1`，适用于 DSH `0.1.7-rc.1`、`0.1.7-alpha.2`，Node.js 要求为 `^22.19.0 || >=24.0.0`。请在同一 DSH profile 先安装 `dsh-bettertaskgraphs@0.3.1-rc.39`，再安装 `dsh-dynamic-context@0.1.1-rc.39`。Bundle 初装默认关闭，完成配置并启用后为新对话提供会话模式选择。
+分支 `0.1.7-rc.1` 对应 npm 标签 `dsh-0.1.7-rc.1`，适用于 DSH `0.1.7-rc.1`、`0.1.7-alpha.2`，Node.js 要求为 `^22.19.0 || >=24.0.0`。请在同一 DSH profile 先安装 `dsh-better-task-grapth@0.3.1-rc.49`，再安装 `dsh-dynamic-context@0.1.1-rc.49`。Bundle 初装默认关闭，完成配置并启用后为新对话提供会话模式选择。
 
-前置插件：[dsh-bettertaskgraphs](https://github.com/oldcitynight/dsh-bettertaskgraphs)。开源协议为 GPL-3.0-only；复制的 DeepSeek 压缩策略另保留原 MIT 声明。验证范围和独立测试方法见 [VALIDATION.md](VALIDATION.md)。GitHub 源码发布与 npm 包发布是不同步骤，当前候选可从源码构建安装包。
+前置插件：[dsh-better-task-grapth](https://github.com/oldcitynight/dsh-better-task-grapth)。开源协议为 GPL-3.0-only；复制的 DeepSeek 压缩策略另保留原 MIT 声明。验证范围和独立测试方法见 [VALIDATION.md](VALIDATION.md)。GitHub 源码发布与 npm 包发布是不同步骤，当前候选可从源码构建安装包。
 
 ## 从源码构建
 
@@ -17,7 +17,7 @@ TMPDIR="$PWD/.test-tmp" npm test
 npm run pack:bundle
 ```
 
-源码构建依赖任务图 `0.3.1-rc.39`。该版本发布前，先将同一批次的任务图 tarball 加入 npm 缓存，再执行 npm ci。运行配置见 `examples/`。
+源码构建依赖任务图 `0.3.1-rc.49`。该版本发布前，先将同一批次的任务图 tarball 加入 npm 缓存，再执行 npm ci。运行配置见 `examples/`。
 
 候选包的独立支持范围是 direct。`native-guarded` 仅为开发对照，依赖另行安装的 context-guard wire hook；干净 DSH 没有该补丁时，在认领任务和创建执行 Agent 前拒绝运行。发布包不修改 DSH 适配器来启用该对照通道。
 
@@ -25,7 +25,7 @@ npm run pack:bundle
 
 ## 已实现的范围
 
-- 通过程序接口 `submit({ taskGraph, contextGraph })` 一次提交任务图、上下文节点和逐任务绑定。复用 `dsh-bettertaskgraphs` 的公开核心、持久化与 CAS；两张图及报告位于一个原子提交的私有文件中。
+- 通过程序接口 `submit({ taskGraph, contextGraph })` 一次提交任务图、上下文节点和逐任务绑定。复用 `dsh-better-task-grapth` 的公开核心、持久化与 CAS；两张图及报告位于一个原子提交的私有文件中。
 - 上下文节点可继承其他上下文节点。程序生成 ID，检查引用、循环和重复绑定；装配时按父节点先行的顺序去重展开，仅包含当前叶任务声明的上下文。
 - 每个任务绑定自己的操作说明、上下文集合、前序报告和可见工具。报告继承只允许引用任务依赖中的前序叶任务，并在使用时核对已提交状态及原始执行记录的 SHA256。报告文本由程序原样复制。
 - 宿主通过 `systemPrompt` 提供完整固定约束，通过 `allowedTools` 给出权限上限。上下文图不能声明 system/developer 角色，也不能扩大工具权限；模型侧工具可见范围和执行时限制使用同一份任务绑定。
@@ -34,6 +34,17 @@ npm run pack:bundle
 - direct 可显式启用持久检查点、协作式暂停和安全边界恢复，以及带原文归档的提取式历史压缩。已确认完成的工具不会因恢复而重放；结果未知的 HTTP 或工具调用继续阻塞。
 
 ## 请求校验
+
+### 运行中共享上下文
+
+在联合提案的 `contextGraph.nodes` 中为可更新的数据节点添加 `mutable: true`，例如 `{key:"reference_location",content:"docs/index.md",parents:[],mutable:true}`。通过现有上下文绑定将它分配给需要该事实的叶。在 direct 执行的 `state` 模块、宿主 `allowedTools` 和该叶的工具绑定中启用以下能力。
+
+- `dynamic_context_shared_update({id, content, reason?})` 直接应用新内容，返回稳定 ID、递增版本及本次修改的回执。程序记录原值、各次修订和对应的叶与调用。修改即生效，无事实审核或审批步骤。
+- `dynamic_context_shared_read({id, revision?})` 读取当前内容或指定历史版本，并返回最新版本号。新叶装入其所绑定节点的当前内容。正在执行的叶从工具回执取得更新，已发送的消息、旧报告及恢复时的初始上下文保留原版本。
+
+共享条目是项目数据。调整任务范围、依赖、验收标准或工具授权由原有图修订渠道处理。旧版本已有的普通节点沿用静态语义，可在结构修订时为后续叶添加可更新的节点。报告修复继续装入完整的本叶执行证据。
+
+### 请求契约
 
 任务开始时固定上下文版本、宿主提示、初始任务消息、完整工具定义、模型路由和输出上限，生成请求契约 hash。原生通道在模型调用入口校验以下内容：
 

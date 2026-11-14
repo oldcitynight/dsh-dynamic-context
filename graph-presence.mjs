@@ -2,8 +2,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { digest, copy, GraphError } from 'dsh-bettertaskgraphs/core'
-import { FileGraphStore } from 'dsh-bettertaskgraphs/store'
+import { digest, copy, GraphError } from 'dsh-better-task-grapth/core'
+import { FileGraphStore } from 'dsh-better-task-grapth/store'
 
 const fail = (code, presence) => { const error = new GraphError(code); error.presence = presence; throw error }
 export const GRAPH_COMMIT_RECORD = 'plugin:dsh-dynamic-context/graphs-committed-v1'

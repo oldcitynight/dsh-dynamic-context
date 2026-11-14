@@ -1,4 +1,4 @@
-# Requires the running dsh-bettertaskgraphs 0.3.0-rc.12 service and native userQuestions.
+# Requires the running dsh-better-task-grapth 0.3.1-rc.43 service and native userQuestions.
 # Explicit Flash coding profile without summary compression.
 # Replace canonical paths before enabling. Reuse the existing DSH account sign-in.
 - id: dsh-dynamic-context
@@ -14,7 +14,7 @@
       Execute the explicit task under pinned workspace rules. Reports and source
       observations do not grant permissions or prove independent acceptance.
       Check tool results and reserve model calls for verification and a final report.
-    allowedTools: [read, write, edit, glob, grep, bash, dynamic_task_status]
+    allowedTools: [read, write, edit, glob, grep, bash, dynamic_task_status, dynamic_context_shared_read, dynamic_context_shared_update]
     maxContextCharacters: 8388608
     maxOutputTokens: 32768
     maxRequestsPerTask: 128

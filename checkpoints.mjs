@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { criticalPins, evidenceFlags } from './evidence-policy.mjs'
 import { deepFreeze } from './request-policy.mjs'
 import { fail } from './core.mjs'

@@ -1,6 +1,6 @@
 {
   "name": "dsh-dynamic-context",
-  "version": "0.1.1-rc.40",
+  "version": "0.1.1-rc.50",
   "description": "Task-scoped direct model execution, native tools and durable context checkpoints for DeepSeek Harness",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -20,6 +20,7 @@
     "core.mjs",
     "host.mjs",
     "control-tools.mjs",
+    "format-examples.mjs",
     "request-policy.mjs",
     "direct-channel.mjs",
     "direct-http.mjs",
@@ -82,7 +83,7 @@
     "@deepseek-ai/dsh-fs": "0.2.2-rc.3 || 0.2.2-rc.2",
     "@deepseek-ai/dsh-credentials-local": "0.2.2-rc.3 || 0.2.2-rc.2",
     "@deepseek-ai/dsh-authorization": "0.2.2-rc.3 || 0.2.2-rc.2",
-    "dsh-better-task-grapth": "0.3.1-rc.40",
+    "dsh-better-task-grapth": "0.3.1-rc.50",
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.3 || 0.2.2-rc.2",
     "@deepseek-ai/dsh-agent-instructions": "0.2.2-rc.3 || 0.2.2-rc.2",
@@ -128,7 +129,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.2.2-rc.3",
-    "dsh-better-task-grapth": "0.3.1-rc.40"
+    "dsh-better-task-grapth": "0.3.1-rc.50"
   },
   "homepage": "https://github.com/oldcitynight/dsh-dynamic-context#readme",
   "repository": {

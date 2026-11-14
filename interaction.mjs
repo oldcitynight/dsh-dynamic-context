@@ -9,6 +9,7 @@ import { connectTaskGraph } from './interop.mjs'
 import { registerControlTools } from './control-tools.mjs'
 import { REVISION_CONTEXTS } from './revision.mjs'
 import { GRAPH_COMMIT_RECORD } from './graph-presence.mjs'
+import { jsonExample } from './format-examples.mjs'
 
 export const MODE_RECORD = 'plugin:dsh-dynamic-context/mode-v1'
 export const MODE_OPTIONS = Object.freeze([
@@ -92,7 +93,10 @@ export class SessionInteraction {
           + (runner.config.supervision ? '\n每个叶绑定 completion。执行后提交成果报告，监督受理与计划倒查由联动流程串行执行；按 status 的 legalNext 继续。' : '')
       } })
     ctx.tools.register(defineTool({ name: 'dynamic_context_select_mode',
-      description: 'Ask the user to choose native, standalone task graph, or full task/context graphs. An existing explicit user choice may be bound using its exact userMessageId and quote; model claims alone cannot approve a mode. Repeated calls return the existing choice unless reconsider=true.',
+      description: 'Ask the user to choose native, standalone task graph, or full task/context graphs. An existing explicit user choice may be bound using its exact userMessageId and quote. Use the actual message ID and verbatim text. Repeated calls return the existing choice unless reconsider=true.\n'
+        + jsonExample('Ask the user', { reason: 'The project has several dependent stages.' }) + '\n'
+        + jsonExample('Bind an explicit choice already present in the conversation', { reason: 'The user chose full mode.',
+          explicit: { mode: 'full', userMessageId: 'example-message', quote: '启用完整任务图功能' } }),
       parameters: { reason: { type: 'string', required: true }, reconsider: { type: 'boolean' },
         explicit: { type: 'object', properties: { mode: { type: 'string', required: true, enum: ['native', 'task-graph', 'full'] },
           userMessageId: { type: 'string', required: true }, quote: { type: 'string', required: true } }, additionalProperties: false } },
@@ -100,7 +104,7 @@ export class SessionInteraction {
       execute: (args, exec) => this.select(exec.agent, args, exec.signal),
     }), { when: ({ agent }) => this.isController(agent) })
     ctx.tools.register(defineTool({ name: 'dynamic_context_graph_status',
-      description: 'Distinguish graphs never created from a previously committed graph that is missing or invalid. Recovery-required workflows cannot be downgraded or recreated.',
+      description: 'Distinguish graphs never created from a previously committed graph that is missing or invalid. Recovery is required before continuing a damaged workflow.\n' + jsonExample('Read graph presence', {}),
       parameters: {}, projectPlanCapability: 'read_or_protocol',
       output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
       execute: (_args, exec) => { this.exact(exec.agent); return { mode: this.mode(exec.agent), base: this.basePresence(exec.agent),

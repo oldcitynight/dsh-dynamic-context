@@ -7,6 +7,7 @@ import UserQuestions from '@deepseek-ai/dsh-user-questions'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TaskGraph from 'dsh-better-task-grapth'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { DynamicContextRuntime, validateConfig } from '../index.mjs'
 import { MODE_OPTIONS, MODE_RECORD } from '../interaction.mjs'
@@ -278,4 +279,49 @@ for (const full of [false, true]) test(`native tool loop reaches ${full ? 'joint
     assert.equal((await f.call(controller, 'dynamic_context_select_mode', { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
   }
   assert.equal(f.questions.length, 1)
+})
+
+test('the native planner receives a usable joint template and specific tool and topology feedback', async t => {
+  let step = 0, accepted
+  const f = await fixture(t, { respond: ({ payload }) => {
+    const tools = payload.tools?.map(row => row.function) ?? []
+    const call = (name, args) => ({ tools: [{ name, arguments: args }] })
+    step++
+    if (step === 1) return call('dynamic_context_select_mode', { reason: 'Project-sized task' })
+    if (step === 2) {
+      for (const tool of tools.filter(row => row.name.startsWith('dynamic_context_'))) {
+        const samples = [...tool.description.matchAll(/```json\n([^\n]+)\n```/g)].map(match => JSON.parse(match[1]))
+        assert.ok(samples.length, tool.name)
+        for (const args of samples) assert.deepEqual(validateJsonSchemaValue(tool.parameters, args, ''), [], tool.name)
+      }
+      const doc = tools.find(row => row.name === 'dynamic_context_submit').description
+      assert.match(doc, /Leaf tool allowlist for this workflow: \["read","write"/)
+      accepted = JSON.parse(doc.match(/```json\n([^\n]+)\n```/)[1])
+      const denied = structuredClone(accepted)
+      denied.proposal.contextGraph.bindings[0].tools = ['fixture_forbidden']
+      return call('dynamic_context_submit', denied)
+    }
+    if (step === 3) {
+      const feedback = JSON.stringify(payload.messages.at(-1))
+      for (const text of ['CONTEXT_CANNOT_GRANT_TOOL_PERMISSION', 'inspect', 'fixture_forbidden', 'allowedTools']) assert.ok(feedback.includes(text), feedback)
+      const invalid = structuredClone(accepted)
+      delete invalid.proposal.taskGraph.nodes[1].parent
+      invalid.proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'root', to: 'inspect' })
+      return call('dynamic_context_submit', invalid)
+    }
+    if (step === 4) {
+      const feedback = JSON.stringify(payload.messages.at(-1))
+      for (const text of ['PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', 'leavesNeedingRootParent', 'edgesTouchingRoot', 'inspect']) assert.ok(feedback.includes(text), feedback)
+      return call('dynamic_context_submit', accepted)
+    }
+    return { text: 'The documented template passed graph validation.' }
+  } })
+  const { agent } = await f.agent('documented-joint-graph', null)
+  agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Plan and check this project task.' }] }))
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(step, 5)
+  const state = f.h.runner.interaction.entries.get(agent).runner.graph.read()
+  assert.equal(state.revision, 1)
+  assert.equal(state.graph.state.plan.edges.length, 1)
 })

@@ -33,6 +33,27 @@ jobs:
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - run: npm ci
+      - name: Cache the exact task-graph Bundle
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict'
+          import { createHash } from 'node:crypto'
+          import { readFileSync } from 'node:fs'
+          import { execFileSync } from 'node:child_process'
+          import { resolve } from 'node:path'
+          const name = 'dsh-better-task-grapth'
+          const { peerDependencies } = JSON.parse(readFileSync('package.json'))
+          const { packages } = JSON.parse(readFileSync('package-lock.json'))
+          const { version, integrity } = packages['node_modules/' + name]
+          assert.equal(version, peerDependencies[name])
+          assert.match(version, /^\d+\.\d+\.\d+-rc\.\d+$/)
+          const file = name + '-' + version + '.tgz'
+          const url = 'https://github.com/oldcitynight/' + name + '/releases/download/v' + version + '/' + file
+          const local = resolve(process.env.TMPDIR, file)
+          execFileSync('curl', ['--fail', '--silent', '--show-error', '--location', '--retry', '4', '--output', local, url], { stdio: 'inherit' })
+          assert.equal('sha512-' + createHash('sha512').update(readFileSync(local)).digest('base64'), integrity)
+          execFileSync('npm', ['cache', 'add', local], { stdio: 'inherit' })
+          NODE
+      - run: npm ci --prefer-offline
       - run: npm test
       - run: npm pack --dry-run

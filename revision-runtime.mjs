@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { fetch } from 'undici'
-import { digest, view, GraphError } from 'dsh-bettertaskgraphs/core'
+import { digest, view, GraphError } from 'dsh-better-task-grapth/core'
 import { ZodError } from 'zod'
 import { RevisionCoordinator, planDefinition } from './revision.mjs'
 import { artifactFacts, verifyArtifactFacts, revisionAuthority } from './revision-host.mjs'
@@ -11,7 +11,7 @@ import { directAuthHeaders } from './direct-auth.mjs'
 import { apiParameters, measureInput } from './api-protocol.mjs'
 import { readCompletion } from './direct-http.mjs'
 import { acquireDirectLease } from './durable-store.mjs'
-import { fail, describeContextBindings } from './core.mjs'
+import { fail, describeContextBindings, currentSharedContexts } from './core.mjs'
 import { artifactProof, realProjectPath } from './artifacts.mjs'
 import { supervisionSemantics } from './supervision-semantics.mjs'
 import { createRoleContext, rolePressureTokens, roleWindow } from './role-context.mjs'
@@ -27,7 +27,8 @@ function save(file, value) {
 export function contextDefinition(state) {
   const contexts = new Map(state.contexts.nodes.map(node => [node.id, node.key]))
   const tasks = new Map(state.graph.state.plan.nodes.map(node => [node.id, node.key]))
-  return { nodes: state.contexts.nodes.map(({ key, content, parents }) => ({ key, content, parents: parents.map(id => contexts.get(id)) })),
+  return { nodes: state.contexts.nodes.map(({ key, content, parents, mutable }) => ({ key, content, parents: parents.map(id => contexts.get(id)),
+    ...(mutable ? { mutable: true } : {}) })),
     bindings: state.contexts.bindings.map(row => ({ task: tasks.get(row.taskId), instruction: row.instruction,
       contexts: row.contexts.map(id => contexts.get(id)), inheritReports: row.inheritReports.map(id => tasks.get(id)), tools: row.tools,
       ...(row.completion ? { completion: row.completion } : {}) })) }
@@ -205,10 +206,12 @@ export function revisionSnapshot(runner) {
   const contextGraph = contextDefinition(state)
   const task = id => state.graph.state.plan.nodes.find(node => node.id === id).key
   const graphView = view(state.graph)
+  const sharedContexts = currentSharedContexts(state)
   // Large immutable node text precedes changing state on the wire. The complete
   // graph and state remain present; this changes order only, not authority.
   const snapshot = { contextGraph,
     contextHashes: Object.fromEntries(contextGraph.nodes.map(node => [node.key, digest(node)])),
+    ...(sharedContexts.length ? { sharedContexts } : {}),
     taskGraph: planDefinition(state.graph.state.plan),
     revision: state.revision, checksum: state.checksum, linked: true, active: state.graph.state.active,
     hostAllowedTools: [...runner.config.allowedTools],

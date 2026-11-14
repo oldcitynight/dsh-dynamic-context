@@ -6,7 +6,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DynamicContextGraph, fail } from './core.mjs'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { bridge, adapterReady, composeHooks } from './adapter-bridge.mjs'
 import { RequestContract, deepFreeze, taskPrompt, toolFingerprint } from './request-policy.mjs'
 import { runDirect } from './direct-channel.mjs'
@@ -116,7 +116,7 @@ export const validateConfig = input => configSchema.parse(input)
 function durableConfigHash(config, meter) {
   const files = ['index.mjs', 'core.mjs', 'request-policy.mjs', 'direct-channel.mjs', 'direct-http.mjs', 'native-compaction.mjs', 'dsh-compaction-policy.mjs', 'direct-runtime.mjs', 'execution-privacy.mjs', 'durable-store.mjs', 'checkpoints.mjs',
     'control-tools.mjs', 'evidence-policy.mjs', 'adapter-bridge.mjs', 'interop.mjs', 'api-protocol.mjs', 'direct-auth.mjs', 'administration.mjs', 'host.mjs', 'revision-runtime.mjs', 'role-context.mjs', 'report-evidence.mjs', 'supervision-state.mjs', 'supervision-semantics.mjs', 'supervision-runtime.mjs', 'revision.mjs', 'revision-host.mjs', 'revision-report.mjs', 'artifacts.mjs', 'interaction.mjs', 'graph-presence.mjs', 'package.json']
-  const external = ['dsh-bettertaskgraphs/core', 'dsh-bettertaskgraphs/store', 'dsh-bettertaskgraphs/host', 'dsh-bettertaskgraphs/interop', 'dsh-bettertaskgraphs/extensions', '@deepseek-ai/dsh-token-meter/estimate']
+  const external = ['dsh-better-task-grapth/core', 'dsh-better-task-grapth/store', 'dsh-better-task-grapth/host', 'dsh-better-task-grapth/interop', 'dsh-better-task-grapth/extensions', '@deepseek-ai/dsh-token-meter/estimate']
   return digest({ config: JSON.parse(JSON.stringify(config)), meter: meter ? { version: meter.version, implementation: sha256(Function.prototype.toString.call(meter.measure)),
     observer: meter.observe ? sha256(Function.prototype.toString.call(meter.observe)) : null } : null, code: [
     ...files.map(name => [name, sha256(fs.readFileSync(new URL(name, import.meta.url)))]),
@@ -301,7 +301,7 @@ export class DynamicContextRuntime {
         this.graph.adoptCheckpoint({ expectedRevision, attemptId: active.attemptId, owner: active.owner })
       } else this.graph.begin({ expectedRevision, choice })
       this.publish(resume ? 'resumed' : 'begun')
-      const assembly = this.graph.assemble(), sessionId = SessionId(`dynamic-context-${randomUUID()}`)
+      const assembly = this.graph.assemble(continuation?.assembly), sessionId = SessionId(`dynamic-context-${randomUUID()}`)
       if (continuation && digest(assembly) !== digest(continuation.assembly)) fail('DIRECT_RESUME_CONTEXT_CHANGED')
       runDirectory = path.join(this.config.directory, assembly.task.attemptId)
       if (!resume) fs.mkdirSync(runDirectory, { mode: 0o700 })
@@ -322,7 +322,8 @@ export class DynamicContextRuntime {
       signal?.throwIfAborted()
       if (this.config.timeoutMs !== null) timer = setTimeout(() => { trace.status = 'TIMEOUT_UNKNOWN'; control.abort(new Error('TASK_TIMEOUT')); if (handle) void handle.dispose() }, this.config.timeoutMs)
       if (this.config.transport === 'direct') execution = await prepareDirectRuntime({ ctx: this.ctx, config: this.config,
-        assembly, sessionId, sourceAgent, control, resumeState: continuation?.runtime, sourceReader: journal, record: (type, data) => {
+        assembly, sessionId, sourceAgent, control, resumeState: continuation?.runtime, sourceReader: journal,
+        sharedContext: (args, callId) => this.graph.sharedContext(assembly, args, callId), record: (type, data) => {
           trace.events.push({ seq: trace.events.length, time: Date.now(), type, data: structuredClone(data) }); persist()
         } })
       if (execution) this.current.agent = execution.agent

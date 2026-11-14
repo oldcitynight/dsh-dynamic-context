@@ -6,7 +6,7 @@ import os from 'node:os'
 import { createHash } from 'node:crypto'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { inspectExecutionReport, parseExecutionDisposition } from '../report-evidence.mjs'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 
 const sha = text => createHash('sha256').update(text).digest('hex')
 const planningReport = { understanding: 'Deliver the local file, then verify it.', assumptions: ['ASSUMPTION_ORIGINAL'], design: 'Two serial leaves with explicit handoff.', acceptanceStrategy: 'Check file identity and the named test.' }

@@ -2,7 +2,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { BlockAssembler, createMessage } from '@deepseek-ai/dsh-llm'
-import { copy, digest, GraphError } from 'dsh-bettertaskgraphs/core'
+import { copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { artifactProof } from './artifacts.mjs'
 
 export function revisionAuthority(ctx, agent) {

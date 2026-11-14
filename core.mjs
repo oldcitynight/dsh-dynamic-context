@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { TransactionGraph, canonical, copy, digest, validateDocument, view, revisedPlan, legalNext } from 'dsh-bettertaskgraphs/core'
-import { FileGraphStore, MemoryGraphStore } from 'dsh-bettertaskgraphs/store'
+import { TransactionGraph, canonical, copy, digest, validateDocument, view, revisedPlan, legalNext } from 'dsh-better-task-grapth/core'
+import { FileGraphStore, MemoryGraphStore } from 'dsh-better-task-grapth/store'
 import { artifactProof, artifactCurrentIdentity } from './artifacts.mjs'
 import { completionSchema, reportSchema, planningReportSchema, supervisionSchema, validateSupervision, checkSupervisionUpdate } from './supervision-state.mjs'
 import { TrackedGraphStore } from './graph-presence.mjs'
@@ -12,7 +12,12 @@ const text = n => z.string().min(1).max(n).refine(value => value.trim().length >
 const unique = values => new Set(values).size === values.length
 const keys = () => z.array(key).max(32).refine(unique, 'Duplicate reference')
 const toolNames = z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/)).max(32).refine(unique)
-const contextNode = z.object({ key, content: text(131072), parents: keys().default([]) }).strict()
+export const contextText = text(131072)
+const contextNode = z.object({ key, content: contextText, parents: keys().default([]), mutable: z.literal(true).optional() }).strict()
+const sharedContextChange = z.object({
+  id: key, revision: z.number().int().min(2), content: contextText,
+  taskId: key, attemptId: key, callId: text(256), reason: text(2000).optional(),
+}).strict()
 const binding = z.object({ task: key, instruction: text(8000), contexts: keys(),
   inheritReports: keys().default([]), tools: toolNames.default([]), completion: completionSchema.optional() }).strict()
 export const proposalSchema = z.object({
@@ -31,6 +36,7 @@ const normalizedContext = z.object({ graphId: key, creationChecksum: z.string().
 }).strict()
 const stateSchema = z.object({ schema: z.literal(1), revision: z.number().int().positive(),
   graph: z.unknown(), contexts: normalizedContext, reports: z.array(reportSchema).max(32),
+  sharedContextHistory: z.array(sharedContextChange).optional(),
   contextHistory: z.array(z.object({ graph: z.unknown(), contexts: normalizedContext }).strict()).optional(),
   invalidatedReports: z.array(key).refine(unique).optional(),
   supervision: supervisionSchema.optional(),
@@ -92,6 +98,15 @@ export function validateState(value) {
   for (const historical of state.contextHistory ?? []) {
     validateDocument(historical.graph); checkContexts(historical.contexts, historical.graph)
   }
+  const historyNodes = new Map([...(state.contextHistory ?? []).flatMap(row => row.contexts.nodes), ...state.contexts.nodes]
+    .filter(node => node.mutable).map(node => [node.id, 1]))
+  const historyCalls = new Set()
+  for (const row of state.sharedContextHistory ?? []) {
+    const call = row.attemptId + ':' + row.callId
+    if ((historyNodes.get(row.id) ?? 0) + 1 !== row.revision || historyCalls.has(call))
+      fail('SHARED_CONTEXT_HISTORY_INVALID')
+    historyNodes.set(row.id, row.revision); historyCalls.add(call)
+  }
   if (!unique(state.reports.map(row => row.taskId))) fail('DUPLICATE_REPORT')
   for (const report of state.reports) {
     const leaf = state.graph.state.leaves[report.taskId]
@@ -111,6 +126,24 @@ export function validateState(value) {
 
 function checkUpdate(previous, next) {
   validateState(next)
+  if (canonical(previous?.sharedContextHistory) !== canonical(next.sharedContextHistory)) {
+    const history = previous?.sharedContextHistory ?? []
+    const changes = next.sharedContextHistory
+    const active = previous?.graph.state.active
+    if (!active || previous.supervision && previous.supervision.phase !== 'READY'
+        || changes?.length !== history.length + 1 || canonical(changes.slice(0, -1)) !== canonical(history))
+      fail('SHARED_CONTEXT_HISTORY_IMMUTABLE')
+    const { sharedContextHistory: _changes, checksum: _checksum, ...nextBody } = next
+    const { sharedContextHistory: _history, checksum: _priorChecksum, ...previousBody } = previous
+    const change = changes.at(-1)
+    const node = boundMutableNode(previous, active, change.id)
+    if (canonical(nextBody) !== canonical(previousBody) || !node
+        || change.taskId !== active.nodeId || change.attemptId !== active.attemptId
+        || change.revision !== sharedContextVersions(history, node).length + 1
+        || history.some(row => row.attemptId === change.attemptId && row.callId === change.callId))
+      fail('SHARED_CONTEXT_CHANGE_INVALID')
+    return
+  }
   if (previous && next.revision === previous.revision) {
     const graphState = ({ supervision, checksum, ...value }) => value
     if (!previous.supervision || canonical(graphState(next)) !== canonical(graphState(previous))) fail('SUPERVISION_GRAPH_CHANGED_WITHOUT_REVISION')
@@ -151,6 +184,18 @@ function contextClosure(contexts, binding) {
   }
   binding.contexts.forEach(visit)
   return [...selected.values()].sort((a, b) => a.id.localeCompare(b.id))
+}
+function boundMutableNode(state, active, id) {
+  const binding = state.contexts.bindings.find(row => row.taskId === active.nodeId)
+  return contextClosure(state.contexts, binding).find(row => row.id === id && row.mutable)
+}
+function sharedContextVersions(history, node) {
+  return [{ id: node.id, revision: 1, content: node.content }, ...history.filter(row => row.id === node.id)]
+}
+export function currentSharedContexts(state) {
+  return state.contexts.nodes.filter(node => node.mutable).map(node => ({
+    key: node.key, ...sharedContextVersions(state.sharedContextHistory ?? [], node).at(-1),
+  }))
 }
 export function describeContextBindings(contexts, plan, leaves) {
   const keys = new Map(plan.nodes.map(node => [node.id, node.key]))
@@ -264,7 +309,8 @@ export class DynamicContextGraph {
       if (Object.keys(node).some(key => !['key', 'retain', 'sha256'].includes(key))) fail('REVISION_RETAIN_REFERENCE_INVALID')
       const source = previous.contexts.nodes.find(row => row.key === node.key)
       if (!source) fail('REVISION_RETAIN_REFERENCE_INVALID')
-      const value = { key: source.key, content: source.content, parents: source.parents.map(id => names.get(id)) }
+      const value = { key: source.key, content: source.content, parents: source.parents.map(id => names.get(id)),
+        ...(source.mutable ? { mutable: true } : {}) }
       if (node.sha256 !== digest(value)) fail('REVISION_RETAIN_REFERENCE_INVALID')
       return value
     })
@@ -281,8 +327,11 @@ export class DynamicContextGraph {
     scratch.submit(input) // Initial shape, cycle, reference and binding checks.
     const plan = revisedPlan(previous.graph, input.taskGraph)
     const taskKeys = new Map(plan.nodes.map(node => [node.key, node.id]))
-    const ids = new Map(input.contextGraph.nodes.map(node => [node.key,
-      previous.contexts.nodes.find(old => old.key === node.key)?.id ?? `ctx_${randomUUID()}`]))
+    const ids = new Map(input.contextGraph.nodes.map(node => {
+      const old = previous.contexts.nodes.find(row => row.key === node.key)
+      if (old?.mutable && node.mutable && old.content !== node.content) fail('SHARED_CONTEXT_INITIAL_VALUE_IMMUTABLE')
+      return [node.key, old?.id ?? `ctx_${randomUUID()}`]
+    }))
     const body = { graphId: plan.id, creationChecksum: previous.graph.events[0].hash,
       nodes: input.contextGraph.nodes.map(node => ({ ...node, id: ids.get(node.key), parents: node.parents.map(key => ids.get(key)) })),
       bindings: input.contextGraph.bindings.map(binding => ({ taskId: taskKeys.get(binding.task), instruction: binding.instruction,
@@ -408,8 +457,35 @@ export class DynamicContextGraph {
     return reports
   }
 
-  /** Expand only the active task's declared context closure and completed report references. */
-  assemble() {
+  sharedContext(assembly, { id, revision, content, reason }, callId) {
+    const state = this.read(), active = state?.graph.state.active
+    if (!active || active.attemptId !== assembly.task.attemptId || active.owner !== this.owner
+        || state.supervision && state.supervision.phase !== 'READY') fail('SHARED_CONTEXT_ACTIVE_ATTEMPT_REQUIRED')
+    const node = boundMutableNode(state, active, id)
+    if (!node) return { status: 'UNAVAILABLE', id }
+    const history = state.sharedContextHistory ?? []
+    const versions = sharedContextVersions(history, node)
+    if (content === undefined) {
+      const selected = revision === undefined ? versions.at(-1) : versions[revision - 1]
+      return selected ? { status: 'FOUND', ...selected, latestRevision: versions.length }
+        : { status: 'UNKNOWN_REVISION', id, revision, latestRevision: versions.length }
+    }
+    const prior = history.find(row => row.attemptId === active.attemptId && row.callId === callId)
+    if (prior) {
+      if (prior.id !== id || prior.content !== content || prior.reason !== reason) fail('SHARED_CONTEXT_CALL_REUSED')
+      return { status: 'APPLIED', ...prior }
+    }
+    const change = { id, revision: versions.length + 1, content, ...(reason === undefined ? {} : { reason }),
+      taskId: active.nodeId, attemptId: active.attemptId, callId }
+    this.store.compareAndSwap(state.revision, previous => {
+      if (previous?.checksum !== state.checksum) fail('SHARED_CONTEXT_STALE_STATE')
+      return seal({ ...previous, sharedContextHistory: [...history, change] })
+    })
+    return { status: 'APPLIED', ...change }
+  }
+
+  /** Expand the declared closure; resumed attempts keep their original seed. */
+  assemble(prior) {
     const state = this.read(), active = state?.graph.state.active
     if (!active || active.owner !== this.owner) fail('ACTIVE_TASK_REQUIRES_RECONCILIATION')
     const task = state.graph.state.plan.nodes.find(node => node.id === active.nodeId)
@@ -418,7 +494,14 @@ export class DynamicContextGraph {
     const visit = id => {
       if (visited.has(id)) return
       const node = state.contexts.nodes.find(row => row.id === id)
-      node.parents.forEach(visit); visited.add(id); chosen.push(copy(node))
+      node.parents.forEach(visit); visited.add(id)
+      if (node.mutable) {
+        const versions = sharedContextVersions(state.sharedContextHistory ?? [], node)
+        const pinned = prior && prior.contexts.find(row => row.id === id)?.revision
+        const selected = prior ? versions[pinned - 1] : versions.at(-1)
+        if (!selected) fail('SHARED_CONTEXT_PIN_NOT_AVAILABLE')
+        chosen.push({ ...copy(node), content: selected.content, revision: selected.revision })
+      } else chosen.push(copy(node))
     }
     binding.contexts.forEach(visit)
     const reports = this.checkInputs(state, task.id)

@@ -20,7 +20,7 @@ import * as ShellEnv from '@deepseek-ai/dsh-shell-env'
 import Skills from '@deepseek-ai/dsh-skill'
 import * as Observations from '@deepseek-ai/dsh-fs-observation-policy'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import TaskGraph from 'dsh-bettertaskgraphs'
+import TaskGraph from 'dsh-better-task-grapth'
 import * as DynamicContext from './index.mjs'
 
 /** Authentication services only; no native model adapter or message assembly. */

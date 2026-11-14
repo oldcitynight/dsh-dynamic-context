@@ -13,9 +13,9 @@ import { discoverBaselineInstructionFiles } from '@deepseek-ai/dsh-agent-instruc
 import { resolveDshHome, resolveAgentsHome } from '@deepseek-ai/dsh-home-paths'
 import { createAssistantMessage, createSystemMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, Session } from '@deepseek-ai/dsh-session'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { deepFreeze, textContent } from './request-policy.mjs'
-import { DynamicContextError, fail } from './core.mjs'
+import { DynamicContextError, contextText, fail } from './core.mjs'
 import { createPrivatePathGuard } from './execution-privacy.mjs'
 
 const names = () => z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/)).max(64).refine(rows => new Set(rows).size === rows.length)
@@ -48,7 +48,7 @@ export const directRuntimeSchema = z.object({
 
 const moduleTools = {
   filesystem: ['read', 'write', 'edit'], search: ['glob', 'grep'], shell: ['bash'], web: ['web_search', 'web_fetch'],
-  skills: ['skill'], state: ['dynamic_task_status', 'dynamic_context_source_read'],
+  skills: ['skill'], state: ['dynamic_task_status', 'dynamic_context_source_read', 'dynamic_context_shared_read', 'dynamic_context_shared_update'],
 }
 const nativeModules = {
   filesystem: ['@deepseek-ai/dsh-tool-fs', { readImage: false }],
@@ -58,7 +58,10 @@ const nativeModules = {
 }
 const requiredServices = { filesystem: ['fs', 'workingDirectory'], search: ['subprocess', 'workingDirectory'],
   shell: ['shell', 'shellEnv', 'sandbox', 'workingDirectory'], web: ['web'], skills: ['skills'], state: [] }
-const readTools = new Set(['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'dynamic_task_status', 'dynamic_context_source_read'])
+const readTools = new Set(['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'dynamic_task_status', 'dynamic_context_source_read', 'dynamic_context_shared_read'])
+const sharedId = z.string().regex(/^ctx_[a-z0-9-]+$/)
+const sharedRead = z.object({ id: sharedId, revision: z.number().int().positive().optional() }).strict()
+const sharedUpdate = z.object({ id: sharedId, content: contextText, reason: z.string().trim().min(1).max(2000).optional() }).strict()
 const modes = ['read-only', 'workspace-write', 'danger-full-access']
 const minimumMode = (...values) => modes[Math.min(...values.map(value => modes.indexOf(value)))]
 const inside = (root, target) => { const relative = path.relative(root, target); return relative === '' || relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative) }
@@ -69,7 +72,7 @@ const jsonTool = (name, description, parameters, execute) => defineTool({ name, 
     render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] }, execute })
 
 /** Real DSH execution identity, with no model loop or default prompt providers. */
-export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader }) {
+export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader, sharedContext }) {
   const options = config.direct.runtime
   if (!options) return undefined
   for (const service of ['sandboxPolicy', 'approval', 'workingDirectory', ...options.modules.flatMap(name => requiredServices[name])]) {
@@ -192,6 +195,20 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       { archive_id: { type: 'string', required: true }, message_index: { type: 'integer', required: true },
         offset: { type: 'integer' }, length: { type: 'integer' }, field: { type: 'string', enum: ['content', 'tool_calls', 'reasoning_content'] } },
       async args => { if (!sourceReader) fail('DIRECT_ARCHIVE_READER_UNAVAILABLE'); return sourceReader.readSource(args) }))
+    if (options.modules.includes('state') && sharedContext) {
+      const access = schema => async (args, exec) => {
+        const parsed = schema.safeParse(args)
+        if (!parsed.success) return { status: 'INVALID_ARGUMENTS', issues: parsed.error.issues.map(row => ({ field: row.path, message: row.message })) }
+        return sharedContext(parsed.data, exec.callId)
+      }
+      const id = { type: 'string', required: true, description: 'Stable ID of a mutable node in this leaf context.' }
+      capabilityScope.ctx.tools.register(jsonTool('dynamic_context_shared_read',
+        'Read a bound mutable context node by ID. Omit revision for the latest value; an explicit revision reads history. The response includes the latest revision number.',
+        { id, revision: { type: 'integer' } }, access(sharedRead)))
+      capabilityScope.ctx.tools.register(jsonTool('dynamic_context_shared_update',
+        'Replace the content of a bound mutable context node. The update applies immediately and records a new revision. Use for factual project data. Existing messages and execution reports keep the versions they received.',
+        { id, content: { type: 'string', required: true }, reason: { type: 'string' } }, access(sharedUpdate)))
+    }
     const getSkill = async name => {
       if (!options.skills.includes(name)) fail('DIRECT_RUNTIME_SKILL_NOT_ALLOWED')
       const skill = await hostCalls.run(true, () => skills.get(name, { cwd, signal: control.signal, scope: handle.agent }))

@@ -6,9 +6,12 @@ import os from 'node:os'
 import { createHash } from 'node:crypto'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { inspectExecutionReport, parseExecutionDisposition } from '../report-evidence.mjs'
+import { dispositionSchema } from '../supervision-state.mjs'
+import { revisionProposalSchema, revisionVerdictSchema } from '../revision.mjs'
 import { digest } from 'dsh-better-task-grapth/core'
 
 const sha = text => createHash('sha256').update(text).digest('hex')
+const examples = prompt => [...prompt.matchAll(/```json\n([^\n]+)\n```/g)].map(match => JSON.parse(match[1]))
 const planningReport = { understanding: 'Deliver the local file, then verify it.', assumptions: ['ASSUMPTION_ORIGINAL'], design: 'Two serial leaves with explicit handoff.', acceptanceStrategy: 'Check file identity and the named test.' }
 const policy = { objective: 'Deliver and verify local results', requirements: [{ id: 'delivery', text: 'Respect each local completion criterion.' }] }
 const body = 'Delivered bytes\n', artifact = { kind: 'artifact', ref: 'deliverable/result.txt', sha256: sha(body) }
@@ -74,6 +77,9 @@ test('updater explains each actual change with an original report citation; revi
     if (index === 4) return { text: '{"verdict":"ACCEPT","reason":"Local result supported."}' }
     if (index === 5) return { text: '{"verdict":"REVIEW_REQUIRED"}' }
     if (index === 6) {
+      const templates = examples(payload.messages[0].content).map(value => revisionProposalSchema.parse(value))
+      assert.deepEqual(templates.map(value => value.disposition), ['REVISE', 'NO_CHANGE', 'NEEDS_USER'])
+      assert.equal(templates[0].modificationReport.changes[0].path, '/contextGraph/bindings/deliver/instruction')
       assert.doesNotMatch(JSON.stringify(input), /RECOVERED_PROCESS_ERROR_NOISE|1 check passed/)
       assert.ok(input.evidenceCatalog.find(fact => fact.factId === 'fact_0').fields.some(field => field.pointer === '/summary'))
       const proposal = { disposition: 'REVISE', trigger: 'CONTEXT_GAP', reason: 'Specify the next verification based on the delivered result.', evidenceIds: ['fact_0'],
@@ -86,6 +92,8 @@ test('updater explains each actual change with an original report citation; revi
       return { text: JSON.stringify(proposal) }
     }
     reviewerSeen = true
+    assert.deepEqual(examples(payload.messages[0].content).map(value => revisionVerdictSchema.parse(value).verdict),
+      ['APPROVE', 'REJECT', 'NEEDS_USER'])
     assert.ok(!input.snapshot && !input.proposal && !input.facts && !input.executionReports)
     assert.equal(input.changes.length, 1)
     assert.equal(input.changes[0].path, '/contextGraph/bindings/later/instruction')
@@ -161,6 +169,40 @@ test('unknown artifact feedback names the exact result field, bad path and allow
   assert.match(result.feedback, /declaredArtifactPaths/)
   assert.ok(h.runner.graph.read().graph.state.active)
   assert.equal(h.backend.requests.length, 3)
+})
+
+test('execution and repair receive the same valid report examples while repair retains the original receipts', async t => {
+  let samples
+  const h = await fixture(t, ({ index, payload }) => {
+    if (index <= 2) return work(index)
+    if (index === 3) {
+      samples = payload.messages.filter(row => row.role === 'user').flatMap(row => examples(row.content))
+      assert.deepEqual(samples.map(row => dispositionSchema.parse(row).outcome), ['COMPLETE', 'BLOCKED', 'FAILED'])
+      const draft = submitted()
+      draft.executionReport.tests[0].quote = 'incorrect quote'
+      return { text: JSON.stringify(draft) }
+    }
+    if (index === 4) {
+      assert.deepEqual(examples(payload.messages[0].content), samples)
+      const input = JSON.parse(payload.messages[1].content)
+      assert.match(input.previousSubmission, /incorrect quote/)
+      assert.match(input.feedback, /SUPERVISION_TEST_QUOTE_NOT_FOUND/)
+      assert.match(JSON.stringify(input.execution), /RECOVERED_PROCESS_ERROR_NOISE/)
+      assert.match(JSON.stringify(input.execution), /1 check passed/)
+      const corrected = JSON.parse(input.previousSubmission)
+      corrected.executionReport.tests[0].quote = '1 check passed'
+      return { text: JSON.stringify(corrected) }
+    }
+    return { text: index === 5 ? '{"verdict":"ACCEPT","reason":"The corrected quote matches the original receipt."}' : '{"verdict":"CURRENT"}' }
+  })
+  const returned = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(returned.status, 'RESULT_RETURNED')
+  assert.equal(h.backend.requests.length, 3)
+  const status = h.runner.status()
+  assert.equal((await h.runner.continueSupervision({ expectedRevision: status.revision,
+    checkpointChecksum: status.supervision.checkpointChecksum })).status, 'RESULT_COMMITTED')
+  assert.deepEqual(h.backend.errors, [])
+  assert.equal(h.backend.requests.length, 6)
 })
 
 for (const fault of ['missing-report', 'wrong-hash', 'extra-file', 'extra-directory', 'fabricated-quote', 'unknown-test']) test(`static report validation rejects ${fault} before any acceptance request`, async t => {

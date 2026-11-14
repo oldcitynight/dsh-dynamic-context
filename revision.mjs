@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { canonical, copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { modificationReportSchema, validateModificationReport, scopedReviewInput, UPDATE_REPORT_INSTRUCTION, REVIEW_REPORT_INSTRUCTION, revisionEvidenceCatalog, EVIDENCE_POINTER_INSTRUCTION } from './revision-report.mjs'
+import { revisionProposalExamples, revisionReviewExamples } from './format-examples.mjs'
 
 const fail = code => { throw new GraphError(code) }
 const key = z.string().regex(/^[a-z][a-z0-9_-]{0,79}$/)
@@ -78,8 +79,11 @@ const mutableContextInstructions = '运行中标记 mutable:true 的上下文节
 
 function roleContext(role, linked) {
   const format = role === 'updater'
-    ? `只输出 JSON 对象：{"disposition":"REVISE|NO_CHANGE|NEEDS_USER","trigger":"COUNTEREXAMPLE|MISSING_DEPENDENCY|CONTEXT_GAP|STALE_REPORT|USER_CHANGE|NONE","reason":"理由","evidenceIds":["事实ID"],"taskGraph":完整任务图或null,"contextGraph":完整上下文图或null,"coverage":[{"requirement":"固定需求ID","tasks":["叶任务key"]}],"retirements":[{"task":"被删除任务key","replacements":["替代key"],"reason":"理由"}],"invalidateReports":["失效报告的任务key"]}。NO_CHANGE/NEEDS_USER 的两张图均为 null。`
-    : `只输出 JSON 对象：{"verdict":"APPROVE|REJECT|NEEDS_USER","reason":"独立审查理由","violations":["未解决的问题"]}。APPROVE 时 violations 必须为空。`
+    ? ['按所选处置仅输出一个 JSON 对象。REVISE 使用实际快照、事实 ID、需求 ID 和任务 key。',
+      '根据证据选择 trigger：COUNTEREXAMPLE（反例）、MISSING_DEPENDENCY（遗漏依赖）、CONTEXT_GAP（上下文缺失）或 STALE_REPORT（报告失效）。无需修改时用 NONE，需要用户另行授权时用 USER_CHANGE。',
+      '移除尚未开始的任务时，在 retirements 中加入形如 {"task":"old_check","replacements":["new_check"],"reason":"新的检查覆盖原验收条件"} 的记录。invalidateReports 填失效报告对应的任务 key。',
+      'NO_CHANGE 或 NEEDS_USER 的两张图均为 null。'].join(' ')
+    : '按审计结论仅输出一个 JSON 对象。APPROVE 的 violations 必须为空。'
   const grounding = role === 'reviewer'
     ? '输出最小充分的审计依据。REJECT 以可定位的直接反例成立，不要求附加其他可能风险来加强语气，也不必填满 violations 数组。每个保留的问题必须独立指出适用规则、具体输入字段或事实、受影响叶，以及为什么该改动本身违反规则；相同缺陷及其后果不要重复列项。已找到足够支持拒绝的反例时，集中说明它及修复所需边界，不把其他合法修改连带指责为违规。区分已观察的冲突与推测的后果，后果不能替代违规证据。尤其是：移除前置边不等于删除历史；受污染的生成输入不等于未改变的验证机制被削弱；与授权源一致的摘要引用仍可交给宿主核验。APPROVE 说明覆盖与推进路径；REJECT 的主结论正确也不能为无依据的附加理由背书。保持原有 JSON 字段。'
     : '若前次审计意见与宿主 runtimeSemantics 或本次可核对事实冲突，不把错误意见升级为合同；保留原目标，在 reason 中说明该项不采纳的具体依据。修改范围以真实问题为准，不为消除措辞歧义无谓改图。'
@@ -123,7 +127,8 @@ export class RevisionCoordinator {
         const runId = `revision_${role}_${randomUUID()}`
         const scoped = snapshot.supervisionReview?.mode === 'report-scoped-v1'
         const messages = [{ role: 'system', content: scoped && role === 'reviewer' ? REVIEW_REPORT_INSTRUCTION
-          : roleContext(role, snapshot.linked) + (scoped ? '\n\n' + UPDATE_REPORT_INSTRUCTION + '\n\n' + EVIDENCE_POINTER_INSTRUCTION : '') },
+          : roleContext(role, snapshot.linked) + (scoped ? '\n\n' + UPDATE_REPORT_INSTRUCTION + '\n\n' + EVIDENCE_POINTER_INSTRUCTION : '')
+            + '\n\n' + (role === 'updater' ? revisionProposalExamples(snapshot.linked, scoped) : revisionReviewExamples) },
           { role: 'user', content: JSON.stringify(data) }]
         const call = { role, runId, inputHash: digest(messages) }
         calls.push(call)

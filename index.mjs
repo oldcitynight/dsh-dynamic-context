@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId, appendPluginRecord } from '@deepseek-ai/dsh-session'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { DynamicContextGraph, fail } from './core.mjs'
 import { digest } from 'dsh-bettertaskgraphs/core'
@@ -142,7 +142,7 @@ export class DynamicContextRuntime {
   }
   graphPresence() {
     const presence = this.graph.store.recoveryPlan()
-    if (presence.state === 'NEVER_CREATED' && this.controller?.session.snapshotEvents().some(event =>
+    if (presence.state === 'NEVER_CREATED' && this.controller && this.taskGraph.sessionRecords.read(this.controller.session).some(({ event }) =>
       event.type === GRAPH_COMMIT_RECORD && event.ignorable && event.data.workflowId === this.workflowId))
       return { state: 'GRAPH_AND_WITNESS_LOST_AFTER_COMMIT', previouslyCommitted: true, recoveryRequired: true, canRestore: false }
     return presence
@@ -248,7 +248,7 @@ export class DynamicContextRuntime {
       if (this.config.transport === 'direct' && !this.config.direct.runtime && (binding.tools ?? []).some(tool => !this.config.direct.agentlessTools.includes(tool))) fail('DIRECT_TOOL_REQUIRES_EXPLICIT_AGENTLESS_PERMISSION')
     }
     const result = this.graph.submit(proposal)
-    if (sourceAgent) appendPluginRecord(sourceAgent.session, GRAPH_COMMIT_RECORD, { workflowId: this.workflowId,
+    if (sourceAgent) this.taskGraph.sessionRecords.append(sourceAgent.session, GRAPH_COMMIT_RECORD, { workflowId: this.workflowId,
       graphId: result.graph.state.plan.id, firstChecksum: result.checksum, revision: result.revision })
     this.publish('created'); return result
   }

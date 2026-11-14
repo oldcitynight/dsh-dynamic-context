@@ -1,6 +1,8 @@
 # dsh-dynamic-context：动态上下文与受控请求通道
 
-当前候选版为 `0.1.0-rc.24`，强依赖已运行的任务图 `0.3.0-rc.11` 服务及其通用扩展接口。可单独打包，但不能脱离任务图服务运行。Bundle 初装默认关闭，完成配置并启用后，向所有项目的新对话注入选择指引。本轮边界与缺图恢复变更仅完成 fake/offline 验证，既往真实 API 结果属于旧候选。
+本构建版本为 `0.1.1-rc.37`。适用宿主和配套版本见 [兼容清单](DSH-COMPATIBILITY.json)。
+
+分支 `0.2.0-rc.2` 对应 npm 标签 `dsh-0.2.0-rc.2`，适用于 DSH `0.2.0-rc.2`、`0.2.0-rc.1`，Node.js 要求为 `^22.19.0 || >=24.0.0`。请在同一 DSH profile 先安装 `dsh-bettertaskgraphs@0.3.1-rc.37`，再安装 `dsh-dynamic-context@0.1.1-rc.37`。Bundle 初装默认关闭，完成配置并启用后为新对话提供会话模式选择。
 
 前置插件：[dsh-bettertaskgraphs](https://github.com/oldcitynight/dsh-bettertaskgraphs)。开源协议为 GPL-3.0-only；复制的 DeepSeek 压缩策略另保留原 MIT 声明。验证范围和独立测试方法见 [VALIDATION.md](VALIDATION.md)。GitHub 源码发布与 npm 包发布是不同步骤，当前候选可从源码构建安装包。
 
@@ -15,7 +17,7 @@ TMPDIR="$PWD/.test-tmp" npm test
 npm run pack:bundle
 ```
 
-Linux 测试依赖见验证说明。开发依赖固定到配套任务图提交，避免要求尚未公开到 npm 的候选版本。运行时仍须在同一 DSH profile 加载任务图插件，并按 `examples/` 中的示例配置和启用动态插件。
+源码构建依赖任务图 `0.3.1-rc.37`。该版本发布前，先将同一批次的任务图 tarball 加入 npm 缓存，再执行 npm ci。运行配置见 `examples/`。
 
 候选包的独立支持范围是 direct。`native-guarded` 仅为开发对照，依赖另行安装的 context-guard wire hook；干净 DSH 没有该补丁时，在认领任务和创建执行 Agent 前拒绝运行。发布包不修改 DSH 适配器来启用该对照通道。
 

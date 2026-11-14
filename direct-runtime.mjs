@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
+import { homedir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -10,9 +11,9 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { discoverBaselineInstructionFiles } from '@deepseek-ai/dsh-agent-instructions'
-import { resolveDshHome, resolveAgentsHome } from '@deepseek-ai/dsh-home-paths'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createAssistantMessage, createSystemMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
-import { appendPluginRecord, Session } from '@deepseek-ai/dsh-session'
+import { Session } from '@deepseek-ai/dsh-session'
 import { digest } from 'dsh-bettertaskgraphs/core'
 import { deepFreeze, textContent } from './request-policy.mjs'
 import { DynamicContextError, fail } from './core.mjs'
@@ -56,8 +57,8 @@ const nativeModules = {
   shell: ['@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false, promoteOnTimeout: false }],
   web: ['@deepseek-ai/dsh-tool-web', {}],
 }
-const requiredServices = { filesystem: ['fs', 'workingDirectory'], search: ['subprocess', 'workingDirectory'],
-  shell: ['shell', 'shellEnv', 'sandbox', 'workingDirectory'], web: ['web'], skills: ['skills'], state: [] }
+const requiredServices = { filesystem: ['fs'], search: ['subprocess'],
+  shell: ['shell', 'shellEnv', 'sandbox'], web: ['web'], skills: ['skills'], state: [] }
 const readTools = new Set(['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'dynamic_task_status', 'dynamic_context_source_read'])
 const modes = ['read-only', 'workspace-write', 'danger-full-access']
 const minimumMode = (...values) => modes[Math.min(...values.map(value => modes.indexOf(value)))]
@@ -72,18 +73,20 @@ const jsonTool = (name, description, parameters, execute) => defineTool({ name, 
 export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader }) {
   const options = config.direct.runtime
   if (!options) return undefined
-  for (const service of ['sandboxPolicy', 'approval', 'workingDirectory', ...options.modules.flatMap(name => requiredServices[name])]) {
+  for (const service of ['sandboxPolicy', 'approval', ...options.modules.flatMap(name => requiredServices[name])]) {
     if (!ctx.get(service)) fail('DIRECT_RUNTIME_MISSING_SERVICE', service)
   }
-  const sandboxPolicy = ctx.get('sandboxPolicy'), approval = ctx.get('approval'), workingDirectory = ctx.get('workingDirectory')
+  const sandboxPolicy = ctx.get('sandboxPolicy'), approval = ctx.get('approval')
   const filesystem = ctx.get('fs'), shell = ctx.get('shell'), skills = ctx.get('skills'), sessions = ctx.get('sessions')
   const sandbox = ctx.get('sandbox'), subprocess = ctx.get('subprocess'), credentials = ctx.get('credentials')
   const root = fs.realpathSync(config.projectRoot), cwd = fs.realpathSync(path.resolve(root, options.cwd ?? '.'))
   if (!inside(root, cwd) || !fs.statSync(cwd).isDirectory()) fail('DIRECT_RUNTIME_INVALID_WORKSPACE')
   const stateDirectory = fs.realpathSync(config.directory)
   if (inside(root, stateDirectory)) fail('DIRECT_RUNTIME_STATE_INSIDE_WORKSPACE')
+  const sessionRecords = ctx.transactionGraph.sessionRecords
+  const recordRoot = sessionRecords.root(true)
   if (process.platform === 'linux' && options.modules.includes('shell') && inside('/tmp', stateDirectory)) fail('DIRECT_RUNTIME_STATE_IN_SHARED_TEMP')
-  const instructionHomes = options.instructionHomes ?? { dshHome: resolveDshHome(), agentsHome: resolveAgentsHome() }
+  const instructionHomes = options.instructionHomes ?? { dshHome: resolveDshHome(), agentsHome: path.resolve(process.env.DSH_AGENTS_HOME || path.join(homedir(), '.agents')) }
   if (sourceAgent && ctx.agents.get(sourceAgent.id) !== sourceAgent) fail('DIRECT_RUNTIME_UNOWNED_SOURCE_AGENT')
   const ownerState = () => {
     const policy = sandboxPolicy.resolve(sourceAgent ? { session: sourceAgent.session } : {})
@@ -112,6 +115,18 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
     if (!options.instructions) return []
     const files = await discoverBaselineInstructionFiles({ cwd: directory, projectRoot: root,
       ...instructionHomes, signal: control.signal })
+    // This host reads DSH_HOME/AGENTS.md and project rules. Include the
+    // second user-global file in the same pinned, bounded read as newer hosts.
+    const agentsRules = path.join(instructionHomes.agentsHome, 'AGENTS.md')
+    if (agentsRules !== path.join(instructionHomes.dshHome, 'AGENTS.md')
+        && !files.some(file => file.absolutePath === agentsRules)) {
+      try {
+        const info = fs.lstatSync(agentsRules)
+        if (!info.isFile()) fail('DIRECT_RUNTIME_INSTRUCTION_PATH_TYPE')
+        const global = files[0]?.absolutePath === path.join(instructionHomes.dshHome, 'AGENTS.md')
+        files.splice(global ? 1 : 0, 0, { absolutePath: agentsRules, displayPath: agentsRules })
+      } catch (error) { if (error.code !== 'ENOENT') throw error }
+    }
     const rows = []; let total = 0
     for (const file of files) {
       control.signal.throwIfAborted()
@@ -166,7 +181,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
     if (options.protectPrivatePaths) privacy = createPrivatePathGuard({
       sandbox: options.modules.includes('shell') && assembly.tools.includes('bash') ? sandbox : undefined,
       subprocess: options.modules.includes('search') && assembly.tools.some(name => ['glob', 'grep'].includes(name)) ? subprocess : undefined,
-      workspaceRoot: cwd, protectedRoots: [config.storageRoot ?? root, stateDirectory,
+      workspaceRoot: cwd, protectedRoots: [config.storageRoot ?? root, stateDirectory, recordRoot,
         path.join(config.storageRoot ?? root, '.dsh', 'workflow-witnesses-v1'), ...options.privateReadRoots],
       credentialFiles: [serviceIdentity(credentials)?.spec?.filename,
         path.join(resolveDshHome(), '.credentials.yaml'), path.join(instructionHomes.dshHome, '.credentials.yaml'),
@@ -221,7 +236,6 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         agentCtx.tools.restrict({ allow: assembly.tools })
         setSandboxMode(agent.session, policy.sandboxMode)
         setApprovalPolicy(agent.session, policy.approvalPolicy)
-        appendPluginRecord(agent.session, 'plugin:dynamic-context/execution-host-v1', { taskId: assembly.task.id, contextVersion: assembly.contextVersion, policy })
         // The identity is native, but only this private runner owns its loop.
         for (const method of ['followup', 'inject', 'steer']) Object.defineProperty(agent, method, {
           value: () => fail('DIRECT_RUNTIME_NATIVE_MESSAGE_DISABLED'), configurable: false, writable: false,
@@ -230,6 +244,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       },
     }))
     const { agent } = handle
+    sessionRecords.append(agent.session, 'plugin:dynamic-context/execution-host-v1', { taskId: assembly.task.id, contextVersion: assembly.contextVersion, policy })
     const visible = ctx.tools.schemas(agent).map(row => row.name).sort()
     if (JSON.stringify(visible) !== JSON.stringify([...assembly.tools].sort())) fail('DIRECT_RUNTIME_TOOL_SCOPE_MISMATCH')
     const shellConfinement = assembly.tools.includes('bash') ? await sandbox.confine(['true'], {
@@ -283,12 +298,12 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
     ]
     const systemPrompt = `${config.systemPrompt}\n\n${rules.join('\n')}\n\n<direct_host_facts>\n${JSON.stringify(facts)}\n</direct_host_facts>`
     const currentPolicy = () => ({ sandboxMode: sandboxPolicy.resolve({ session: agent.session }).mode,
-      approvalPolicy: approval.effectivePolicy(agent.session), plan: policy.plan, cwd: workingDirectory.get(agent.session) })
+      approvalPolicy: approval.effectivePolicy(agent.session), plan: policy.plan, cwd: agent.session.header.cwd })
     const check = () => {
       control.signal.throwIfAborted()
       if (sourceAgent && ctx.agents.get(sourceAgent.id) !== sourceAgent) fail('DIRECT_RUNTIME_OWNER_DISPOSED')
       if (ctx.agents.get(agent.id) !== agent) fail('DIRECT_RUNTIME_EXECUTION_HOST_DISPOSED')
-      for (const [name, service] of Object.entries({ sandboxPolicy, approval, workingDirectory, fs: filesystem, sandbox, subprocess, shell, skills, credentials }))
+      for (const [name, service] of Object.entries({ sandboxPolicy, approval, fs: filesystem, sandbox, subprocess, shell, skills, credentials }))
         if (serviceIdentity(ctx.get(name)) !== serviceIdentity(service)) fail('DIRECT_RUNTIME_SERVICE_CHANGED')
       privacy?.check()
       if (digest(ownerState()) !== digest(owner) || digest(currentPolicy()) !== digest(policy)) fail('DIRECT_RUNTIME_POLICY_CHANGED')
@@ -352,7 +367,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         const initial = new Set(initialInstructions.map(row => row.path)), required = new Set(facts.requiredSkills.map(row => row.name))
         return { instructions: [...instructionPins.values()].filter(row => !initial.has(row.path)), skills: [...loadedSkills.values()].filter(row => !required.has(row.name)) }
       },
-      checkpoint(reference) { appendPluginRecord(agent.session, 'plugin:dynamic-context/checkpoint-v1', reference) },
+      checkpoint(reference) { sessionRecords.append(agent.session, 'plugin:dynamic-context/checkpoint-v1', reference) },
       async complete() { await verifySources(); completed = true; await close() },
       async preflight(calls) {
         await verifySources()

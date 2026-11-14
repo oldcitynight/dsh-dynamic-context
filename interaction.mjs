@@ -60,19 +60,27 @@ export class SessionInteraction {
     if (record && !['native', 'task-graph', 'full'].includes(record.mode)) reject('DYNAMIC_CONTEXT_MODE_RECORD_INVALID')
     return record?.mode ?? (this.classic(agent) ? 'task-graph' : 'native')
   }
+  isController(agent) {
+    const registry = this.ctx.agents
+    if (!agent || !registry.roots().includes(agent)) return false
+    const { header } = agent.session
+    // Fork lineage alone does not make a normal chat a delegated child.
+    if (header.origin === 'subagent' || (header.delegationDepth ?? 0) > 0) return false
+    return !agent.session.snapshotEvents(agent.session.inheritedEventCount).some(event => event.ignorable === true
+      && event.type === 'plugin:dynamic-context/execution-host-v1')
+  }
   exact(agent) {
     this.template.assertBase()
-    if (this.closed || !agent || this.ctx.agents.get(agent.id) !== agent
-        || !this.ctx.agents.roots().includes(agent)) reject('DYNAMIC_CONTEXT_ROOT_CONTROLLER_REQUIRED')
+    if (this.closed || !this.isController(agent)) reject('DYNAMIC_CONTEXT_ROOT_CONTROLLER_REQUIRED')
   }
   install() {
     const ctx = this.ctx
     ctx.effect(() => this.template.taskGraph.registerSessionPolicy({ id: 'dynamic-context', allowClassic: agent => this.mode(agent) === 'task-graph' }))
     ctx.systemPrompt.section({ name: 'dynamic-context:initial-guidance', order: 45,
-      text: ({ agent }) => agent && ctx.agents.roots().includes(agent) ? INITIAL_GUIDANCE : '' })
+      text: ({ agent }) => this.isController(agent) ? INITIAL_GUIDANCE : '' })
     ctx.systemPrompt.context({ name: 'dynamic-context:session-mode', order: 47, interpolate: false,
       text: ({ agent }) => {
-        if (!agent || !ctx.agents.roots().includes(agent)) return ''
+        if (!this.isController(agent)) return ''
         const mode = this.mode(agent), entry = this.entries.get(agent)
         const state = { mode, selected: Boolean(this.record(agent)), taskGraphPresent: Boolean(this.classic(agent)), baseGraphPresence: this.basePresence(agent) }
         if (mode !== 'full' || !entry) return JSON.stringify(state)
@@ -88,7 +96,7 @@ export class SessionInteraction {
           userMessageId: { type: 'string', required: true }, quote: { type: 'string', required: true } }, additionalProperties: false } },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
       execute: (args, exec) => this.select(exec.agent, args, exec.signal),
-    }))
+    }), { when: ({ agent }) => this.isController(agent) })
     ctx.tools.register(defineTool({ name: 'dynamic_context_graph_status',
       description: 'Distinguish graphs never created from a previously committed graph that is missing or invalid. Recovery-required workflows cannot be downgraded or recreated.',
       parameters: {}, projectPlanCapability: 'read_or_protocol',
@@ -96,14 +104,14 @@ export class SessionInteraction {
       execute: (_args, exec) => { this.exact(exec.agent); return { mode: this.mode(exec.agent), base: this.basePresence(exec.agent),
         linked: this.linkedPresence(exec.agent),
         instruction: 'Missing historical graphs require restoration of verified state. Do not start a new graph or infer that previous work never happened.' } },
-    }))
+    }), { when: ({ agent }) => this.isController(agent) })
     ctx.on('agent/created', async ({ agent }) => {
-      if (!ctx.agents.roots().includes(agent)) return
+      if (!this.isController(agent)) return
       if (this.mode(agent) === 'full') this.mount(agent, this.record(agent))
       this.refresh(agent)
     })
     ctx.on('agent/disposed', ({ agent }) => this.release(agent))
-    for (const agent of ctx.agents.roots()) {
+    for (const agent of ctx.agents.roots().filter(agent => this.isController(agent))) {
       if (this.mode(agent) === 'full') this.mount(agent, this.record(agent))
       this.refresh(agent)
     }

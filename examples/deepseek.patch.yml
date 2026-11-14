@@ -1,4 +1,4 @@
-# Requires the running dsh-bettertaskgraphs rc.11 service and native userQuestions.
+# Requires the running dsh-bettertaskgraphs 0.3.0-rc.12 service and native userQuestions.
 # Replace paths/model with your intended project and API model before enabling.
 # Keep the credential in DSH's credential store or environment, never this file.
 - id: dsh-dynamic-context

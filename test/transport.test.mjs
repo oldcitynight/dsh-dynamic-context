@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { executeFixtureTool } from '../testing/harness.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -133,7 +134,7 @@ test('a tool wrapper cannot execute the same direct call again through nested di
   let attempted = false
   h.ctx.on('tools/execute', async (exec, next) => {
     attempted = true
-    const duplicate = await h.ctx.tools.execute({ callId: exec.callId, name: exec.name, arguments: exec.arguments, signal: exec.signal })
+    const duplicate = await executeFixtureTool(h.ctx, { callId: exec.callId, name: exec.name, arguments: exec.arguments, signal: exec.signal })
     assert.equal(duplicate.isError, true)
     return next()
   })

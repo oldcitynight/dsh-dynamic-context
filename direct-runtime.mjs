@@ -7,6 +7,8 @@ import { z } from 'zod'
 import { symbols } from '@deepseek-ai/cordis'
 import { createScope, bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
+import * as Observations from '@deepseek-ai/dsh-fs-observation-policy'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { discoverBaselineInstructionFiles } from '@deepseek-ai/dsh-agent-instructions'
@@ -59,6 +61,22 @@ const nativeModules = {
 const requiredServices = { filesystem: ['fs', 'workingDirectory'], search: ['subprocess', 'workingDirectory'],
   shell: ['shell', 'shellEnv', 'sandbox', 'workingDirectory'], web: ['web'], skills: ['skills'], state: [] }
 const readTools = new Set(['read', 'glob', 'grep', 'web_search', 'web_fetch', 'skill', 'dynamic_task_status', 'dynamic_context_source_read'])
+
+function installFileObservations(ctx, agent) {
+  // DSH dispatches fs events without a scope carrier. Route the native policy
+  // by its explicit actor so the deployment's ordinary tools keep their policy.
+  Observations.apply(ctx.extend({
+    on(event, listener) {
+      if (event === 'fs/observed') return ctx.on(event, (target, observation, actor) => {
+        if (actor?.agent === agent) listener(target, observation, actor)
+      })
+      return ctx.on(event, async (target, actor, next) => {
+        const intent = await next()
+        return actor?.agent === agent && intent === undefined ? listener(target, actor, next) : intent
+      }, { prepend: true })
+    },
+  }))
+}
 const modes = ['read-only', 'workspace-write', 'danger-full-access']
 const minimumMode = (...values) => modes[Math.min(...values.map(value => modes.indexOf(value)))]
 const inside = (root, target) => { const relative = path.relative(root, target); return relative === '' || relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative) }
@@ -215,15 +233,16 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       meta: { cwd, ...(resumeState ? { parentSession: resumeState.native.header.id, isSeeded: true } : {}) },
       ...(seed ? { seed, inheritedEventCount: seed.length } : {}), signal: control.signal,
       agentOptions: { provider: config.provider, model: config.model, maxTokens: config.maxOutputTokens },
-      setup: (agentCtx, agent) => {
+      setup: async (agentCtx, agent) => {
         bindScopeParent(agent, scopeKey)
-        agentCtx.tools.presentAs('native')
+        await agentCtx.plugin(NativeExecutor)
+        if (options.modules.includes('filesystem')) installFileObservations(agentCtx, agent)
         agentCtx.tools.restrict({ allow: assembly.tools })
         setSandboxMode(agent.session, policy.sandboxMode)
         setApprovalPolicy(agent.session, policy.approvalPolicy)
         appendPluginRecord(agent.session, 'plugin:dynamic-context/execution-host-v1', { taskId: assembly.task.id, contextVersion: assembly.contextVersion, policy })
         // The identity is native, but only this private runner owns its loop.
-        for (const method of ['followup', 'inject', 'steer']) Object.defineProperty(agent, method, {
+        for (const method of ['send', 'followup', 'inject', 'steer']) Object.defineProperty(agent, method, {
           value: () => fail('DIRECT_RUNTIME_NATIVE_MESSAGE_DISABLED'), configurable: false, writable: false,
         })
         agentCtx.on('agent/pre-step', () => { fail('DIRECT_RUNTIME_NATIVE_MODEL_DISABLED') })
@@ -342,6 +361,9 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       agent, systemPrompt, facts, close, check,
       beforeAuxiliaryRequest: verifySources,
       runTool: fn => privacy ? privacy.run(fn) : fn(),
+      resolveTools: () => hostCalls.run(true, () => ctx.tools.resolve({ agent, signal: control.signal,
+        modelSelection: Object.freeze({ provider: config.provider, model: config.model,
+          ...(config.direct.reasoningEffort ? { reasoningEffort: config.direct.reasoningEffort } : {}) }) })),
       async snapshot() {
         await verifySources()
         return { facts, owner, sourceAgentId: sourceAgent?.id ?? null,

@@ -3,7 +3,7 @@
 // belong to one role invocation; this is not a filesystem or workflow tool.
 import fs from 'node:fs'
 import path from 'node:path'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { nativeMessageEstimate } from './native-compaction.mjs'
 import { COMPACTION_INSTRUCTION, nativeCompactSpec, SUMMARY_MAX_TOKENS } from './dsh-compaction-policy.mjs'
 import { apiParameters } from './api-protocol.mjs'

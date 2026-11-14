@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { z } from 'zod'
-import { canonical, copy, digest, GraphError } from 'dsh-bettertaskgraphs/core'
+import { canonical, copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 const nonempty = z.string().trim().min(1)
 const fail = (code, detail) => { throw new GraphError(code, detail ? code + ': ' + JSON.stringify(detail) : code) }
 export const modificationReportSchema = z.object({ summary: nonempty,

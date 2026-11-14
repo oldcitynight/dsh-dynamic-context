@@ -5,13 +5,13 @@ import os from 'node:os'
 import path from 'node:path'
 import UserQuestions from '@deepseek-ai/dsh-user-questions'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import TaskGraph from 'dsh-bettertaskgraphs'
+import TaskGraph from 'dsh-better-task-grapth'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { DynamicContextRuntime, validateConfig } from '../index.mjs'
 import { MODE_OPTIONS, MODE_RECORD } from '../interaction.mjs'
 import { GRAPH_COMMIT_RECORD } from '../graph-presence.mjs'
-import { sessionReference } from 'dsh-bettertaskgraphs/host'
+import { sessionReference } from 'dsh-better-task-grapth/host'
 
 async function fixture(t, { choice = 'full', revision = false, respond, taskGraph = true } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-boundaries-')))

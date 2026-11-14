@@ -1,3 +1,8 @@
+# 0.1.1-rc.39 — DSH compatibility line
+
+- Pin this build to its listed DSH releases and pair it with the other plugin on RC slot 9.
+- Persist plugin records in a separate JSONL-host-bound journal while validating native tool evidence against DSH persistence. Adapt the Web read endpoint to the native Session lookup of this host generation.
+
 # 0.1.0-rc.24 — task-graph prerequisite and graph provenance (2026-11-13)
 
 - Require the live task-graph extension contract; move joint revision implementation out of the base plugin.

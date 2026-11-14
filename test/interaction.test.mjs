@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import UserQuestions from '@deepseek-ai/dsh-user-questions'
-import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TaskGraph from 'dsh-bettertaskgraphs'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
@@ -73,7 +73,9 @@ for (const mode of ['native', 'task-graph', 'full']) test(`human choice ${mode} 
   assert.equal(schemaNames(f.h.ctx, first.agent).includes('dynamic_context_submit'), mode === 'full')
   assert.equal((await f.call(first.agent, 'dynamic_context_select_mode', { reason: '重复调用' })).alreadySelected, true)
   assert.equal(f.questions.length, 1)
-  assert.ok(first.agent.session.snapshotEvents().some(row => row.type === MODE_RECORD && row.data.mode === mode))
+  const records = f.h.ctx.transactionGraph.sessionRecords
+  assert.ok(records.read(first.agent.session).some(({ event }) => event.type === MODE_RECORD && event.data.mode === mode))
+  assert.ok(!first.agent.session.snapshotEvents().some(event => event.type === MODE_RECORD))
   const secondPrompt = await f.h.ctx.systemPrompt.assemble({ agent: second.agent, scope: second.agent })
   assert.doesNotMatch(JSON.stringify(secondPrompt), /FIRST_TASK_CONTRACT|MUST_NOT_LEAK_TEMPLATE_GOAL/)
   if (mode === 'full') {
@@ -187,7 +189,7 @@ test('session commit receipt prevents fresh creation after both graph and witnes
   await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
   await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
   const child = f.h.runner.interaction.entries.get(agent).runner
-  assert.ok(agent.session.snapshotEvents().some(event => event.type === GRAPH_COMMIT_RECORD))
+  assert.ok(f.h.ctx.transactionGraph.sessionRecords.read(agent.session).some(({ event }) => event.type === GRAPH_COMMIT_RECORD))
   fs.unlinkSync(child.graph.store.file); fs.unlinkSync(child.graph.store.witness.file)
   assert.equal(child.graphPresence().state, 'GRAPH_AND_WITNESS_LOST_AFTER_COMMIT')
   assert.equal(child.graphPresence().canRestore, false)
@@ -278,4 +280,23 @@ for (const full of [false, true]) test(`native tool loop reaches ${full ? 'joint
     assert.equal((await f.call(controller, 'dynamic_context_select_mode', { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
   }
   assert.equal(f.questions.length, 1)
+})
+
+test('legacy session record loss blocks mode changes while native JSONL remains readable', async t => {
+  const f = await fixture(t), { agent } = await f.agent('lost-plugin-records')
+  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  const records = f.h.ctx.transactionGraph.sessionRecords
+  const native = await f.h.ctx.sessionPersistence.open(agent.id, 'read')
+  try {
+    const { events } = await native.read(0, 100)
+    assert.ok(events.some(row => row.type === 'user/message'))
+    assert.ok(events.every(row => !row.type.startsWith('plugin:')))
+  } finally { await native.close() }
+  fs.unlinkSync(path.join(records.directory(agent.session), 'records.json'))
+  const status = await f.call(agent, 'dynamic_context_graph_status', {})
+  assert.equal(status.mode, 'recovery')
+  assert.equal(status.base.code, 'LEGACY_SESSION_RECORD_JOURNAL_MISSING')
+  const selection = await f.call(agent, 'dynamic_context_select_mode', { reason: '尝试新建', reconsider: true })
+  assert.equal(selection.status, 'RECOVERY_REQUIRED')
 })

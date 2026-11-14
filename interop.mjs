@@ -13,6 +13,7 @@ export function requireTaskGraph(ctx, expected) {
   if (!service || expected && identity(service) !== identity(expected) || service.host?.closed || service.workflows?.closed
       || service.workflowContract !== WORKFLOW_CONTRACT || service.extensionContract !== EXTENSION_CONTRACT
       || typeof service.registerWorkflowProvider !== 'function' || typeof service.registerSessionPolicy !== 'function'
+      || typeof service.sessionRecords?.read !== 'function' || typeof service.sessionRecords?.append !== 'function'
       || typeof service.createExtensionStore !== 'function' || typeof service.inspectGraphPresence !== 'function')
     throw new Error('DYNAMIC_CONTEXT_REQUIRES_ACTIVE_TASK_GRAPH')
   return service

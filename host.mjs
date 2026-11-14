@@ -11,7 +11,6 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Filesystem from '@deepseek-ai/dsh-fs-sandbox'
-import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import Subprocess from '@deepseek-ai/dsh-subprocess-local'
 import Sandbox from '@deepseek-ai/dsh-sandbox-local'
@@ -19,7 +18,7 @@ import Shell from '@deepseek-ai/dsh-bash-sandbox'
 import * as ShellEnv from '@deepseek-ai/dsh-shell-env'
 import Skills from '@deepseek-ai/dsh-skill'
 import * as Observations from '@deepseek-ai/dsh-fs-observation-policy'
-import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TaskGraph from 'dsh-bettertaskgraphs'
 import * as DynamicContext from './index.mjs'
 
@@ -46,7 +45,6 @@ export async function createDirectHost(input) {
     const runtime = config.direct.runtime
     await ctx.plugin(SandboxPolicy, { mode: runtime.sandboxMode, workspaceRoot: config.projectRoot })
     await ctx.plugin(Filesystem, { cwd: config.projectRoot })
-    await ctx.plugin(WorkingDirectory, { defaultDirectory: config.projectRoot })
     await ctx.plugin(Approval, { policy: runtime.approvalPolicy })
     await ctx.plugin(Subprocess)
     await ctx.plugin(Sandbox)

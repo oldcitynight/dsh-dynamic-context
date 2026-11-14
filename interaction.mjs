@@ -2,7 +2,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { appendPluginRecord } from '@deepseek-ai/dsh-session'
 import { digest, normalizePlan } from 'dsh-bettertaskgraphs/core'
 import { connectTaskGraph } from './interop.mjs'
 import { registerControlTools } from './control-tools.mjs'
@@ -29,8 +28,8 @@ export class SessionInteraction {
     this.entries = new Map(); this.filters = new Map(); this.pending = new Set(); this.closed = false
   }
   record(agent) {
-    return agent?.session.snapshotEvents().findLast(event => event.type === MODE_RECORD
-      && event.ignorable === true && event.data.sessionId === agent.session.id)?.data
+    return agent && this.template.taskGraph.sessionRecords.read(agent.session).findLast(({ event }) => event.type === MODE_RECORD
+      && event.data.sessionId === agent.session.id)?.event.data
   }
   classic(agent) {
     if (!agent || this.ctx.agents.get(agent.id) !== agent) return null
@@ -43,7 +42,9 @@ export class SessionInteraction {
   linkedPresence(agent) {
     const entry = this.entries.get(agent)
     if (entry) return entry.runner.graphPresence()
-    const events = agent.session.snapshotEvents()
+    let events
+    try { events = this.template.taskGraph.sessionRecords.read(agent.session).map(({ event }) => event) }
+    catch (error) { return { state: 'SESSION_PLUGIN_RECORDS_UNAVAILABLE', previouslyCommitted: null, code: error.code ?? error.name } }
     const key = digest({ id: agent.session.id, createdAt: agent.session.header.createdAt, cwd: agent.session.header.cwd })
     const committed = events.some(event => event.ignorable && event.type === GRAPH_COMMIT_RECORD
       && event.data.workflowId === `workflow_${key.slice(0, 40)}`)
@@ -74,7 +75,7 @@ export class SessionInteraction {
       text: ({ agent }) => {
         if (!agent || !ctx.agents.roots().includes(agent)) return ''
         const mode = this.mode(agent), entry = this.entries.get(agent)
-        const state = { mode, selected: Boolean(this.record(agent)), taskGraphPresent: Boolean(this.classic(agent)), baseGraphPresence: this.basePresence(agent) }
+        const state = { mode, selected: mode === 'recovery' ? null : Boolean(this.record(agent)), taskGraphPresent: Boolean(this.classic(agent)), baseGraphPresence: this.basePresence(agent) }
         if (mode !== 'full' || !entry) return JSON.stringify(state)
         const runner = entry.runner
         return JSON.stringify({ ...state, workflowId: runner.config.interop.workflowId, status: runner.status() })
@@ -163,9 +164,10 @@ export class SessionInteraction {
     this.exact(agent); signal?.throwIfAborted()
     if (typeof reason !== 'string' || !reason.trim()) reject('DYNAMIC_CONTEXT_MODE_REASON_REQUIRED')
     if (this.pending.has(agent)) reject('DYNAMIC_CONTEXT_MODE_QUESTION_PENDING')
+    const baseGraphPresence = this.basePresence(agent)
+    if (!['PRESENT', 'CREATION_PENDING', 'NEVER_CREATED', 'OUTSIDE_SCOPE'].includes(baseGraphPresence.state))
+      return { status: 'RECOVERY_REQUIRED', mode: 'recovery', baseGraphPresence, changed: false }
     const prior = this.record(agent)
-    if (!['PRESENT', 'CREATION_PENDING', 'NEVER_CREATED', 'OUTSIDE_SCOPE'].includes(this.basePresence(agent).state))
-      return { status: 'RECOVERY_REQUIRED', mode: 'recovery', baseGraphPresence: this.basePresence(agent), changed: false }
     const graphPresence = this.entries.get(agent)?.runner.graphPresence()
     if (graphPresence?.recoveryRequired) return { status: 'RECOVERY_REQUIRED', mode: 'full', graphPresence, changed: false, nextTool: 'dynamic_context_recover_graphs' }
     if (prior && !reconsider) return { mode: prior.mode, alreadySelected: true }
@@ -186,7 +188,7 @@ export class SessionInteraction {
     const row = { version: 1, sessionId: agent.session.id, mode, evidence,
       ...(mode === 'full' && this.template.config.revision ? { policy: this.policy(agent) } : {}) }
     await this.release(agent)
-    appendPluginRecord(agent.session, MODE_RECORD, row)
+    this.template.taskGraph.sessionRecords.append(agent.session, MODE_RECORD, row)
     if (!await this.ctx.sessions.flush(agent.session)) reject('DYNAMIC_CONTEXT_MODE_NOT_DURABLE')
     signal?.throwIfAborted(); this.exact(agent)
     if (mode === 'full') await this.mount(agent, row)

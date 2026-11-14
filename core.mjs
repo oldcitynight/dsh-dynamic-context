@@ -45,9 +45,12 @@ const stateSchema = z.object({ schema: z.literal(1), revision: z.number().int().
 }).strict()
 
 export class DynamicContextError extends Error {
-  constructor(code) { super(code); this.name = 'DynamicContextError'; this.code = code }
+  constructor(code, detail) {
+    super(detail ? `${code}: ${JSON.stringify(detail)}` : code)
+    this.name = 'DynamicContextError'; this.code = code
+  }
 }
-export const fail = code => { throw new DynamicContextError(code) }
+export const fail = (code, detail) => { throw new DynamicContextError(code, detail) }
 const seal = value => { const { checksum, ...body } = value; return { ...body, checksum: digest(body) } }
 function reachable(source, target, edges) {
   const visited = new Set(), pending = [source]
@@ -252,9 +255,16 @@ export class DynamicContextGraph {
     const proposal = proposalSchema.parse(input)
     return this.store.compareAndSwap(0, () => {
       const roots = proposal.taskGraph.nodes.filter(node => node.kind === 'container')
-      if (roots.length !== 1 || roots[0].parent !== undefined || proposal.taskGraph.nodes.some(node =>
-        node.kind === 'leaf' && node.parent !== roots[0].key)
-        || proposal.taskGraph.edges.some(edge => edge.from === roots[0].key || edge.to === roots[0].key)) fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES')
+      const topologyError = (field, correction) => fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', { field, correction })
+      if (roots.length !== 1) topologyError('taskGraph.nodes', 'Declare exactly one node with kind="container". Put every leaf directly under it using parent.')
+      const [root] = roots
+      if (root.parent !== undefined) topologyError('taskGraph.nodes.' + root.key + '.parent', 'Omit parent on the root container.')
+      const unparented = proposal.taskGraph.nodes.filter(node => node.kind === 'leaf' && node.parent !== root.key).map(node => node.key)
+      const containerEdges = proposal.taskGraph.edges.filter(edge => edge.from === root.key || edge.to === root.key)
+      if (unparented.length || containerEdges.length) fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', {
+        root: root.key, leavesNeedingRootParent: unparented, edgesTouchingRoot: containerEdges,
+        correction: 'Set each listed leaf parent to the root key. Express containment with parent; keep prerequisite edges between leaves only.',
+      })
       const temporary = new MemoryGraphStore()
       this.core(temporary).create({ operationId: `op_${randomUUID()}`, definition: proposal.taskGraph })
       const graph = temporary.read(), taskIds = new Map(graph.state.plan.nodes.map(node => [node.key, node.id]))

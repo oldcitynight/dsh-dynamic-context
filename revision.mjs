@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import { canonical, copy, digest, GraphError } from 'dsh-bettertaskgraphs/core'
+import { canonical, copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { modificationReportSchema, validateModificationReport, scopedReviewInput, UPDATE_REPORT_INSTRUCTION, REVIEW_REPORT_INSTRUCTION, revisionEvidenceCatalog, EVIDENCE_POINTER_INSTRUCTION } from './revision-report.mjs'
 
 const fail = code => { throw new GraphError(code) }
@@ -74,6 +74,8 @@ export const REVISION_CONTEXTS = Object.freeze({
   standalone: `当前仅使用任务图插件，contextGraph 必须是 null，invalidateReports 必须为空。保持现有分支语义，改动仅覆盖未开始任务及前置依赖。`,
 })
 
+const mutableContextInstructions = '运行中标记 mutable:true 的上下文节点，其初始内容和历史绑定保留在 contextGraph，当前值见 snapshot.sharedContexts。保留标记以维持同一 ID 的事实版本。当前事实内容通过共享上下文工具更新，结构与绑定变更仍须审计。新增可变节点可使用 {key,content,parents,mutable:true}。'
+
 function roleContext(role, linked) {
   const format = role === 'updater'
     ? `只输出 JSON 对象：{"disposition":"REVISE|NO_CHANGE|NEEDS_USER","trigger":"COUNTEREXAMPLE|MISSING_DEPENDENCY|CONTEXT_GAP|STALE_REPORT|USER_CHANGE|NONE","reason":"理由","evidenceIds":["事实ID"],"taskGraph":完整任务图或null,"contextGraph":完整上下文图或null,"coverage":[{"requirement":"固定需求ID","tasks":["叶任务key"]}],"retirements":[{"task":"被删除任务key","replacements":["替代key"],"reason":"理由"}],"invalidateReports":["失效报告的任务key"]}。NO_CHANGE/NEEDS_USER 的两张图均为 null。`
@@ -84,7 +86,8 @@ function roleContext(role, linked) {
   const responsibilities = role === 'reviewer'
     ? '依据 snapshot.supervisionReview.runtimeSemantics、completion 和局部指令分配核验职责。全局发布格式或摘要要求不自动成为每个 report 叶的字节核验义务；只有明确的局部字节义务或确切字节声明才增加该项检查。完整值比较被改成部分字段比较时，反例是遗漏的必要字段。局部指令与宿主已经提供的保证无需逐字重复。'
     : ''
-  return [REVISION_CONTEXTS.trigger, REVISION_CONTEXTS[role], REVISION_CONTEXTS[linked ? 'linked' : 'standalone'], grounding, responsibilities, format].filter(Boolean).join('\n\n')
+  return [REVISION_CONTEXTS.trigger, REVISION_CONTEXTS[role], REVISION_CONTEXTS[linked ? 'linked' : 'standalone'],
+    linked && mutableContextInstructions, grounding, responsibilities, format].filter(Boolean).join('\n\n')
 }
 
 /** Host-only coordinator. The model never supplies a reviewer callback or receipt.

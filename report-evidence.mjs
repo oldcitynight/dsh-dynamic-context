@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
 import path from 'node:path'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { realProjectPath } from './artifacts.mjs'
 import { artifactMetadata } from './revision-host.mjs'
 import { executionReportSchema } from './supervision-state.mjs'

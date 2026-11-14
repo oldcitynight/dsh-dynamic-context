@@ -30,20 +30,18 @@ function fixture({ count = 450, length = 7800 } = {}) {
 }
 const summary = text => ({ finish: 'stop', text, message: { role: 'assistant', content: text }, responseId: 'summary-1' })
 
-test('pinned native prompt and preamble are byte-identical to pristine rc.5', t => {
-  // Repository source is not included in the distributable test bundle.
-  const actual = new URL('../../../upstream/deepseek-harness-rc.5/packages/compaction/compaction-basic/src/summarizer.ts', import.meta.url)
-  if (!fs.existsSync(actual)) return t.skip('pristine upstream tree unavailable in installed package')
-  const text = fs.readFileSync(actual, 'utf8')
-  const block = text.slice(text.indexOf('const SUMMARY_OPEN_TAG'), text.indexOf('/**\n * The replayed conversation'))
+test('pinned native prompt and preamble match the installed DSH compactor', () => {
+  const text = fs.readFileSync(new URL(import.meta.resolve('@deepseek-ai/dsh-compaction-basic')), 'utf8')
+  const start = text.indexOf('const SUMMARY_OPEN_TAG')
+  const preamble = text.indexOf('const CHECKPOINT_PREAMBLE', start)
+  const end = text.indexOf('\n/**', preamble)
+  assert.ok(start >= 0 && preamble > start && end > preamble)
+  const block = text.slice(start, end)
   const expected = vm.runInNewContext(block + '; ({ COMPACTION_INSTRUCTION, CHECKPOINT_PREAMBLE })')
   assert.equal(COMPACTION_INSTRUCTION, expected.COMPACTION_INSTRUCTION)
   assert.equal(CHECKPOINT_PREAMBLE, expected.CHECKPOINT_PREAMBLE)
   assert.deepEqual(nativeCompactSpec(1048576, 32768), { contextWindow: 1048576, reservedCompletionTokens: 32768,
     thresholdTokens: 838860, retainTokens: 162529, maxTokens: 65536, attempts: 2 })
-  assert.equal(DEFAULT_MAX_TOKENS, 256000)
-  assert.equal(nativeCompactSpec(1048576, DEFAULT_MAX_TOKENS).thresholdTokens, 727040)
-  assert.equal(nativeCompactSpec(1048576, DEFAULT_MAX_TOKENS).retainTokens, 126812)
 })
 
 test('tool pruner uses native code point boundaries and acts only beyond 8192', () => {

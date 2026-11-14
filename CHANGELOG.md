@@ -1,3 +1,8 @@
+# 0.1.1-rc.48
+
+- 配套任务图包更名为 `dsh-better-task-grapth@0.3.1-rc.48`。
+- 支持运行中直接修订共享上下文，并持久保存版本。
+
 # 0.1.1-rc.38 — DSH compatibility line
 
 - Pin this build to its listed DSH releases and pair it with the other plugin on RC slot 8.

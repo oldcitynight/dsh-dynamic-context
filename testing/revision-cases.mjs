@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 
 export const revisionTestPolicy = {
   objective: '实现可在长期工作中安全修订任务图和动态上下文图的插件，修改提案和审批角色独立串行执行。',
@@ -47,7 +47,7 @@ export function initialRevisionFixture(spec, root) {
     '当前方案已经明确：追加修订事件、保留历史、双图原子 CAS、独立修改和审批角色、证据及授权复核、报告失效传递、未知结果禁止重放、完整失败路径验证。'
   if (spec.long) {
     // Authentic historical source and tests, not repetition to inflate context.
-    const directories = ['plugins/dynamic-context', 'plugins/dynamic-context/test', 'dsh-bettertaskgraphs', 'dsh-bettertaskgraphs/test']
+    const directories = ['plugins/dynamic-context', 'plugins/dynamic-context/test', 'dsh-better-task-grapth', 'dsh-better-task-grapth/test']
     const files = directories.flatMap(directory => fs.readdirSync(path.join(root, directory)).filter(name => name.endsWith('.mjs'))
       .map(name => path.join(directory, name)))
     let count = 0, total = 0, chunk = ''

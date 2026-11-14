@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { revisionChanges, validateModificationReport, scopedReviewInput, revisionEvidenceCatalog } from '../revision-report.mjs'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 const snapshot = () => ({ linked: true, revision: 3, checksum: 'base',
   taskGraph: { title: 'Task', nodes: [{ key: 'root', kind: 'container', label: 'Root' }, { key: 'a', kind: 'leaf', parent: 'root', label: 'A' }, { key: 'b', kind: 'leaf', parent: 'root', label: 'B' }], edges: [] },
   contextGraph: { nodes: [{ key: 'shared', content: 'Required source data', parents: [] }, { key: 'private', content: 'UNRELATED_CONTEXT_DATA', parents: [] }],

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { z } from 'zod'
 import { symbols } from '@deepseek-ai/cordis'
-import { WORKFLOW_CONTRACT } from 'dsh-bettertaskgraphs/interop'
-import { EXTENSION_CONTRACT } from 'dsh-bettertaskgraphs/extensions'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { WORKFLOW_CONTRACT } from 'dsh-better-task-grapth/interop'
+import { EXTENSION_CONTRACT } from 'dsh-better-task-grapth/extensions'
+import { digest } from 'dsh-better-task-grapth/core'
 import { proposalSchema } from './core.mjs'
 import { interactiveProposalSchema } from './control-tools.mjs'
 

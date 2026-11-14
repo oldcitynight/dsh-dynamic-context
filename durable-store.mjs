@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { canonical, digest } from 'dsh-bettertaskgraphs/core'
+import { canonical, digest } from 'dsh-better-task-grapth/core'
 import { fail } from './core.mjs'
 
 const clean = value => JSON.parse(JSON.stringify(value))

@@ -2,7 +2,7 @@
 // Text-only adaptation of DSH's MIT compaction-basic and tool-result-pruner.
 // Native prompt/policy attribution: DSH-COMPACTION-LICENSE.txt.
 import { estimateMessage, estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 import { deepFreeze, wireTools, activeTaskBinding } from './request-policy.mjs'
 import { checkDirectHistory, checkpointData } from './checkpoints.mjs'
 import { apiParameters } from './api-protocol.mjs'

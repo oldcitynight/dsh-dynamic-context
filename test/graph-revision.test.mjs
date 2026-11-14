@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { TransactionGraph, revisedPlan, digest, copy } from 'dsh-bettertaskgraphs/core'
-import { MemoryGraphStore } from 'dsh-bettertaskgraphs/store'
+import { TransactionGraph, revisedPlan, digest, copy } from 'dsh-better-task-grapth/core'
+import { MemoryGraphStore } from 'dsh-better-task-grapth/store'
 import { RevisionCoordinator, planDefinition } from '../revision.mjs'
 
 const definition = { title: 'Revision fixture', nodes: [{ key: 'root', kind: 'container', label: 'Root' },

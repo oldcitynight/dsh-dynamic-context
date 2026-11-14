@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { z } from 'zod'
-import { canonical, GraphError } from 'dsh-bettertaskgraphs/core'
+import { canonical, GraphError } from 'dsh-better-task-grapth/core'
 
 const nonempty = z.string().refine(value => value.trim().length > 0)
 const hash = z.string().regex(/^[a-f0-9]{64}$/)

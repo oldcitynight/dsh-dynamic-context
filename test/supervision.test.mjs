@@ -628,7 +628,7 @@ test('a fabricated failed tool identifier cannot close the attempt', async t => 
 })
 
 test('the real workflow port and controller schema expose only the supervised continuation', async t => {
-  const { default: TaskGraph } = await import('dsh-bettertaskgraphs')
+  const { default: TaskGraph } = await import('dsh-better-task-grapth')
   const Persistence = await import('@deepseek-ai/dsh-session-persistence-jsonl').then(module => module.default)
   const h = await fixture(t, ({ index }) => index === 1 ? result('COMPLETE', 'Prepared report.') : index === 2 ? accept : current, {
     runtime: true, config: { exposeControlTools: true, interop: { workflowId: 'supervision-fixture' } },

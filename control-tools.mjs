@@ -57,7 +57,7 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
     'Continue the exact pending supervision checkpoint. Report repair uses the same attempt and recorded evidence. Unknown role requests require trusted reconciliation.',
     { expectedRevision: { ...integer, required: true }, checkpointChecksum: { type: 'string', required: true } },
     async (args, exec, sourceAgent) => runner.continueSupervision({ ...args, sourceAgent, signal: exec.signal }), false, true)
-  register('dynamic_context_submit', 'Atomically submit one task graph and its context graph. Bind every leaf to explicit context nodes, prerequisite reports and a subset of host-authorized tools. Context cannot grant permissions. Later changes require the separate revision workflow if configured.'
+  register('dynamic_context_submit', 'Atomically submit one task graph and its context graph. Bind every leaf to explicit context nodes, prerequisite reports and a subset of host-authorized tools. Mark shared facts mutable: true; bind dynamic_context_shared_read and dynamic_context_shared_update where authorized. Context data cannot grant permissions. Structural changes use the separate revision workflow if configured.'
     + (runner.config.direct.compaction && runner.config.direct.compaction.strategy !== 'dsh-native' ? ' Extractive compaction is enabled: every leaf must explicitly bind dynamic_context_source_read.' : ''),
     { proposal: valueSpec(proposal, true) }, async ({ proposal }, exec, sourceAgent) => {
       if (submit) return submit(proposal, exec)

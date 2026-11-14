@@ -54,7 +54,7 @@ try {
     route: transport === 'direct' ? 'plugin-owned JSON -> direct loopback HTTP/SSE; native ToolRuntime for explicitly allowed agentless tools'
       : 'guarded native DSH -> shipped PiAiAdapter -> loopback HTTP/SSE',
     dshVersion: JSON.parse(fs.readFileSync(path.join(projectRoot, 'node_modules/@deepseek-ai/dsh/package.json'))).version,
-    taskGraphCoreVersion: JSON.parse(fs.readFileSync(path.join(projectRoot, 'dsh-bettertaskgraphs/package.json'))).version,
+    taskGraphCoreVersion: JSON.parse(fs.readFileSync(path.join(projectRoot, 'dsh-better-task-grapth/package.json'))).version,
     nodeVersion: process.version, requests: wire.length,
     taskRuns: completed.map(row => ({ task: row.trace.assembly.task.key, conversationId: row.report.sessionId,
       identityKind: transport === 'direct' ? 'plugin-owned conversation; not a native DSH Session' : 'native DSH Session',

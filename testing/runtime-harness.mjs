@@ -7,15 +7,14 @@ import Sandbox from '@deepseek-ai/dsh-sandbox-local'
 import Shell from '@deepseek-ai/dsh-bash-sandbox'
 import * as ShellEnv from '@deepseek-ai/dsh-shell-env'
 import Skills from '@deepseek-ai/dsh-skill'
-import * as FsObservation from '@deepseek-ai/dsh-fs-observation-policy'
 import { createHarness } from './harness.mjs'
 
 /** Real local execution services; model HTTP is the isolated fake endpoint. */
-export async function createRuntimeHarness({ projectRoot, directory, respond, backend, config = {}, setup, taskGraph = true, mode = 'workspace-write', approval = 'never' }) {
+export async function createRuntimeHarness({ projectRoot, directory, respond, backend, config = {}, setup, taskGraph = true, mode = 'workspace-write', approval = 'never', executor }) {
   const direct = config.direct ?? {}
   const runtime = { modules: ['filesystem', 'search', 'shell', 'skills', 'state'], sandboxMode: mode,
     instructionHomes: { dshHome: projectRoot + '/.dsh', agentsHome: projectRoot + '/.agents' }, ...direct.runtime }
-  return createHarness({ projectRoot, directory, respond, backend, taskGraph,
+  return createHarness({ projectRoot, directory, respond, backend, taskGraph, executor,
     config: { transport: 'direct', allowedTools: ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'skill', 'dynamic_task_status'],
       ...config, direct: { ...direct, agentlessTools: direct.agentlessTools ?? [], runtime } },
     setup: async ctx => {
@@ -28,7 +27,6 @@ export async function createRuntimeHarness({ projectRoot, directory, respond, ba
       await ctx.plugin(ShellEnv, { dshHome: projectRoot + '/.dsh' })
       await ctx.plugin(Shell, { cwd: projectRoot, timeoutMs: 1000, maxTimeoutMs: 3000 })
       await ctx.plugin(Skills)
-      await ctx.plugin(FsObservation)
       ctx.skills.register({ name: 'fixture-skill', description: 'Isolated fixture workflow', content: 'SKILL_FIXTURE_BODY: inspect evidence before reporting success.', source: 'runtime' })
       if (setup) await setup(ctx)
     },

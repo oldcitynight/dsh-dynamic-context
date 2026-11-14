@@ -54,7 +54,7 @@ function toolBridge(ctx, contract, control, record, execution, journal) {
   let repairDeferral
   return {
     takeRepairDeferral() { const value = repairDeferral; repairDeferral = undefined; return value },
-    async execute(call, deferred) {
+    async execute(call, deferred, toolSet) {
       control.signal.throwIfAborted()
       if (ctx.tools.get(call.function.name, agent) !== contract.definitions.get(call.function.name)) fail('DIRECT_TOOL_DEFINITION_CHANGED')
       journal?.append('TOOL_PENDING', { callId: call.id, tool: call.function.name, deferred: Boolean(deferred) })
@@ -69,9 +69,16 @@ function toolBridge(ctx, contract, control, record, execution, journal) {
         record('tool/deferred', { callId: call.id, name: call.function.name, execution: 'NOT_EXECUTED', content: deferred })
         return { role: 'tool', tool_call_id: call.id, content: reportContent(deferred, 'NOT_EXECUTED') }
       }
-      const invoke = () => owned.run(input, () => ctx.tools.execute({ callId: ToolCallId(call.id),
-        name: call.function.name, arguments: input.arguments, ...(agent ? { agent } : {}), signal: control.signal }))
-      const result = await ctx.agents.withoutInitiator(() => execution?.runTool ? execution.runTool(invoke) : invoke())
+      // The direct journal owns the call/result records. Keep the native batch
+      // unlogged and dispatch a single call after validating the full model batch.
+      const batch = {
+        calls: [{ type: 'tool-call', id: ToolCallId(call.id), name: call.function.name, arguments: call.function.arguments }],
+        ...(agent ? { agent, toolSet } : {}), signal: control.signal,
+      }
+      const invoke = () => owned.run(input, () => ctx.tools.execute(batch))
+      const settled = await ctx.agents.withoutInitiator(() => execution?.runTool ? execution.runTool(invoke) : invoke())
+      if (settled.results.length !== 1 || settled.results[0].callId !== call.id) fail('DIRECT_TOOL_EXECUTION_CONTRACT_MISMATCH')
+      const { result } = settled.results[0]
       execution?.toolResult(call, result)
       record('tool/result', { callId: call.id, name: call.function.name, content: result.content,
         isError: result.isError, ...(result.error === undefined ? {} : { error: result.error }),
@@ -109,6 +116,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
   const usedCallIds = new Set(continuation?.usedCallIds ?? [])
   let nextStep = continuation?.nextStep ?? 0, compactions = continuation?.compactions ?? 0
   let forceCompaction = false, overflowRetries = 0
+  let toolSet
   for (const checkpoint of continuation?.approvedCheckpoints ?? []) contract.approveCheckpoint(checkpoint)
   checkDirectHistory(messages, contract.checkpoints)
   const record = (type, data) => { trace.events.push({ seq: trace.events.length, time: Date.now(), type, data: structuredClone(data) }); persist() }
@@ -207,6 +215,12 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       const inputMeasurement = await measureInput(meter, payload, control.signal, config.maxInputTokens)
       if (overflowRetries) await execution?.beforeAuxiliaryRequest()
       else await execution?.beforeRequest(step + 1)
+      // Match native step admission without running the native message assembler.
+      // The fixed direct contract must remain executable on every request.
+      toolSet = execution && contract.assembly.tools.length ? await execution.resolveTools() : undefined
+      for (const [name, definition] of contract.definitions) {
+        if (ctx.tools.executable(name, execution?.agent, toolSet) !== definition) fail('TASK_TOOL_NOT_AVAILABLE')
+      }
       const authHeaders = await directAuthHeaders(ctx, direct, control.signal)
       const request = { ordinal: trace.requests.length + 1, taskOrdinal: step + 1, purpose: 'task', payload: deepFreeze(JSON.parse(body)), bodySha256: createHash('sha256').update(body).digest('hex'),
         inputCharacters: body.length, inputBytes: Buffer.byteLength(body), contractHash: contract.hash,
@@ -258,7 +272,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
           // directories. Revalidate the still-unexecuted suffix, not just pins
           // that existed before the first call in this model response.
           if (index > 0 && !deferred) deferred = await execution?.preflight(calls.slice(index))
-          messages = deepFreeze([...messages, await bridge.execute(calls[index], deferred)])
+          messages = deepFreeze([...messages, await bridge.execute(calls[index], deferred, toolSet)])
           deferred ||= bridge.takeRepairDeferral()
         }
         execution?.endStep()
@@ -272,8 +286,8 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
         }
         if (error.directReceipt) request.transportReceipt = structuredClone(error.directReceipt)
         request.status = 'UNKNOWN_OR_FAILED'; request.errorCode = error.code ?? 'DIRECT_TRANSPORT_OR_EXECUTION_FAILED'; persist(); throw error
-      }
+      } finally { toolSet?.dispose(); toolSet = undefined }
     }
     fail('TASK_REQUEST_LIMIT')
-  } finally { stopAccount(); bridge.close() }
+  } finally { toolSet?.dispose(); stopAccount(); bridge.close() }
 }

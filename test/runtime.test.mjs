@@ -8,6 +8,8 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import * as RepeatReminder from '@deepseek-ai/dsh-repeat-tool-reminder'
 import WebRuntime from '@deepseek-ai/dsh-web'
+import { PtcExecutor } from '@deepseek-ai/dsh-tool-executor-ptc'
+import { executeFixtureTool } from '../testing/harness.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { startFakeLlama } from '../testing/fake-llama.mjs'
 
@@ -241,7 +243,7 @@ test('explicit registered tools support deferred MCP-style definitions without i
 for (const [name, execute] of [
   ['native message submission', async (_args, exec) => { exec.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'unapproved followup' }], source: { kind: 'user' } })); return {} }],
   ['auxiliary model request', async (_args, _exec, ctx) => { for await (const _chunk of ctx.llm.stream({ provider: 'dynamic-context-fake', model: 'fake-llama', messages: [] })) {} return {} }],
-  ['nested dispatch', async (_args, exec, ctx) => { await ctx.tools.execute({ name: 'write', arguments: { file_path: 'blocked.txt', content: 'must not execute' }, callId: 'nested', parent: exec.token, agent: exec.agent, signal: exec.signal }); return {} }],
+  ['nested dispatch', async (_args, exec, ctx) => { await executeFixtureTool(ctx, { name: 'write', arguments: { file_path: 'blocked.txt', content: 'must not execute' }, callId: 'nested', agent: exec.agent, signal: exec.signal }); return {} }],
 ]) test(`registered adapter cannot escape through ${name}`, async t => {
   const h = await fixture(t, { respond: () => tool('adapter_probe', {}),
     config: { allowedTools: ['adapter_probe', 'write'], direct: { runtime: { registeredTools: ['adapter_probe'] } } },
@@ -269,6 +271,43 @@ test('native web tools use an explicit provider and keep results in the task his
   await h.runner.runNext({ expectedRevision: 1 })
   assert.match(JSON.stringify(h.backend.requests[1].payload), /SEARCH_PROVIDER_FIXTURE/)
   assert.match(JSON.stringify(h.backend.requests[1].payload), /FETCH_PROVIDER_FIXTURE/)
+})
+
+test('a disabled conditional tool rejects the fixed direct contract before sending HTTP', async t => {
+  const h = await fixture(t, {
+    respond: () => ({ text: 'The model must not be called.' }),
+    config: { allowedTools: ['web_search'], direct: { runtime: { modules: ['web'] } } },
+    setup: async ctx => {
+      await ctx.plugin(WebRuntime)
+      ctx.web.registerSearchProvider({ id: 'unready-fixture', available: () => true,
+        ready: () => false, search: () => { throw new Error('unready provider must not run') } })
+    },
+  })
+  h.runner.submit(runtimeProposal(['web_search']))
+  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /TASK_TOOL_NOT_AVAILABLE/)
+  unresolved(h, 0)
+})
+
+test('direct filesystem observations leave ordinary native writes under the deployment policy', async t => {
+  const FsTools = await import('@deepseek-ai/dsh-tool-fs')
+  let h, owner
+  h = await fixture(t, {
+    respond: async ({ index }) => {
+      if (index !== 1) return { text: 'Direct read recorded.' }
+      const ordinary = await executeFixtureTool(h.ctx, { agent: owner.agent, name: 'write',
+        callId: 'ordinary-overwrite', arguments: { file_path: 'ordinary.txt', content: 'new' },
+        signal: new AbortController().signal })
+      assert.equal(ordinary.isError, false)
+      return tool('read', { file_path: 'ordinary.txt' })
+    },
+    setup: ctx => ctx.plugin(FsTools, { readImage: false }),
+  })
+  owner = await h.ctx.agents.create({ sessionId: 'ordinary-filesystem', meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose())
+  fs.writeFileSync(path.join(h.projectRoot, 'ordinary.txt'), 'old')
+  h.runner.submit(runtimeProposal(['read']))
+  await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(fs.readFileSync(path.join(h.projectRoot, 'ordinary.txt'), 'utf8'), 'new')
 })
 
 for (const decision of ['allowed-once', 'rejected', 'unavailable']) test(`native approval ${decision} is audited inside the direct execution turn`, async t => {
@@ -427,7 +466,7 @@ test('controller tools atomically submit, inspect and execute the direct workflo
   fs.writeFileSync(path.join(h.projectRoot, 'input.txt'), 'CONTROLLER_FIXTURE')
   const owner = await h.ctx.agents.create({ sessionId: 'controller-owner', meta: { cwd: h.projectRoot } })
   t.after(() => owner.dispose())
-  const invoke = (name, args, callId) => h.ctx.tools.execute({ agent: owner.agent, name, arguments: args, callId, signal: new AbortController().signal })
+  const invoke = (name, args, callId) => executeFixtureTool(h.ctx, { agent: owner.agent, name, arguments: args, callId, signal: new AbortController().signal })
   const submitted = await invoke('dynamic_context_submit', { proposal: runtimeProposal(['read']) }, 'controller-submit')
   assert.equal(Boolean(submitted.isError), false)
   assert.equal(submitted.value.revision, 1)
@@ -446,7 +485,7 @@ test('controller tools reject a different workspace before graph submission', as
   t.after(() => fs.rmSync(other, { recursive: true, force: true }))
   const owner = await h.ctx.agents.create({ sessionId: 'outside-controller', meta: { cwd: other } })
   t.after(() => owner.dispose())
-  const result = await h.ctx.tools.execute({ agent: owner.agent, name: 'dynamic_context_submit',
+  const result = await executeFixtureTool(h.ctx, { agent: owner.agent, name: 'dynamic_context_submit',
     arguments: { proposal: runtimeProposal([]) }, callId: 'outside-submit', signal: new AbortController().signal })
   assert.equal(result.isError, true)
   assert.equal(h.runner.graph.read(), null)
@@ -550,15 +589,19 @@ test('host sampling parameters are pinned in every actual direct request', async
   for (const request of h.backend.requests) for (const [key, value] of Object.entries(generation)) assert.equal(request.payload[key], value)
 })
 
-test('direct native tool presentation overrides an ambient PTC deployment mode', async t => {
-  const h = await fixture(t, { respond: ({ index }) => index === 1 ? tool('read', { file_path: 'input.txt' }) : { text: 'Native tool result observed.' } })
-  h.ctx.tools.defaultMode = 'ptc'
+test('direct native executor overrides an ambient PTC executor for its worker only', async t => {
+  const h = await fixture(t, { respond: ({ index }) => index === 1 ? tool('read', { file_path: 'input.txt' }) : { text: 'Native tool result observed.' },
+    executor: { inject: ['tools', 'systemPrompt'], apply(ctx) { ctx.tools.setExecutor(new PtcExecutor(ctx)) } } })
+  const rootCall = () => executeFixtureTool(h.ctx, { name: 'fixture_read_a', arguments: {}, callId: 'ptc-root',
+    signal: new AbortController().signal })
+  assert.equal((await rootCall()).isError, true)
   fs.writeFileSync(path.join(h.projectRoot, 'input.txt'), 'NATIVE_PRESENTATION_FIXTURE')
   h.runner.submit(runtimeProposal(['read']))
   await h.runner.runNext({ expectedRevision: 1 })
   assert.deepEqual(h.backend.requests[0].payload.tools.map(row => row.function.name), ['read'])
   assert.match(JSON.stringify(h.backend.requests[1].payload), /NATIVE_PRESENTATION_FIXTURE/)
   assert.doesNotMatch(h.backend.requests[0].payload.messages[0].content, /run_code.*only tool/)
+  assert.equal((await rootCall()).isError, true)
 })
 
 test('real shell confinement prevents a write outside its execution workspace', async t => {

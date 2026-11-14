@@ -6,6 +6,7 @@ import Sessions from '@deepseek-ai/dsh-session'
 import Projections from '@deepseek-ai/dsh-session-projection'
 import Prompts from '@deepseek-ai/dsh-system-prompt'
 import Tools from '@deepseek-ai/dsh-tools'
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import Agents from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
@@ -18,7 +19,6 @@ import Sandbox from '@deepseek-ai/dsh-sandbox-local'
 import Shell from '@deepseek-ai/dsh-bash-sandbox'
 import * as ShellEnv from '@deepseek-ai/dsh-shell-env'
 import Skills from '@deepseek-ai/dsh-skill'
-import * as Observations from '@deepseek-ai/dsh-fs-observation-policy'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TaskGraph from 'dsh-bettertaskgraphs'
 import * as DynamicContext from './index.mjs'
@@ -41,6 +41,7 @@ export async function createDirectHost(input) {
   try {
     if (config.direct.auth === 'deepseek-account') await installAccountServices(ctx)
     for (const plugin of [Llm, Sessions, Projections, Prompts, Tools, Agents, TokenMeter]) await ctx.plugin(plugin)
+    await ctx.plugin(NativeExecutor)
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(Persistence, { root: path.join(config.directory, 'native-sessions') })
     const runtime = config.direct.runtime
@@ -54,7 +55,6 @@ export async function createDirectHost(input) {
     await ctx.plugin(Shell, { cwd: config.projectRoot, ...(runtime.nativeRequestControls ? { timeoutMs: 60000 } : { timeoutMs: 30000, maxTimeoutMs: 60000 }) })
     if (runtime.nativeRequestControls) await ctx.plugin(await import('@deepseek-ai/dsh-tool-call-timeout-policy'))
     await ctx.plugin(Skills)
-    await ctx.plugin(Observations)
     await ctx.plugin(TaskGraph, { projectRoot: config.projectRoot })
     await ctx.plugin(DynamicContext, config)
     let closed = false

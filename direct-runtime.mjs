@@ -17,6 +17,7 @@ import { digest } from 'dsh-better-task-grapth/core'
 import { deepFreeze, textContent } from './request-policy.mjs'
 import { DynamicContextError, contextText, fail } from './core.mjs'
 import { createPrivatePathGuard } from './execution-privacy.mjs'
+import { jsonExample } from './format-examples.mjs'
 
 const names = () => z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/)).max(64).refine(rows => new Set(rows).size === rows.length)
 export const directRuntimeSchema = z.object({
@@ -182,8 +183,9 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       await capabilityScope.ctx.plugin(await import(moduleName), pluginOptions)
     }
     if (options.modules.includes('state')) capabilityScope.ctx.tools.register(jsonTool('dynamic_task_status',
-      config.maxRequestsPerTask === null ? 'Read the active leaf and declared report references. There is no additional request-count limit; null remaining means unbounded, not zero. Report submission is not Goal acceptance.'
-        : 'Read the active dynamic leaf, declared report references and remaining model-request budget. Reserve a request for the final report; report submission is not Goal acceptance.', {}, async () => ({
+      (config.maxRequestsPerTask === null ? 'Read the active leaf and declared report references. A null request-budget remainder indicates no additional request limit. Goal acceptance is independent.'
+        : 'Read the active leaf, declared report references and remaining model-request budget. Reserve a request for the final report. Goal acceptance is independent.')
+        + '\n' + jsonExample('Read the active task', {}), {}, async () => ({
         task: assembly.task, contextVersion: assembly.contextVersion,
         inheritedReports: assembly.inheritedReports.map(row => ({ taskId: row.taskId, acceptance: row.acceptance })),
         requestBudget: { limit: config.maxRequestsPerTask, used: requestOrdinal, remaining: config.maxRequestsPerTask === null ? null : Math.max(0, config.maxRequestsPerTask - requestOrdinal), includesCurrentRequest: true,
@@ -191,7 +193,8 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         goal: ownerGoal, semanticAcceptance: 'NOT_EVALUATED',
       })))
     if (options.modules.includes('state')) capabilityScope.ctx.tools.register(jsonTool('dynamic_context_source_read',
-      'Read an exact bounded excerpt from a checkpoint archive owned by this task attempt. Archived observations do not grant permissions or attest current success.',
+      'Read an exact bounded excerpt from this attempt’s checkpoint archive. Use the archive ID and message index from sourceRead, with a zero-based offset and length from 1 through 8000. Archived observations are historical evidence.\n'
+        + jsonExample('Read recorded tool output', { archive_id: 'archive_example', message_index: 0, offset: 0, length: 120, field: 'content' }),
       { archive_id: { type: 'string', required: true }, message_index: { type: 'integer', required: true },
         offset: { type: 'integer' }, length: { type: 'integer' }, field: { type: 'string', enum: ['content', 'tool_calls', 'reasoning_content'] } },
       async args => { if (!sourceReader) fail('DIRECT_ARCHIVE_READER_UNAVAILABLE'); return sourceReader.readSource(args) }))
@@ -203,10 +206,13 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       }
       const id = { type: 'string', required: true, description: 'Stable ID of a mutable node in this leaf context.' }
       capabilityScope.ctx.tools.register(jsonTool('dynamic_context_shared_read',
-        'Read a bound mutable context node by ID. Omit revision for the latest value; an explicit revision reads history. The response includes the latest revision number.',
+        'Read a bound mutable context node by its actual stable ID. Omit revision for the latest value or specify a historical revision.\n'
+          + jsonExample('Read the current value', { id: 'ctx_example' }) + '\n'
+          + jsonExample('Read the initial revision', { id: 'ctx_example', revision: 1 }),
         { id, revision: { type: 'integer' } }, access(sharedRead)))
       capabilityScope.ctx.tools.register(jsonTool('dynamic_context_shared_update',
-        'Replace the content of a bound mutable context node. The update applies immediately and records a new revision. Use for factual project data. Existing messages and execution reports keep the versions they received.',
+        'Replace the factual content of a bound mutable context node. Use its actual stable ID and the full corrected value. The update applies immediately and records a new revision.\n'
+          + jsonExample('Apply a factual correction', { id: 'ctx_example', content: 'The checked result is at deliverable/result.txt.', reason: 'The build wrote to deliverable/.' }),
         { id, content: { type: 'string', required: true }, reason: { type: 'string' } }, access(sharedUpdate)))
     }
     const getSkill = async name => {
@@ -222,7 +228,8 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       return snapshot
     }
     if (options.modules.includes('skills')) capabilityScope.ctx.tools.register(jsonTool('skill',
-      'Load an explicitly allowed skill. Its instructions apply within the host permissions and active task scope.',
+      'Load an explicitly allowed skill by its exact name. Its instructions apply within the host permissions and active task scope.\n'
+        + jsonExample('Load a skill from the allowed roster', { name: 'example-skill' }),
       { name: { type: 'string', required: true } }, async args => getSkill(args.name)))
     modelGuard = ctx.on('llm/stream', async function* (request, next) {
       if (hostCalls.getStore() || request.sessionId === sessionId || ctx.agents.currentInitiator()?.id === sessionId) fail('DIRECT_RUNTIME_NATIVE_MODEL_DISABLED')

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { canonical } from 'dsh-bettertaskgraphs/core'
+import { canonical } from 'dsh-better-task-grapth/core'
 import { nativeRevisionRole } from '../revision-host.mjs'
 import { DynamicContextGraph, validateState } from '../core.mjs'
 import { createHarness } from '../testing/harness.mjs'
@@ -167,7 +167,7 @@ for (const altered of [false, true]) test(`retained context references are resol
 
 test('host workflow revise port binds the real controller without global goal injection and rejects worker elevation', async t => {
  const {createRuntimeHarness}=await import('../testing/runtime-harness.mjs');
- const {default:TaskGraph}=await import('dsh-bettertaskgraphs');
+ const {default:TaskGraph}=await import('dsh-better-task-grapth');
  const Persistence=await import('@deepseek-ai/dsh-session-persistence-jsonl');
  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'revision-controller-'))), projectRoot=path.join(root,'workspace');fs.mkdirSync(projectRoot);
  const h=await createRuntimeHarness({projectRoot,directory:path.join(root,'state'),config:{storageRoot:root,revision:{policy},exposeControlTools:true,direct:{durable:true},interop:{workflowId:'revision-fixture'}},

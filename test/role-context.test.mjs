@@ -9,7 +9,7 @@ import { roleInputTokens, EVIDENCE_TOOL } from '../role-context.mjs'
 import { COMPACTION_INSTRUCTION, nativeCompactSpec } from '../dsh-compaction-policy.mjs'
 import { startFakeLlama } from '../testing/fake-llama.mjs'
 import { validateConfig } from '../index.mjs'
-import { digest } from 'dsh-bettertaskgraphs/core'
+import { digest } from 'dsh-better-task-grapth/core'
 
 const text = 'ordinary evidence 0123456789, '.repeat(24000) + '\nTAIL_COUNTEREXAMPLE: required_field is missing.\n'
 const messages = () => [{ role: 'system', content: 'Independently check this evidence. Return a JSON verdict.' },

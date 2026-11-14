@@ -1,6 +1,6 @@
 {
   "name": "dsh-dynamic-context",
-  "version": "0.1.1-rc.36",
+  "version": "0.1.1-rc.46",
   "description": "Task-scoped direct model execution, native tools and durable context checkpoints for DeepSeek Harness",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -83,7 +83,7 @@
     "@deepseek-ai/dsh-credentials-local": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-authorization": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-deepseek-account-platform": "0.2.1-alpha.1",
-    "dsh-bettertaskgraphs": "0.3.1-rc.36",
+    "dsh-better-task-grapth": "0.3.1-rc.46",
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.1-alpha.1",
     "@deepseek-ai/dsh-agent-instructions": "0.2.1-alpha.1",
@@ -126,7 +126,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.2.1-alpha.1",
-    "dsh-bettertaskgraphs": "0.3.1-rc.36"
+    "dsh-better-task-grapth": "0.3.1-rc.46"
   },
   "homepage": "https://github.com/oldcitynight/dsh-dynamic-context#readme",
   "repository": {

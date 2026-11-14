@@ -1,6 +1,5 @@
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import SandboxedFileSystem from '@deepseek-ai/dsh-fs-sandbox'
-import WorkingDirectory from '@deepseek-ai/dsh-working-directory'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import Subprocess from '@deepseek-ai/dsh-subprocess-local'
 import Sandbox from '@deepseek-ai/dsh-sandbox-local'
@@ -21,7 +20,6 @@ export async function createRuntimeHarness({ projectRoot, directory, respond, ba
     setup: async ctx => {
       await ctx.plugin(SandboxPolicy, { mode, workspaceRoot: projectRoot })
       await ctx.plugin(SandboxedFileSystem, { cwd: projectRoot })
-      await ctx.plugin(WorkingDirectory, { defaultDirectory: projectRoot })
       await ctx.plugin(Approval, { policy: approval })
       await ctx.plugin(Subprocess)
       await ctx.plugin(Sandbox)

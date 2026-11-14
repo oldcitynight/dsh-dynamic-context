@@ -6,14 +6,14 @@ import { copy, digest, GraphError } from 'dsh-bettertaskgraphs/core'
 import { artifactProof } from './artifacts.mjs'
 
 export function revisionAuthority(ctx, agent) {
-  const sessions = ctx.get?.('sessions') ?? ctx.sessions, workingDirectory = ctx.get?.('workingDirectory') ?? ctx.workingDirectory
+  const sessions = ctx.get?.('sessions') ?? ctx.sessions
   if (!agent || ctx.agents.get(agent.id) !== agent || sessions.get(agent.session.id) !== agent.session)
     throw new GraphError('REVISION_CONTROLLER_CHANGED')
   const sandbox = ctx.get('sandboxPolicy')?.resolve({ session: agent.session }), goal = ctx.get('goals')?.get(agent)
   const plan = ctx.get('runtimeQuality')?.planActive(agent)
     ?? ctx.get('agentPresets')?.serviceFor(agent, 'planMode')?.loggedActive(agent.session)
     ?? agent.ctx?.get('planMode')?.loggedActive(agent.session)
-  return { cwd: workingDirectory.get(agent.session), header: agent.session.header,
+  return { cwd: ctx.get?.('workingDirectory')?.get(agent.session) ?? agent.session.header.cwd, header: agent.session.header,
     input: agent.session.deriveMessages().filter(message => ['user', 'developer', 'system'].includes(message.role)),
     sandbox: sandbox ? { mode: sandbox.mode, workspaceRoot: sandbox.workspaceRoot } : null,
     approval: ctx.get('approval')?.effectivePolicy(agent.session) ?? null, plan: Boolean(plan),

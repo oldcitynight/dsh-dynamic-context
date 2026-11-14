@@ -214,17 +214,29 @@ test('a compacted checkpoint resumes with its original archive and without repea
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function waitFor(callback) {
-  for (let i = 0; i < 150; i++) { const value = callback(); if (value) return value; await delay(20) }
+  const deadline = performance.now() + 10000
+  while (performance.now() < deadline) {
+    const value = callback()
+    if (value) return value
+    await delay(20)
+  }
   throw new Error('Isolated crash worker did not reach its expected boundary')
 }
 function crashWorker(t, where, mode) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../testing/crash-worker.mjs', import.meta.url)), where.storageRoot, where.backend.origin, mode],
-    { stdio: ['ignore', 'ignore', 'pipe'] })
+    { stdio: ['ignore', 'pipe', 'pipe'] })
   let diagnostic = ''
   child.stderr.on('data', bytes => { diagnostic = (diagnostic + bytes.toString()).slice(-8000) })
+  let ready = false
+  child.stdout.on('data', bytes => { if (bytes.toString().includes('READY\n')) ready = true })
   const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal, diagnostic })))
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited })
-  return { child, exited }
+  return { child, exited, async waitUntilReady() {
+    await waitFor(() => {
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error('Crash worker stopped before READY: ' + diagnostic)
+      return ready
+    })
+  } }
 }
 async function resumeAfterLeaseRelease(h, options) {
   for (let i = 0; i < 100; i++) {
@@ -266,10 +278,11 @@ test('a crash after the write effect but before its checkpoint remains unresolve
 test('a live process owns even a safe READY checkpoint until its kernel lease is released', async t => {
   const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Lease-protected response.' })
   const worker = crashWorker(t, where, 'hold-ready')
+  await worker.waitUntilReady()
   const h = await where.open()
-  const status = await waitFor(() => {
-    try { const value = h.runner.checkpointStatus(); return value?.phase === 'READY' && fs.existsSync(path.join(where.projectRoot, 'effect.txt')) ? value : null } catch { return null }
-  })
+  const status = h.runner.checkpointStatus()
+  assert.equal(status?.phase, 'READY')
+  assert.equal(fs.readFileSync(path.join(where.projectRoot, 'effect.txt'), 'utf8'), 'written once\n')
   await assert.rejects(h.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: status.checksum }), /DIRECT_EXECUTION_LEASE_HELD/)
   worker.child.kill('SIGKILL'); await worker.exited
   await resumeAfterLeaseRelease(h, { expectedRevision: 2, checkpointChecksum: status.checksum })

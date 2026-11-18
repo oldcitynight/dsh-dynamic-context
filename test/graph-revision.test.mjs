@@ -60,7 +60,7 @@ for (const mode of ['REJECT', 'NEEDS_USER', 'NO_CHANGE']) test(`${mode} preserve
   const c = coordinator(f, async r => {
     roles.push(r.role)
     const p = proposal(JSON.parse(r.messages[1].content).snapshot)
-    return r.role === 'updater' ? mode === 'NO_CHANGE' ? { ...p, disposition: mode, taskGraph: null } : p : { ...verdict, verdict: mode }
+    return r.role === 'updater' ? mode === 'NO_CHANGE' ? { ...p, disposition: mode, taskGraph: null } : p : { ...verdict, verdict: mode, issues: [{ path: '/proposal/reason', item: 'change justification', reason: 'The cited justification needs correction or further authorization.' }] }
   })
   assert.equal((await c.run(request)).status, mode)
   assert.deepEqual(f.store.read(), before)

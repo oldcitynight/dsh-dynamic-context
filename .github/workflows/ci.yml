@@ -55,5 +55,16 @@ jobs:
           execFileSync('npm', ['cache', 'add', local], { stdio: 'inherit' })
           NODE
       - run: npm ci --prefer-offline
-      - run: npm test
+      - name: Run the Direct suite on Node 22
+        if: matrix.node == '22.x'
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          # Node 22 applies the default timeout to the whole file. The slowest
+          # integration files contain many individually bounded, serial cases.
+          mapfile -t files < <(find test -maxdepth 1 -type f -name '*.test.mjs' ! -name 'native-*.test.mjs' | LC_ALL=C sort)
+          node --test --test-concurrency=4 --test-reporter=tap --test-timeout=180000 "${files[@]}"
+      - name: Run npm test on Node 24
+        if: matrix.node != '22.x'
+        run: npm test
       - run: npm pack --dry-run

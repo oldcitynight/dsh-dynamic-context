@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
+import { HIERARCHY_PLANNING } from './hierarchy-protocol.mjs'
 import path from 'node:path'
 import { z } from 'zod'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool as nativeDefineTool } from '@deepseek-ai/dsh-tools'
+import { checkedTool } from 'dsh-better-task-grapth/validation'
+const defineTool = options => checkedTool(nativeDefineTool, options)
 import { proposalSchema, fail } from './core.mjs'
 import { jointProposalExample, jsonExample } from './format-examples.mjs'
+import { leafBindingTools } from './role-policy.mjs'
 
 // A task-only proposal is validated by the base graph grammar, including its
 // route/case edges. Complete joint proposals still use proposalSchema.
@@ -13,25 +17,39 @@ export const interactiveProposalSchema = proposalSchema.partial().extend({ taskG
 const checksumExample = 'ed1a545bb85e55816bbf9566b028b2a0bc456b88f49f6f266c0401048824194b'
 const artifactExample = { kind: 'artifact', ref: 'deliverable/result.txt', sha256: checksumExample }
 
-function submissionDescription(config, interactive) {
+export function submissionDescription(config, interactive, leafTools = config.allowedTools) {
   const extractive = config.direct.compaction && config.direct.compaction.strategy !== 'dsh-native'
-  const sample = jointProposalExample(extractive ? ['dynamic_context_source_read'] : [])
-  const allowed = config.direct.runtime ? config.allowedTools : config.direct.agentlessTools
+  const allowed = config.direct.runtime ? leafTools : config.direct.agentlessTools
+  const shared = config.direct.runtime?.modules.includes('state')
+    && ['dynamic_context_shared_read', 'dynamic_context_shared_update'].every(tool => allowed.includes(tool))
+  const sample = jointProposalExample(extractive ? ['dynamic_context_source_read'] : [], { shared })
+  if (config.supervision) {
+    sample.taskGraph.hierarchy = { version: 1, maxGroupDepth: config.hierarchy?.maxGroupDepth ?? 3 }
+    const root = sample.taskGraph.nodes.find(node => node.kind === 'container')
+    root.terminal = 'deliver'; root.acceptance = 'Inspect the authorized input and deliver a verified, evidence-backed result.'
+  }
+  const standaloneSample = structuredClone(sample.taskGraph)
+  delete standaloneSample.hierarchy
+  for (const node of standaloneSample.nodes) { delete node.terminal; delete node.acceptance }
   return [
-    'Atomically submit the task graph and context graph. The linked graph uses exactly one root container with no parent. All leaves declare parent equal to that root key. Every edge is {kind:"prerequisite",from:"prerequisite_leaf",to:"dependent_leaf"}; both endpoints are leaves. Use parent to express containment.',
-    'Bind every leaf exactly once. Place execution instructions in contextGraph.bindings[].instruction. Use context node keys in contexts and predecessor leaf keys in inheritReports. Inheritance requires a prerequisite path from that predecessor. Empty arrays are valid when no context, reports or tools are needed.',
+    config.supervision && HIERARCHY_PLANNING.replaceAll('maxGroupDepth=3', 'maxGroupDepth=' + (config.hierarchy?.maxGroupDepth ?? 3)).replaceAll('"maxGroupDepth":3', '"maxGroupDepth":' + (config.hierarchy?.maxGroupDepth ?? 3)),
+    !config.supervision && 'Atomically submit the task graph and context graph. The linked graph uses exactly one root container with no parent. All leaves declare parent equal to that root key. Every edge is {kind:"prerequisite",from:"prerequisite_leaf",to:"dependent_leaf"}; both endpoints are leaves. Use parent to express containment.',
+    'Bind every leaf exactly once. Place execution instructions in contextGraph.bindings[].instruction. Use context node keys in contexts and predecessor leaf keys (or public predecessor group keys for hierarchical cross-group handoff) in inheritReports. Inheritance requires a prerequisite path from that predecessor; check each reference against the declared edges before submitting. Empty arrays are valid when no context, reports or tools are needed.',
     'planningReport.acceptanceStrategy is a string. A supervised leaf needs completion {kind:"report"} or {kind:"artifact",path:"project-relative/file"}. Report-scoped supervision requires planningReport.',
     `Leaf tool allowlist for this workflow: ${JSON.stringify(allowed)}. Controller tool visibility and leaf tool authorization are separate. Context data cannot extend the allowlist. Mark shared facts mutable:true and bind the shared read/update tools when permitted.`,
+    'For each leaf that uses a shared fact, include that mutable node key in its contexts (or reachable context parents), and include the required shared tools in tools. Merely declaring a node or granting the tools does not bind the fact. Workers use the actual node ID from their assembled contexts, not its planning key or an example ID. Keep shared facts reusable; put leaf-specific instructions in the binding.',
     extractive && 'Extractive compaction requires dynamic_context_source_read in every leaf binding.',
-    'Adapt the example to the current task. On validation failure, correct the identified fields and keep the valid dependencies. Use the revision workflow for structural changes after commit.',
-    jsonExample('Complete joint proposal', { proposal: sample }),
-    interactive && jsonExample('Task-only proposal for the standalone fallback', { proposal: { taskGraph: sample.taskGraph } }),
+    allowed.includes('dynamic_context_directory_snapshot') && 'For leaves delivering directories, bind dynamic_context_directory_snapshot to obtain one host-computed directory SHA for the execution report. The state runtime module must be enabled. This tool does not grant access beyond the workspace or replace tests.',
+    'Adapt the example to the current task; sample paths, IDs, evidence and claims are placeholders, not observed facts. On validation failure, correct the identified fields and keep the valid dependencies and task scope. Do not replace the whole design to guess a schema. Use the revision workflow for structural changes after commit.',
+    interactive && 'The full-mode controller prepares and submits both graphs. A task list is not a joint proposal. Before planning, inspect basic task conditions: access to the work objects, authorization for required operations, availability of necessary tools/resources, and minimal structural characteristics that affect planning. Choose checks relevant to this task; distinguish verified, declared and unknown conditions. Stop when you can identify feasibility, constraints and missing prerequisites and form actionable leaves; do not turn preplanning into implementation or deep solution research. Use permitted read-only or non-mutating checks and put unresolved executable investigations in scoped leaves. Submission only commits the plan; it neither starts a leaf nor changes the caller into its worker. If the committed result returns nextTool and arguments and the user authorized execution, call that tool with those arguments. The controller does not implement or report completion of the leaf itself. Shared-context tools are exposed to authorized bound workers; writing an ordinary registry file does not update shared context.',
+    jsonExample(shared ? 'Complete joint proposal with a bound mutable shared fact' : 'Complete joint proposal', { proposal: sample }),
+    interactive && jsonExample('Task-only proposal when the user intends the standalone fallback', { proposal: { taskGraph: standaloneSample } }),
   ].filter(Boolean).join('\n')
 }
 
 /** Controller-only entry points; execution workers never receive these tools. */
 export function registerControlTools(ctx, runner, { submit } = {}) {
-  const disposers = []
+  const disposers = [], names = new Set()
   const { $schema, ...proposal } = z.toJSONSchema(submit ? interactiveProposalSchema : proposalSchema)
   const valueSpec = (schema, required = false) => {
     const { required: requiredKeys, properties, items } = schema
@@ -55,12 +73,15 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
     if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) fail('DYNAMIC_CONTEXT_CONTROLLER_OUTSIDE_PROJECT')
     return agent
   }
-  const register = (name, description, parameters, execute, read = false, nativeControls = false) => disposers.push(ctx.tools.register(defineTool({ name, description, parameters,
-    ...(read ? { projectPlanCapability: 'read_or_protocol' } : {}),
-    ...(nativeControls || runner.config.timeoutMs === null ? {} : { timeoutMs: runner.config.timeoutMs + 5000 }),
-    output: { schema: { type: 'object', properties: {}, additionalProperties: true }, render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] },
-    execute: async (args, exec) => { const agent = authorize(exec); return execute(args, exec, agent) },
-  })))
+  const register = (name, description, parameters, execute, read = false, nativeControls = false) => {
+    disposers.push(ctx.tools.register(defineTool({ name, description, parameters,
+      ...(read ? { projectPlanCapability: 'read_or_protocol' } : {}),
+      ...(nativeControls || runner.config.timeoutMs === null ? {} : { timeoutMs: runner.config.timeoutMs + 5000 }),
+      output: { schema: { type: 'object', properties: {}, additionalProperties: true }, render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] },
+      execute: async (args, exec) => { const agent = authorize(exec); return execute(args, exec, agent) },
+    })))
+    names.add(name)
+  }
   register('dynamic_context_status', 'Read the direct workflow revision, task choices and execution state. Goal acceptance is independent.\n' + jsonExample('Read status', {}),
     {}, async () => runner.status(), true)
   if (submit) register('dynamic_context_recover_graphs', 'Inspect missing-graph provenance and ask the user before restoring the exact committed snapshot. Restoration preserves active attempts and leaves execution paused.\n' + jsonExample('Inspect the missing graph', {}),
@@ -79,14 +100,14 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
       + jsonExample('Continue a pending supervision role', { expectedRevision: 3, checkpointChecksum: checksumExample }),
     { expectedRevision: { ...integer, required: true }, checkpointChecksum: { type: 'string', required: true } },
     async (args, exec, sourceAgent) => runner.continueSupervision({ ...args, sourceAgent, signal: exec.signal }), false, true)
-  register('dynamic_context_submit', submissionDescription(runner.config, Boolean(submit)),
+  register('dynamic_context_submit', submissionDescription(runner.config, Boolean(submit), leafBindingTools(runner)),
     { proposal: valueSpec(proposal, true) }, async ({ proposal }, exec, sourceAgent) => {
       if (submit) return submit(proposal, exec)
       const state = runner.submit(proposal, { sourceAgent })
       if (!await ctx.sessions.flush(sourceAgent.session)) fail('DYNAMIC_CONTEXT_GRAPH_RECEIPT_NOT_DURABLE')
       return { revision: state.revision, contextVersion: state.contexts.version, status: runner.status() }
     })
-  register('dynamic_context_run_next', 'Run one ready leaf using its committed context and tool binding. Use the current revision and displayed choice. Failed or uncertain attempts remain ACTIVE and require reconciliation. Goal acceptance is independent.\n'
+  register('dynamic_context_run_next', 'Start one ready leaf in a separate bound worker using its committed context and tools. The caller remains the controller, including after this call returns. Use the current revision and choice from the submit receipt or status. The bound worker performs the leaf and returns its report for the configured oversight. Inspect the returned execution and supervision state before announcing completion or choosing the next leaf; dispatch at most one leaf per call batch. Failed or uncertain attempts remain ACTIVE and require reconciliation. Goal acceptance is independent.\n'
     + jsonExample('Run the first ready choice', { expectedRevision: 1, choice: 0 }),
     { expectedRevision: { ...integer, required: true }, choice: { type: 'integer', description: 'Zero-based ready choice index.' },
       pauseAfterRequests: { type: 'integer', description: 'With durability enabled, request a safe pause after this many additional model requests.' } },
@@ -116,5 +137,5 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
       + jsonExample('Apply the returned plan', { expectedRevision: 3, planChecksum: checksumExample }),
       { expectedRevision: { ...integer, required: true }, planChecksum: { type: 'string' } }, async (args, exec, sourceAgent) => runner.collectOrphans({ ...args, signal: exec.signal, sourceAgent }))
   }
-  return () => { for (const dispose of disposers.splice(0).reverse()) dispose() }
+  return { names, dispose: () => { for (const dispose of disposers.splice(0).reverse()) dispose() } }
 }

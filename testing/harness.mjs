@@ -19,7 +19,7 @@ export const HOST_POLICY = 'HOST_POLICY_KEEP: Follow the host constraints. Manag
 export const GLOBAL_PRIVATE = 'UNRELATED_GLOBAL_CONTEXT_MUST_NOT_LEAK'
 
 /** Real DSH services and the shipped pi-ai adapter; only the HTTP model endpoint is fake. */
-export async function createHarness({ projectRoot, directory, respond, config = {}, setup, taskGraph = true, backend: externalBackend }) {
+export async function createHarness({ projectRoot, directory, respond, config = {}, setup, taskGraph = true, imageInput = false, backend: externalBackend }) {
   const backend = externalBackend ?? await startFakeLlama({ respond }), ctx = new Context(), toolCalls = []
   let closed = false
   try {
@@ -34,7 +34,7 @@ export async function createHarness({ projectRoot, directory, respond, config = 
       api: 'openai-completions', baseURL: backend.origin + '/v1',
       defaultContextWindow: 8192, defaultMaxTokens: 512,
       retryPolicy: { mode: 'normal', maxRetries: 0 },
-      models: [{ id: 'fake-llama', name: 'Fake llama; scripted responses', contextWindow: 8192, maxTokens: 512, input: ['text'] }],
+      models: [{ id: 'fake-llama', name: 'Fake llama; scripted responses', contextWindow: 8192, maxTokens: 512, input: imageInput ? ['text', 'image'] : ['text'] }],
     } } })
     ctx.systemPrompt.section({ name: 'unrelated-global-policy', order: 10, text: GLOBAL_PRIVATE })
     ctx.systemPrompt.context({ name: 'unrelated-global-runtime', order: 10, required: true, text: GLOBAL_PRIVATE })
@@ -56,7 +56,7 @@ export async function createHarness({ projectRoot, directory, respond, config = 
       systemPrompt: HOST_POLICY, allowedTools: ['fixture_read_a', 'fixture_read_b'], supervisionContext: 'legacy',
       interaction: { mode: 'host' }, exposeControlTools: false, ...config,
       ...(config.transport === 'direct' ? { direct: { endpoint: backend.origin + '/v1/chat/completions',
-        apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY', agentlessTools: ['fixture_read_a', 'fixture_read_b'], ...config.direct } } : {}),
+        protocol: 'chat-completions', apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY', agentlessTools: ['fixture_read_a', 'fixture_read_b'], ...config.direct } } : {}),
     })
     return { ctx, backend, toolCalls, get runner() { return ctx.get('dynamicContext') },
       async close() { if (closed) return; closed = true; await ctx.get('dynamicContext')?.close(); await ctx.fiber.dispose(); if (!externalBackend) await backend.close() },

@@ -16,6 +16,8 @@ async function fixture(t, options = {}) {
     respond: () => ({ tools: [{ name: 'write', arguments: { file_path: 'effect.txt', content: 'effect survived\n' } }] }),
     setup: ctx => ctx.on('tools/execute', async (exec, next) => { const value = await next(); if (exec.name === 'write') throw new Error('Injected interruption after actual effect'); return value }),
     ...options, config: { storageRoot, ...options.config, direct: { durable: true, ...options.config?.direct } } })
+  h.runner.toolErrorPolicy.register({ pluginId: 'test-host', ruleId: 'injected-interruption', toolId: 'write',
+    when: { '/isError': true, '/error/message': 'Injected interruption after actual effect' }, reason: 'Fixture simulates a host-required reconciliation after an effect.' })
   t.after(async () => { await h.close(); fs.rmSync(storageRoot, { recursive: true, force: true }) })
   return { ...h, storageRoot, projectRoot }
 }
@@ -32,7 +34,7 @@ async function interrupted(h, sourceAgent) {
   proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'task', to: 'dependent' })
   proposal.contextGraph.bindings.push({ task: 'dependent', instruction: 'Wait for verified predecessor.', contexts: [], tools: [], inheritReports: ['task'] })
   h.runner.submit(proposal)
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1, sourceAgent }), /DIRECT_TOOL_EXECUTION_FAILED/)
+  await assert.rejects(h.runner.runNext({ expectedRevision: 1, sourceAgent }), /DIRECT_TOOL_ERROR_BLOCKED/)
 }
 
 test('reconciliation requires a trusted current host receipt and never retries or upgrades an unknown effect', async t => {

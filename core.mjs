@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { isHierarchical, ancestorsOf, hierarchyComplete } from 'dsh-better-task-grapth/hierarchy'
+import { acceptanceEnabled, acceptancePlan } from './acceptance-protocol.mjs'
 import { randomUUID } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { attachDiagnostic, feedbackText, withValidation } from 'dsh-better-task-grapth/validation'
 import { z } from 'zod'
-import { TransactionGraph, canonical, copy, digest, validateDocument, view, revisedPlan, legalNext } from 'dsh-better-task-grapth/core'
+import { TransactionGraph, canonical, copy, digest, validateDocument, view, revisedPlan, legalNext, reworkClosure } from 'dsh-better-task-grapth/core'
 import { FileGraphStore, MemoryGraphStore } from 'dsh-better-task-grapth/store'
 import { artifactProof, artifactCurrentIdentity } from './artifacts.mjs'
 import { completionSchema, reportSchema, planningReportSchema, supervisionSchema, validateSupervision, checkSupervisionUpdate } from './supervision-state.mjs'
@@ -16,14 +21,14 @@ export const contextText = text(131072)
 const contextNode = z.object({ key, content: contextText, parents: keys().default([]), mutable: z.literal(true).optional() }).strict()
 const sharedContextChange = z.object({
   id: key, revision: z.number().int().min(2), content: contextText,
-  taskId: key, attemptId: key, callId: text(256), reason: text(2000).optional(),
+  taskId: key, attemptId: key, callId: text(384), sourceCallId: text(256).optional(), segmentId: key.optional(), reason: text(2000).optional(),
 }).strict()
 const binding = z.object({ task: key, instruction: text(8000), contexts: keys(),
   inheritReports: keys().default([]), tools: toolNames.default([]), completion: completionSchema.optional() }).strict()
 export const proposalSchema = z.object({
   planningReport: planningReportSchema.optional(),
-  taskGraph: z.object({ title: text(512), nodes: z.array(z.object({ key,
-    kind: z.enum(['container', 'leaf']), label: text(512), parent: key.optional() }).strict()).min(2).max(33),
+  taskGraph: z.object({ title: text(512), hierarchy: z.object({ version: z.literal(1), maxGroupDepth: z.number().int().min(1).max(16).default(3) }).strict().optional(), nodes: z.array(z.object({ key,
+    kind: z.enum(['container', 'leaf']), label: text(512), parent: key.optional(), terminal: key.optional(), acceptance: text(8000).optional() }).strict()).min(2).max(128),
   edges: z.array(z.object({ kind: z.literal('prerequisite'), from: key, to: key }).strict()).max(128) }).strict(),
   contextGraph: z.object({ nodes: z.array(contextNode).max(32), bindings: z.array(binding).min(1).max(32) }).strict(),
 }).strict()
@@ -36,6 +41,7 @@ const normalizedContext = z.object({ graphId: key, creationChecksum: z.string().
 }).strict()
 const stateSchema = z.object({ schema: z.literal(1), revision: z.number().int().positive(),
   graph: z.unknown(), contexts: normalizedContext, reports: z.array(reportSchema).max(32),
+  reportArchive: z.array(reportSchema).optional(),
   sharedContextHistory: z.array(sharedContextChange).optional(),
   contextHistory: z.array(z.object({ graph: z.unknown(), contexts: normalizedContext }).strict()).optional(),
   invalidatedReports: z.array(key).refine(unique).optional(),
@@ -47,7 +53,7 @@ const stateSchema = z.object({ schema: z.literal(1), revision: z.number().int().
 export class DynamicContextError extends Error {
   constructor(code, detail) {
     super(detail ? `${code}: ${JSON.stringify(detail)}` : code)
-    this.name = 'DynamicContextError'; this.code = code
+    this.name = 'DynamicContextError'; this.code = code; attachDiagnostic(this, detail); this.message = feedbackText(this)
   }
 }
 export const fail = (code, detail) => { throw new DynamicContextError(code, detail) }
@@ -66,6 +72,13 @@ function reachable(source, target, edges) {
   return false
 }
 
+export function publicReportPredecessor(plan, sourceId, taskId) {
+  const source = plan.nodes.find(node => node.id === sourceId), task = plan.nodes.find(node => node.id === taskId)
+  if (!source || !task) return false
+  const target = [task, ...ancestorsOf(plan, taskId)].find(node => node.parent === source.parent)
+  return Boolean(target && target.id !== sourceId && reachable(sourceId, target.id, plan.edges)
+    && (source.kind === 'container' || source.parent === task.parent))
+}
 function checkContexts(contexts, graph) {
   const { version, ...body } = normalizedContext.parse(contexts)
   if (digest(body) !== version || contexts.graphId !== graph.state.plan.id
@@ -75,18 +88,18 @@ function checkContexts(contexts, graph) {
   const visited = new Set(), visiting = new Set()
   const visit = id => {
     if (!nodes.has(id)) fail('UNKNOWN_CONTEXT_REFERENCE')
-    if (visiting.has(id)) fail('CONTEXT_CYCLE')
+    if (visiting.has(id)) fail('CONTEXT_CYCLE', { path: '/contextGraph/nodes/' + contexts.nodes.findIndex(node => node.id === id) + '/parents', reason: 'Context inheritance must be acyclic.', cycleKeys: [...visiting, id].map(id => nodes.get(id)?.key ?? id) })
     if (visited.has(id)) return
     visiting.add(id); nodes.get(id).parents.forEach(visit); visiting.delete(id); visited.add(id)
   }
   nodes.forEach(node => visit(node.id))
   const leaves = graph.state.plan.nodes.filter(node => node.kind === 'leaf')
-  if (contexts.bindings.length !== leaves.length || !unique(contexts.bindings.map(row => row.taskId))) fail('EXACT_LEAF_BINDINGS_REQUIRED')
+  if (contexts.bindings.length !== leaves.length || !unique(contexts.bindings.map(row => row.taskId))) fail('EXACT_LEAF_BINDINGS_REQUIRED', { path: '/contextGraph/bindings', reason: 'Every declared leaf requires exactly one binding.', missingTasks: leaves.filter(leaf => !contexts.bindings.some(row => row.taskId === leaf.id)).map(leaf => leaf.key), duplicateTaskIds: contexts.bindings.map(row => row.taskId).filter((id, i, ids) => ids.indexOf(id) !== i) })
   for (const row of contexts.bindings) {
-    if (!leaves.some(leaf => leaf.id === row.taskId)) fail('UNKNOWN_BOUND_TASK')
+    if (!leaves.some(leaf => leaf.id === row.taskId)) fail('UNKNOWN_BOUND_TASK', { path: '/contextGraph/bindings/' + contexts.bindings.indexOf(row) + '/task', reason: 'The binding must name a declared leaf task.', observed: row.taskId ?? null, allowed: leaves.map(leaf => leaf.key) })
     row.contexts.forEach(id => { if (!nodes.has(id)) fail('UNKNOWN_CONTEXT_REFERENCE') })
     for (const source of row.inheritReports) {
-      if (!leaves.some(leaf => leaf.id === source) || !reachable(source, row.taskId, graph.state.plan.edges)) fail('REPORT_SOURCE_MUST_BE_PREDECESSOR')
+      if (!(isHierarchical(graph.state.plan) ? publicReportPredecessor(graph.state.plan, source, row.taskId) : leaves.some(leaf => leaf.id === source) && reachable(source, row.taskId, graph.state.plan.edges))) fail('REPORT_SOURCE_MUST_BE_PREDECESSOR', { path: '/contextGraph/bindings/' + contexts.bindings.indexOf(row) + '/inheritReports/' + row.inheritReports.indexOf(source), reason: 'An inherited report must originate at a leaf with a prerequisite path to this task.', source: leaves.find(leaf => leaf.id === source)?.key ?? source, target: leaves.find(leaf => leaf.id === row.taskId)?.key })
     }
   }
 }
@@ -123,6 +136,14 @@ export function validateState(value) {
   if ((state.invalidatedReports ?? []).some(id => !state.reports.some(report => report.taskId === id))) fail('INVALIDATED_REPORT_MISSING')
   for (const binding of state.contexts.bindings) if (['PENDING', 'INACTIVE'].includes(state.graph.state.leaves[binding.taskId]?.status)
       && binding.inheritReports.some(id => state.invalidatedReports?.includes(id))) fail('INVALIDATED_REPORT_INHERITANCE')
+  for (const report of state.reportArchive ?? []) {
+    const finished = state.graph.events.find(event => event.type === 'FINISHED' && event.data.attemptId === report.attemptId
+      && event.data.nodeId === report.taskId && event.data.outcome === 'complete')
+    const reopened = state.graph.events.find(event => event.type === 'REOPENED'
+      && event.data.attempts.some(row => row.nodeId === report.taskId && row.attemptId === report.attemptId))
+    if (!finished || !reopened || canonical(finished.data.evidence) !== canonical(report.evidence)) fail('REWORK_ARCHIVE_NOT_BOUND')
+  }
+  if (!unique((state.reportArchive ?? []).map(report => report.attemptId))) fail('REWORK_ARCHIVE_DUPLICATE')
   validateSupervision(state)
   return state
 }
@@ -133,7 +154,7 @@ function checkUpdate(previous, next) {
     const history = previous?.sharedContextHistory ?? []
     const changes = next.sharedContextHistory
     const active = previous?.graph.state.active
-    if (!active || previous.supervision && previous.supervision.phase !== 'READY'
+    if (!active || previous.supervision && !['READY', ...(acceptanceEnabled(previous) ? ['REWORK_RESULT'] : [])].includes(previous.supervision.phase)
         || changes?.length !== history.length + 1 || canonical(changes.slice(0, -1)) !== canonical(history))
       fail('SHARED_CONTEXT_HISTORY_IMMUTABLE')
     const { sharedContextHistory: _changes, checksum: _checksum, ...nextBody } = next
@@ -157,6 +178,18 @@ function checkUpdate(previous, next) {
   if (!previous) return
   if (canonical(next.planningRecord) !== canonical(previous.planningRecord)) fail('PLANNING_RECORD_IMMUTABLE')
   checkSupervisionUpdate(previous, next)
+  if (next.graph.events.at(-1).type === 'REOPENED') {
+    const reopened = new Set(next.graph.events.at(-1).data.attempts.map(row => row.nodeId))
+    const expected = { ...previous, revision: next.revision, graph: next.graph,
+      ...(isHierarchical(previous.graph.state.plan) ? { supervision: { phase: 'READY', outcomes: previous.supervision.outcomes } } : {}),
+      reports: previous.reports.filter(report => !reopened.has(report.taskId)),
+      reportArchive: [...previous.reportArchive ?? [], ...previous.reports.filter(report => reopened.has(report.taskId))],
+      ...(previous.invalidatedReports ? { invalidatedReports: previous.invalidatedReports.filter(id => !reopened.has(id)) } : {}) }
+    if (canonical(next.graph.events.slice(0, -1)) !== canonical(previous.graph.events)
+        || seal(expected).checksum !== next.checksum) fail('REWORK_HISTORY_CHANGED')
+    return
+  }
+  if (canonical(next.reportArchive) !== canonical(previous.reportArchive)) fail('REWORK_ARCHIVE_IMMUTABLE')
   if (canonical(next.graph.events.slice(0, -1)) !== canonical(previous.graph.events)
       || canonical(next.reports.slice(0, previous.reports.length)) !== canonical(previous.reports)
       || next.reports.length > previous.reports.length + 1) fail('COMMITTED_CONTEXT_HISTORY_IMMUTABLE')
@@ -210,7 +243,8 @@ export function describeContextBindings(contexts, plan, leaves) {
 }
 function preserveExecutedBindings(previous, contexts) {
   for (const binding of previous.contexts.bindings) {
-    if (['PENDING', 'INACTIVE'].includes(previous.graph.state.leaves[binding.taskId]?.status)) continue
+    if (['PENDING', 'INACTIVE'].includes(previous.graph.state.leaves[binding.taskId]?.status)
+        && !previous.graph.state.leaves[binding.taskId].reopenedFrom) continue
     const next = contexts.bindings.find(row => row.taskId === binding.taskId)
     if (canonical(next) !== canonical(binding) || canonical(contextClosure(previous.contexts, binding)) !== canonical(contextClosure(contexts, next)))
       fail('EXECUTED_CONTEXT_BINDING_IMMUTABLE')
@@ -219,8 +253,9 @@ function preserveExecutedBindings(previous, contexts) {
 
 /** Serial prototype using the existing task-graph core; never opens the live graph ledger. */
 export class DynamicContextGraph {
-  constructor({ projectRoot, storageRoot = projectRoot, directory, maxContextCharacters = 64000, maxReportCharacters = 16000, maxStateBytes, direct, revision, supervision, supervisionContext = 'legacy', storeFactory }) {
+  constructor({ projectRoot, storageRoot = projectRoot, directory, maxContextCharacters = 64000, maxReportCharacters = 16000, maxStateBytes, direct, revision, supervision, supervisionContext = 'legacy', hierarchy, storeFactory }) {
     if (maxContextCharacters !== null && (!Number.isSafeInteger(maxContextCharacters) || maxContextCharacters < 1 || maxContextCharacters > 8388608)) fail('INVALID_CONTEXT_BUDGET')
+    this.maxGroupDepth = hierarchy?.maxGroupDepth ?? 3
     this.maxContextCharacters = maxContextCharacters
     this.maxReportCharacters = maxReportCharacters
     this.artifactOptions = direct?.maxJournalBytes === null ? { maxBytes: null } : undefined
@@ -246,25 +281,34 @@ export class DynamicContextGraph {
       result.legalNext = []
       result.skipChoices = []
     }
+    if (isHierarchical(state.graph.state.plan) && state.supervision?.hierarchy) {
+      const flow = state.supervision.hierarchy, gate = { UPDATE: 'GRAPH_UPDATE', UPDATE_AUDIT: 'GRAPH_AUDIT', PAUSE_AUDIT: 'PAUSE_REVIEW', WAITING_USER: 'WAITING_USER', BLOCKAGE: 'BLOCKAGE' }[flow.stage]
+      result.focusScopeId = flow.scopeId
+      if (gate) for (const node of result.nodes.filter(node => node.kind === 'container')) node.gate = node.id === flow.scopeId ? gate : null
+    }
     return result
   }
   core(store) { return new TransactionGraph(store, { id: prefix => prefix === 'owner' ? this.owner : `${prefix}_${randomUUID()}` }) }
 
   /** Validate both proposals before atomically committing either graph. */
   submit(input) {
-    const proposal = proposalSchema.parse(input)
+    const proposal = withValidation({ stage: 'dual-graph-submission', path: '/proposal' }, () => proposalSchema.parse(input))
     return this.store.compareAndSwap(0, () => {
+      if (!proposal.taskGraph.hierarchy) {
       const roots = proposal.taskGraph.nodes.filter(node => node.kind === 'container')
-      const topologyError = (field, correction) => fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', { field, correction })
+      const topologyError = (field, correction) => fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', { path: '/' + field.replaceAll('.', '/'), reason: correction, field, correction })
       if (roots.length !== 1) topologyError('taskGraph.nodes', 'Declare exactly one node with kind="container". Put every leaf directly under it using parent.')
       const [root] = roots
-      if (root.parent !== undefined) topologyError('taskGraph.nodes.' + root.key + '.parent', 'Omit parent on the root container.')
+      if (root.parent !== undefined) topologyError('taskGraph.nodes.' + proposal.taskGraph.nodes.indexOf(root) + '.parent', 'Omit parent on the root container.')
       const unparented = proposal.taskGraph.nodes.filter(node => node.kind === 'leaf' && node.parent !== root.key).map(node => node.key)
       const containerEdges = proposal.taskGraph.edges.filter(edge => edge.from === root.key || edge.to === root.key)
       if (unparented.length || containerEdges.length) fail('PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', {
-        root: root.key, leavesNeedingRootParent: unparented, edgesTouchingRoot: containerEdges,
+        path: '/taskGraph', reason: 'Every leaf must be directly under the single root; prerequisite edges must connect leaves.', root: root.key, leavesNeedingRootParent: unparented, edgesTouchingRoot: containerEdges,
         correction: 'Set each listed leaf parent to the root key. Express containment with parent; keep prerequisite edges between leaves only.',
       })
+      }
+      if (proposal.taskGraph.hierarchy && proposal.taskGraph.hierarchy.maxGroupDepth > this.maxGroupDepth) fail('GROUP_DEPTH_CONFIGURATION', { path: '/taskGraph/hierarchy/maxGroupDepth', reason: 'The declared policy exceeds the configured group-depth limit.', maximum: this.maxGroupDepth })
+      if (proposal.taskGraph.hierarchy && !this.supervisionEnabled) fail('HIERARCHY_REQUIRES_SUPERVISION')
       const temporary = new MemoryGraphStore()
       this.core(temporary).create({ operationId: `op_${randomUUID()}`, definition: proposal.taskGraph })
       const graph = temporary.read(), taskIds = new Map(graph.state.plan.nodes.map(node => [node.key, node.id]))
@@ -272,10 +316,10 @@ export class DynamicContextGraph {
       if (contextIds.size !== proposal.contextGraph.nodes.length) fail('DUPLICATE_CONTEXT_NODE')
       const contextBody = { graphId: graph.state.plan.id, creationChecksum: graph.events[0].hash,
         nodes: proposal.contextGraph.nodes.map(node => ({ ...node, id: contextIds.get(node.key),
-          parents: node.parents.map(ref => { if (!contextIds.has(ref)) fail('UNKNOWN_CONTEXT_REFERENCE'); return contextIds.get(ref) }) })),
+          parents: node.parents.map(ref => { if (!contextIds.has(ref)) fail('UNKNOWN_CONTEXT_REFERENCE', { path: '/contextGraph/nodes/' + proposal.contextGraph.nodes.indexOf(node) + '/parents/' + node.parents.indexOf(ref), item: ref, reason: 'Referenced context key is not declared.', allowed: [...contextIds.keys()] }); return contextIds.get(ref) }) })),
         bindings: proposal.contextGraph.bindings.map(row => ({ taskId: taskIds.get(row.task), instruction: row.instruction,
-          contexts: row.contexts.map(ref => { if (!contextIds.has(ref)) fail('UNKNOWN_CONTEXT_REFERENCE'); return contextIds.get(ref) }),
-          inheritReports: row.inheritReports.map(ref => { if (!taskIds.has(ref)) fail('UNKNOWN_REPORT_TASK'); return taskIds.get(ref) }), tools: row.tools,
+          contexts: row.contexts.map(ref => { if (!contextIds.has(ref)) fail('UNKNOWN_CONTEXT_REFERENCE', { path: '/contextGraph/bindings/' + proposal.contextGraph.bindings.indexOf(row) + '/contexts/' + row.contexts.indexOf(ref), item: ref, reason: 'Referenced context key is not declared.', allowed: [...contextIds.keys()] }); return contextIds.get(ref) }),
+          inheritReports: row.inheritReports.map(ref => { if (!taskIds.has(ref)) fail('UNKNOWN_REPORT_TASK', { path: '/contextGraph/bindings/' + proposal.contextGraph.bindings.indexOf(row) + '/inheritReports', item: ref, reason: 'Inherited report source must be a declared predecessor leaf.', allowed: [...taskIds.keys()] }); return taskIds.get(ref) }), tools: row.tools,
           ...(row.completion ? { completion: row.completion } : {}) })),
       }
       const contexts = { ...contextBody, version: digest(contextBody) }
@@ -303,12 +347,55 @@ export class DynamicContextGraph {
         reports: report ? [...previous.reports, reportSchema.parse(report)] : previous.reports })
     })
   }
+  reviewHierarchy({ state, scopeId, inputHash, runId, kind, report }) {
+    return this.store.compareAndSwap(state.revision, previous => {
+      if (previous.checksum !== state.checksum || previous.supervision?.phase !== 'HIERARCHY' || previous.supervision.roleRunId !== runId) fail('HIERARCHY_STALE_GATE')
+      const temporary = new MemoryGraphStore(previous.graph)
+      this.core(temporary).reviewScope({ expectedRevision: state.revision, operationId: `op_${randomUUID()}`, scopeId, inputHash, runId, kind, report })
+      const graph = temporary.read()
+      return seal({ ...previous, graph, revision: graph.revision, supervision: { phase: 'HIERARCHY', outcomes: previous.supervision.outcomes } })
+    })
+  }
+  suspend({ expectedRevision, evidence, note, metadata }) {
+    return this.store.compareAndSwap(expectedRevision, previous => {
+      if (!previous?.supervision || !['READY', 'REWORK_RESULT'].includes(previous.supervision.phase)) fail('GUIDANCE_SUSPENSION_NOT_SAFE')
+      const { outcomes, ...supervision } = previous.supervision, temporary = new MemoryGraphStore(previous.graph)
+      this.core(temporary).suspend({ expectedRevision, operationId: `op_${randomUUID()}`, evidence, note, metadata: { ...metadata, supervision } })
+      const graph = temporary.read()
+      return seal({ ...previous, graph, revision: graph.revision, supervision: { phase: 'READY', outcomes } })
+    })
+  }
+  resolveSuspension({ expectedRevision, attemptId, mode }) {
+    return this.store.compareAndSwap(expectedRevision, previous => {
+      if (previous?.supervision?.phase !== 'READY') fail('GUIDANCE_SUSPENSION_NOT_SAFE')
+      const temporary = new MemoryGraphStore(previous.graph), held = previous.graph.state.suspended
+      this.core(temporary).resolveSuspension({ expectedRevision, operationId: `op_${randomUUID()}`, attemptId, mode })
+      const graph = temporary.read(), supervision = mode === 'resume' ? { ...held.metadata.supervision, outcomes: previous.supervision.outcomes } : previous.supervision
+      return seal({ ...previous, graph, revision: graph.revision, supervision })
+    })
+  }
   begin({ expectedRevision, choice = 0 }) { return this.mutate(expectedRevision, 'begin', { choice }) }
   updateSupervision(state, supervision) {
     return this.store.compareAndSwap(state.revision, previous => {
       if (!this.supervisionEnabled || previous?.checksum !== state.checksum || !previous.supervision)
         fail('SUPERVISION_STALE_BASE')
       return seal({ ...previous, supervision })
+    })
+  }
+  reopenReports({ expectedRevision, baseChecksum, nodeIds, decisionId, evidence }) {
+    return this.store.compareAndSwap(expectedRevision, previous => {
+      if (!previous || previous.checksum !== baseChecksum || !['READY', ...(isHierarchical(previous.graph.state.plan) ? ['HIERARCHY'] : [])].includes(previous.supervision?.phase)) fail('REWORK_STALE_OR_UNREVIEWED')
+      evidence.forEach(ref => artifactProof(this.storageRoot, ref, undefined, this.artifactOptions))
+      const ids = new Set(reworkClosure(previous.graph.state, nodeIds))
+      const temporary = new MemoryGraphStore(previous.graph)
+      this.core(temporary).reopen({ expectedRevision, operationId: `op_${randomUUID()}`, nodeIds, decisionId, evidence,
+        note: 'Evidence-backed rework; historical reports and acceptance remain in the append-only record.' })
+      const graph = temporary.read()
+      return seal({ ...previous, graph, revision: graph.revision,
+        ...(isHierarchical(previous.graph.state.plan) ? { supervision: { phase: 'READY', outcomes: previous.supervision.outcomes } } : {}),
+        reports: previous.reports.filter(report => !ids.has(report.taskId)),
+        reportArchive: [...previous.reportArchive ?? [], ...previous.reports.filter(report => ids.has(report.taskId))],
+        ...(previous.invalidatedReports ? { invalidatedReports: previous.invalidatedReports.filter(id => !ids.has(id)) } : {}) })
     })
   }
   expandRevision(proposal) {
@@ -326,21 +413,22 @@ export class DynamicContextGraph {
     })
     return proposalSchema.parse({ taskGraph: proposal.taskGraph, contextGraph })
   }
-  prepareRevision(proposal) {
+  prepareRevision(proposal, { id } = {}) {
     const previous = this.read()
     if (!previous) fail('CONTEXT_GRAPH_NOT_SUBMITTED')
     const input = this.expandRevision(proposal)
     const scratch = Object.create(DynamicContextGraph.prototype)
+    scratch.maxGroupDepth = previous.graph.state.plan.hierarchy?.maxGroupDepth ?? this.maxGroupDepth
     scratch.owner = this.owner
     scratch.supervisionEnabled = this.supervisionEnabled
     scratch.store = { compareAndSwap(_revision, build) { return build() } }
     scratch.submit(input) // Initial shape, cycle, reference and binding checks.
-    const plan = revisedPlan(previous.graph, input.taskGraph)
+    const plan = id ? revisedPlan(previous.graph, input.taskGraph, { id }) : revisedPlan(previous.graph, input.taskGraph)
     const taskKeys = new Map(plan.nodes.map(node => [node.key, node.id]))
     const ids = new Map(input.contextGraph.nodes.map(node => {
       const old = previous.contexts.nodes.find(row => row.key === node.key)
       if (old?.mutable && node.mutable && old.content !== node.content) fail('SHARED_CONTEXT_INITIAL_VALUE_IMMUTABLE')
-      return [node.key, old?.id ?? `ctx_${randomUUID()}`]
+      return [node.key, old?.id ?? (id ? id('ctx') : `ctx_${randomUUID()}`)]
     }))
     const body = { graphId: plan.id, creationChecksum: previous.graph.events[0].hash,
       nodes: input.contextGraph.nodes.map(node => ({ ...node, id: ids.get(node.key), parents: node.parents.map(key => ids.get(key)) })),
@@ -377,6 +465,8 @@ export class DynamicContextGraph {
   commitRevision({ expectedRevision, prepared, review }) {
     return this.store.compareAndSwap(expectedRevision, previous => {
       if (!previous || previous.checksum !== prepared.baseChecksum) fail('REVISION_STALE_BASE')
+      if (isHierarchical(previous.graph.state.plan) && (review.reviewerRunId !== previous.supervision.roleRunId
+          || review.updaterRunId !== previous.supervision.hierarchy?.updaterRunId)) fail('HIERARCHY_REVISION_ROLE_MISMATCH')
       if (review.preparedHash !== digest(prepared) || review.proposalHash !== digest(review.proposal)) fail('REVISION_APPROVED_DRAFT_MISMATCH')
       const temporary = new MemoryGraphStore(previous.graph)
       this.core(temporary).revise({ expectedRevision, operationId: `op_${randomUUID()}`, plan: prepared.plan, review })
@@ -384,7 +474,7 @@ export class DynamicContextGraph {
         contextHistory: prepared.contexts.version === previous.contexts.version ? previous.contextHistory ?? []
           : [...previous.contextHistory ?? [], { graph: previous.graph, contexts: previous.contexts }],
         invalidatedReports: prepared.invalidatedReports,
-        ...(previous.supervision ? { supervision: { phase: 'READY', outcomes: previous.supervision.outcomes } } : {}) })
+        ...(previous.supervision ? { supervision: { phase: isHierarchical(previous.graph.state.plan) ? 'HIERARCHY' : 'READY', outcomes: previous.supervision.outcomes } } : {}) })
     })
   }
   adoptCheckpoint({ expectedRevision, attemptId, owner }) {
@@ -424,8 +514,9 @@ export class DynamicContextGraph {
         revision: graph.revision, authorityHash, result, check, evidence: report.evidence }
       return seal({ ...previous, graph, revision: graph.revision,
         reports: complete ? [...previous.reports, { ...report, text: result.executionReport ? JSON.stringify({ summary: result.summary,
-          results: result.executionReport.results, directories: result.executionReport.directories, limitations: result.executionReport.limitations }) : result.summary }] : previous.reports,
-        supervision: { phase: 'CHECK_PLAN', outcomes: [...control.outcomes, entry] } })
+          results: result.executionReport.results, directories: result.executionReport.directories, limitations: result.executionReport.limitations,
+          ...(acceptanceEnabled(previous) ? { verification: result.executionReport.verification ?? [], delivery: result.executionReport.delivery ?? null } : {}) }) : result.summary }] : previous.reports,
+        supervision: { phase: isHierarchical(graph.state.plan) ? 'HIERARCHY' : 'CHECK_PLAN', outcomes: [...control.outcomes, entry] } })
     })
   }
   /** Trusted host attestation is enforced by the runtime before this port. */
@@ -439,27 +530,52 @@ export class DynamicContextGraph {
       precommit?.()
       if (current.checksum !== previous.checksum) fail('DIRECT_RECONCILE_STATE_CHANGED')
       const graph = temporary.read()
-      const supervision = current.supervision && { phase: 'CHECK_PLAN', outcomes: [...current.supervision.outcomes, {
+      const supervision = current.supervision && { phase: isHierarchical(graph.state.plan) ? 'HIERARCHY' : 'CHECK_PLAN', outcomes: [...current.supervision.outcomes, {
         taskId: active.nodeId, attemptId: active.attemptId, contextVersion: current.contexts.version,
         revision: graph.revision, authorityHash, evidence, check: null, result: { outcome: 'BLOCKED', summary: note, artifacts: [] },
       }] }
       return seal({ ...current, revision: graph.revision, graph, ...(supervision ? { supervision } : {}) })
     })
   }
-  checkInputs(state, taskId) {
+  checkInputs(state, taskId, priorReports) {
     const binding = state.contexts.bindings.find(row => row.taskId === taskId)
     const reports = binding.inheritReports.map(id => {
-      const report = state.reports.find(row => row.taskId === id)
-      if (!report || state.graph.state.leaves[id].status !== 'COMPLETE') fail('INHERITED_REPORT_NOT_COMMITTED')
+      const source = state.graph.state.plan.nodes.find(node => node.id === id)
+      if (isHierarchical(state.graph.state.plan) && source?.kind === 'container') {
+        if (!hierarchyComplete(state.graph.state, id)) fail('INHERITED_REPORT_NOT_COMMITTED')
+        const group = state.graph.state.hierarchy.groups[id]
+        return { taskId: id, groupReport: copy(group.aliasOf ? state.graph.state.hierarchy.groups[group.aliasOf] : group), acceptance: 'GROUP_FINAL_ACCEPTED' }
+      }
+      let report = state.reports.find(row => row.taskId === id)
+      const task = state.graph.state.plan.nodes.find(node => node.id === taskId), parent = state.graph.state.plan.nodes.find(node => node.id === task.parent)
+      const terminalInput = isHierarchical(state.graph.state.plan) && parent.terminal === taskId && source?.parent === parent.id
+      if (!report && terminalInput) {
+        const outcome = state.supervision.outcomes.findLast(row => row.taskId === id && row.attemptId === state.graph.state.leaves[id]?.attemptId)
+        if (outcome) report = { taskId: id, attemptId: outcome.attemptId, text: JSON.stringify(outcome.result), evidence: outcome.evidence, acceptance: 'ACCEPTED_DISPOSITION_NOT_SUCCESS' }
+      }
+      if (!report || !terminalInput && state.graph.state.leaves[id].status !== 'COMPLETE') fail('INHERITED_REPORT_NOT_COMMITTED')
       report.evidence.forEach(ref => artifactProof(this.storageRoot, ref, undefined, this.artifactOptions))
       return copy(report)
     })
     if (state.supervision) {
       const inputs = new Set(binding.inheritReports)
       for (const row of state.supervision.outcomes) if (inputs.has(row.taskId)) {
+        if (state.graph.events.some(event => event.type === 'REOPENED' && event.data.attempts.some(attempt =>
+          attempt.nodeId === row.taskId && attempt.attemptId === row.attemptId))) continue
         if (this.reportScoped) {
           const inherited = reports.find(report => report.taskId === row.taskId)
-          inherited.currentArtifactChecks = row.result.artifacts.map(ref => artifactCurrentIdentity(this.projectRoot, ref, undefined, this.artifactOptions))
+          const pinned = priorReports?.find(report => report.taskId === row.taskId && report.attemptId === inherited.attemptId)?.currentArtifactChecks
+          // File observations belong to the leaf's original input. Its own
+          // work may have changed those files since. Keep the accepted report
+          // and evidence checks above, and bind each saved observation to it.
+          if (pinned !== undefined) {
+            if (!Array.isArray(pinned) || pinned.length !== row.result.artifacts.length || row.result.artifacts.some((ref, i) => {
+              const seen = pinned[i]
+              return seen?.acceptedSha256 !== ref.sha256 || typeof seen?.ref !== 'string'
+                || path.resolve(this.projectRoot, seen.ref) !== path.resolve(this.projectRoot, ref.ref)
+            })) fail('DIRECT_RESUME_CONTEXT_CHANGED', { taskId: row.taskId, path: '/inheritedReports/currentArtifactChecks' })
+            inherited.currentArtifactChecks = copy(pinned)
+          } else inherited.currentArtifactChecks = row.result.artifacts.map(ref => artifactCurrentIdentity(this.projectRoot, ref, undefined, this.artifactOptions))
           inherited.identityQualification = 'The immutable report/trace proves the historical accepted result. Current artifact checks are file identity observations, not current semantic or directory-tree acceptance. CHANGED/MISSING never becomes a new success proof; use current files and satisfy this leaf contract. Ordinary authorized later development may change earlier deliverables without rewriting their history.'
         } else for (const ref of row.result.artifacts) artifactProof(this.projectRoot, ref, undefined, this.artifactOptions)
       }
@@ -467,10 +583,10 @@ export class DynamicContextGraph {
     return reports
   }
 
-  sharedContext(assembly, { id, revision, content, reason }, callId) {
+  sharedContext(assembly, { id, revision, content, reason }, callId, segmentId) {
     const state = this.read(), active = state?.graph.state.active
     if (!active || active.attemptId !== assembly.task.attemptId || active.owner !== this.owner
-        || state.supervision && state.supervision.phase !== 'READY') fail('SHARED_CONTEXT_ACTIVE_ATTEMPT_REQUIRED')
+        || state.supervision && !['READY', ...(acceptanceEnabled(state) ? ['REWORK_RESULT'] : [])].includes(state.supervision.phase)) fail('SHARED_CONTEXT_ACTIVE_ATTEMPT_REQUIRED')
     const node = boundMutableNode(state, active, id)
     if (!node) return { status: 'UNAVAILABLE', id }
     const history = state.sharedContextHistory ?? []
@@ -480,13 +596,15 @@ export class DynamicContextGraph {
       return selected ? { status: 'FOUND', ...selected, latestRevision: versions.length }
         : { status: 'UNKNOWN_REVISION', id, revision, latestRevision: versions.length }
     }
-    const prior = history.find(row => row.attemptId === active.attemptId && row.callId === callId)
+    if (segmentId && (!acceptanceEnabled(state) || segmentId !== state.supervision?.correction?.id)) fail('SHARED_CONTEXT_SEGMENT_SCOPE')
+    const receiptId = segmentId ? segmentId + ':' + callId : callId
+    const prior = history.find(row => row.attemptId === active.attemptId && row.callId === receiptId)
     if (prior) {
       if (prior.id !== id || prior.content !== content || prior.reason !== reason) fail('SHARED_CONTEXT_CALL_REUSED')
       return { status: 'APPLIED', ...prior }
     }
     const change = { id, revision: versions.length + 1, content, ...(reason === undefined ? {} : { reason }),
-      taskId: active.nodeId, attemptId: active.attemptId, callId }
+      taskId: active.nodeId, attemptId: active.attemptId, callId: receiptId, ...(segmentId ? { sourceCallId: callId, segmentId } : {}) }
     this.store.compareAndSwap(state.revision, previous => {
       if (previous?.checksum !== state.checksum) fail('SHARED_CONTEXT_STALE_STATE')
       return seal({ ...previous, sharedContextHistory: [...history, change] })
@@ -514,12 +632,29 @@ export class DynamicContextGraph {
       } else chosen.push(copy(node))
     }
     binding.contexts.forEach(visit)
-    const reports = this.checkInputs(state, task.id)
+    const reports = this.checkInputs(state, task.id, prior?.inheritedReports)
     const result = { protocol: 'dynamic-context-prototype-v1', contextVersion: state.contexts.version,
       task: { id: task.id, key: task.key, label: task.label, attemptId: active.attemptId, instruction: binding.instruction },
       contexts: chosen, inheritedReports: reports, tools: [...binding.tools],
       ...(state.supervision ? { completion: binding.completion, ...(this.reportScoped ? { reportProtocol: 'report-scoped-v1' } : {}), ...(this.revisionPolicy ? { taskContract: copy(this.revisionPolicy) } : {}) } : {}),
+      ...(acceptanceEnabled(state) ? { verificationPlan: copy(acceptancePlan(state)) } : {}),
       ...(this.revisionEnabled ? { revisionGuidance: '只有新证据推翻假设、发现遗漏依赖、上下文缺失或报告失效时才建议改图。普通错误先在当前任务内处理。执行 worker 不修改或审批双图。若发现必须修图，将证据写成项目内工件，在报告中给出路径、SHA-256、理由、受影响任务及阻塞情况，交给控制器在安全边界发起独立修订和审批。不得声称建议已获批准；报告提交不代表语义验收。' } : {}) }
+    const superseded = state.graph.events.findLast(event => event.type === 'SUSPENSION_RESOLVED' && event.data.mode === 'supersede')
+    const held = superseded && state.graph.events.find(event => event.type === 'SUSPENDED' && event.data.active.attemptId === superseded.data.attemptId)?.data
+    if (held && (held.active.nodeId === task.id || ancestorsOf(state.graph.state.plan, task.id).some(node => node.id === held.metadata.scopeId)))
+      result.interruptedWork = { attemptId: held.active.attemptId, taskId: held.active.nodeId, evidence: copy(held.evidence),
+        qualification: 'Unfinished attempt preserved by user-guided replanning. Existing tool effects remain real; inspect original evidence and current files before reusing or redoing work. This is not an accepted execution report.' }
+    const reopened = state.graph.events.findLast(event => event.type === 'REOPENED'
+      && event.data.attempts.some(row => row.nodeId === task.id))
+    if (reopened) {
+      const ref = reopened.data.evidence[0], proof = artifactProof(this.storageRoot, ref, undefined, this.artifactOptions)
+      const request = JSON.parse(fs.readFileSync(proof.path, 'utf8'))
+      artifactProof(this.storageRoot, ref, undefined, this.artifactOptions)
+      if (request.roundId !== reopened.data.decisionId || request.decision?.action !== 'REWORK') fail('REWORK_REQUEST_CHANGED')
+      result.reworkRequest = { previousAttempt: reopened.data.attempts.find(row => row.nodeId === task.id).attemptId,
+        source: ref, findings: request.decision.report.findings,
+        instruction: 'This is a new execution attempt after an evidence-backed withdrawal. Preserve the original task contract; address applicable defects, recheck affected prerequisites, and submit a fresh report. Old reports remain historical observations, not current completion proof.' }
+    }
     if (this.maxContextCharacters !== null && JSON.stringify(result).length > this.maxContextCharacters) fail('ASSEMBLED_CONTEXT_BUDGET_EXCEEDED')
     return result
   }

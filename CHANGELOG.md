@@ -1,3 +1,9 @@
+# 0.1.1-rc.61
+
+- Visual inspection: each role chooses up to 5 new images per turn. The model sees the most recent 10 image occurrences; references and original tool records remain available for a fresh read.
+
+- 更新预规划、执行和终审角色，支持工作区只读取证、用户中途引导、权限热更新及检查点恢复。
+
 # 0.1.1-rc.41
 
 - 配套任务图包更名为 `dsh-better-task-grapth@0.3.1-rc.41`。

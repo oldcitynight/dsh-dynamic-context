@@ -110,12 +110,12 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
     }
     refresh()
     for (const h of disposers) h.check()
-  }, wrap(argv, effectiveMode = mode) {
+  }, wrap(argv, effectiveMode = typeof mode === 'function' ? mode() : mode) {
     if (!Array.isArray(argv) || !argv.length) fail('DIRECT_PRIVATE_PATH_ARGV_INVALID')
     const nativeBwrap = path.basename(argv[0]) === 'bwrap'
     const boundary = nativeBwrap ? argv.indexOf('--') : -1
     if (nativeBwrap && boundary < 1) fail('DIRECT_PRIVATE_PATH_RUNNER_DIALECT')
-    const args = nativeBwrap ? argv.slice(0, boundary) : [runner, '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent']
+    const args = nativeBwrap ? argv.slice(0, boundary) : [runner, effectiveMode === 'danger-full-access' ? '--bind' : '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent']
     if (nativeBwrap) args[0] = runner
     // Native bwrap already grants an isolated writable /tmp for workspace-write.
     // Point child utilities there rather than inheriting an unwritable host
@@ -123,7 +123,7 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
     if (nativeBwrap && effectiveMode === 'workspace-write' && args.some((arg, index) => arg === '--tmpfs' && args[index + 1] === '/tmp'))
       args.push('--setenv', 'TMPDIR', '/tmp')
     for (const root of directories) args.push('--tmpfs', root)
-    args.push(effectiveMode === 'workspace-write' ? '--bind' : '--ro-bind', workspace, workspace)
+    args.push(effectiveMode !== 'read-only' ? '--bind' : '--ro-bind', workspace, workspace)
     for (const root of directories) if (inside(workspace, root)) args.push('--tmpfs', root)
     // A single bind over the current credential inode is insufficient: the host
     // atomically replaces it during refresh. Snapshot its dedicated parent in

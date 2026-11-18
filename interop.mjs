@@ -6,6 +6,7 @@ import { EXTENSION_CONTRACT } from 'dsh-better-task-grapth/extensions'
 import { digest } from 'dsh-better-task-grapth/core'
 import { proposalSchema } from './core.mjs'
 import { interactiveProposalSchema } from './control-tools.mjs'
+import { GRAPH_COMMIT_RECORD } from './graph-presence.mjs'
 
 export function requireTaskGraph(ctx, expected) {
   const service = ctx.get('transactionGraph')
@@ -33,6 +34,15 @@ const requests = {
   maintenance: z.object({ expectedRevision: revision, planChecksum: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(),
 }
 
+function linkedGraphView(runner) {
+  const { state, presence } = runner.graph.store.inspect({ reconcilePrepared: false })
+  if (presence.state === 'NEVER_CREATED' && !runner.controller.session.snapshotEvents().some(event =>
+    event.type === GRAPH_COMMIT_RECORD && event.ignorable && event.data.workflowId === runner.workflowId)) return null
+  if (presence.state !== 'READY') throw new Error('GRAPH_RECOVERY_REQUIRED')
+  const display = runner.graph.status(state)
+  return { display: { ...display, skipChoices: [] }, plan: state.graph.state.plan }
+}
+
 /** Bind one joint ledger to the task-graph plugin; never mirror its transitions. */
 export function workflowAdapter(runner) {
   const durable = runner.config.transport === 'direct' && runner.config.direct.durable
@@ -45,6 +55,19 @@ export function workflowAdapter(runner) {
       ...(durable ? ['pause', 'resume', 'reconcile', 'maintenance'] : [])],
     authorize: agent => !runner.closed && agent !== runner.current?.agent
       && (runner.config.interaction.mode === 'host' || runner.controller === agent),
+    ...(runner.config.interaction.mode === 'interactive' ? { readGraphView: () => linkedGraphView(runner),
+      readExecutionView: () => runner.interaction?.orchestrator?.executionView(runner.controller) ?? null,
+      readExecutionOutput: async request => {
+        await runner.output.importHistory(runner)
+        if (request.itemId) return runner.output.body(request)
+        const page = runner.output.read(request)
+        if (!page.items.length) return page
+        let labels = new Map()
+        try { labels = new Map((runner.graph.read()?.graph.state.plan.nodes ?? []).map(node => [node.id, node.label])) } catch {}
+        return { ...page, items: page.items.map(row => ({ ...row, taskLabel: labels.get(row.taskId) ?? null })) }
+      },
+      controlExecution: (action, { agent, signal }) => runner.interaction.orchestrator.fromView(agent, action, signal),
+    } : {}),
     subscribe: callback => runner.subscribe(callback),
     read() {
       const graphPresence = runner.graphPresence()

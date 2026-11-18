@@ -1,5 +1,11 @@
+import { livePermissionAuthority } from './permissions.mjs'
+import { parseModelJSON, diagnostic, feedbackText } from 'dsh-better-task-grapth/validation'
+import { validateReview } from './review-feedback.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
+import { rolePrompt, roleTools, roleScope, roleMessagesMatch, leafBindingTools } from './role-policy.mjs'
+import { withUserGuidance } from './guidance-state.mjs'
+import { COMPACTION_INSTRUCTION } from './dsh-compaction-policy.mjs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { fetch } from 'undici'
@@ -8,14 +14,21 @@ import { ZodError } from 'zod'
 import { RevisionCoordinator, planDefinition } from './revision.mjs'
 import { artifactFacts, verifyArtifactFacts, revisionAuthority } from './revision-host.mjs'
 import { directAuthHeaders } from './direct-auth.mjs'
-import { apiParameters, measureInput } from './api-protocol.mjs'
+import { apiParameters, measureInput, resolveReasoningPolicy } from './api-protocol.mjs'
 import { readCompletion } from './direct-http.mjs'
+import { IMAGE_WINDOW } from './image-content.mjs'
+import { prepareDirectRequest, directEndpoint, directProtocolHeaders } from './direct-wire.mjs'
+import { roleToolOutcome, toolErrorBlock, toolErrorBlocked } from './tool-error-policy.mjs'
+import { workspaceAuditTools } from './workspace-audit.mjs'
+import { imageWireByteBound } from './image-content.mjs'
 import { acquireDirectLease } from './durable-store.mjs'
 import { fail, describeContextBindings, currentSharedContexts } from './core.mjs'
 import { artifactProof, realProjectPath } from './artifacts.mjs'
 import { supervisionSemantics } from './supervision-semantics.mjs'
 import { createRoleContext, rolePressureTokens, roleWindow } from './role-context.mjs'
 import { executionReportHistory, REPORT_PROTOCOL } from './report-evidence.mjs'
+import { createReportDraft, standardReportTemplate, REPORT_GENERATE, REPORT_SUBMIT } from './report-draft.mjs'
+import { blockageSituation } from './blockage-protocol.mjs'
 
 function save(file, value) {
   const fd = fs.openSync(file + '.tmp', fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600)
@@ -34,7 +47,7 @@ export function contextDefinition(state) {
       ...(row.completion ? { completion: row.completion } : {}) })) }
 }
 const uncertainRole = phase => ['MODEL_PENDING', 'RESPONSE_RECEIVED', 'UNKNOWN_NO_REPLAY'].includes(phase)
-const roleId = /^revision_(updater|reviewer|result_check|plan_check|result_repair)_[a-f0-9-]{36}$/
+const roleId = /^revision_(updater|reviewer|result_check|plan_check|result_repair|blockage|blockage_audit|group_audit|scope_plan|scope_update|scope_audit|task_reporter|progress_reporter|scope_blockage|scope_pause|guidance_intake|guidance_router)_[a-f0-9-]{36}$/
 export function readRoleRecord(runner, runId) {
   if (!roleId.test(runId)) fail('REVISION_RECOVERY_SCOPE_REQUIRED')
   const file = path.join(runner.config.directory, 'revisions', runId, 'role.json')
@@ -45,6 +58,23 @@ export function readRoleRecord(runner, runId) {
     if (digest(call.payload) !== call.requestHash || call.response && digest(call.response) !== call.responseHash) fail('REVISION_RECOVERY_RECORD_CHANGED')
   }
   return record
+}
+function savedRoleToolSchemas(record) {
+  const byRole = new Map()
+  for (const { purpose, payload } of record?.calls ?? []) {
+    if (!payload.tools?.length || byRole.has(purpose)) continue
+    const schemas = new Map()
+    for (const tool of payload.tools) {
+      const { name, description, parameters = tool.input_schema } = tool.function ?? tool
+      if (typeof name === 'string' && typeof description === 'string' && parameters)
+        schemas.set(name, { description, parameters })
+    }
+    byRole.set(purpose, schemas)
+  }
+  return byRole
+}
+export function roleRecordValue(record) {
+  return record.submittedReport ?? parseModelJSON(record.response.text, { envelope: true }).value
 }
 export function revisionRecoveryState(runner) {
   if (!runner.config.revision) return []
@@ -118,52 +148,180 @@ export async function abandonRevisionRole(runner, { expectedRevision, runId, req
   }
 }
 export async function directRevisionRole(runner, request) {
-  const { config, ctx } = runner, { direct } = config, { runId, role, messages, signal } = request
+  const { ctx } = runner, { runId, role, signal, validateOutput = false, validateResult } = request
+  let messages = withUserGuidance(runner, role, request.messages)
+  const prior = readRoleRecord(runner, runId)
+  const blocked = prior?.toolErrorBlock
+  if (blocked && runner.workflowControl?.ackToolError?.id !== blocked.id) throw toolErrorBlocked(blocked)
+  const baseMessagesHash = digest(messages), baseInputHash = digest(messages.slice(1))
+  let promptSnapshot
+  if (roleMessagesMatch(prior, messages)) { messages = prior.payload.messages; promptSnapshot = prior.promptSnapshot }
+  else {
+    let input = {}; try { input = JSON.parse(messages[1].content) } catch {}
+    promptSnapshot = rolePrompt(runner, role, messages[0].content, input)
+    messages = [{ ...messages[0], content: promptSnapshot.content }, ...messages.slice(1)]
+  }
+  const reasoning = await resolveReasoningPolicy({ config: runner.config, ctx,
+    sourceAgent: request.sourceAgent ?? runner.controller ?? runner.current?.sourceAgent, signal, previous: prior?.reasoningPolicy })
+  const { config } = reasoning, { direct } = config
+  const returned = value => {
+    runner.workflowControl?.beforeCommit?.()
+    runner.workflowControl?.roleComplete?.(role, runId, JSON.parse(messages[1].content), value)
+    return value
+  }
   const directory = path.join(config.directory, 'revisions', runId)
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
   const payload = { ...direct.generation, ...apiParameters(direct), model: config.model, messages,
-    max_tokens: config.revision.maxOutputTokens, response_format: { type: 'json_object' }, stream: true, stream_options: { include_usage: true } }
-  const record = { role, runId, phase: 'PREPARED', requestHash: digest(payload), payload, calls: [] }
-  const prior = readRoleRecord(runner, runId)
+    max_tokens: config.revision?.maxOutputTokens ?? config.maxOutputTokens, response_format: { type: 'json_object' }, stream: true, stream_options: { include_usage: true } }
+  let record = { role, runId, phase: 'PREPARED', requestHash: digest(payload), payload, calls: [], baseMessagesHash, baseInputHash,
+    ...(promptSnapshot?.contributions.length ? { promptSnapshot } : {}), ...(reasoning.receipt ? { reasoningPolicy: reasoning.receipt } : {}) }
   if (prior) {
     if (prior.role !== role || prior.requestHash !== record.requestHash) fail('REVISION_ROLE_INPUT_CHANGED')
-    if (prior.phase === 'COMPLETE') {
-      const result = JSON.parse(prior.response.text)
+    if (prior.phase === 'COMPLETE' && !request.revalidateCompleted) {
+      if (prior.submittedReport) {
+        // Reconstruct from the original immutable input and exact provider tool
+        // receipts. Never trust a stored materialization without this check.
+        const input = JSON.parse(messages[1].content)
+        if (!prior.formattedReports && (role !== 'result_repair' || typeof input.previousSubmission !== 'string')) fail('REVISION_ROLE_RECEIPT_INVALID')
+        const draft = createReportDraft(role === 'result_repair' ? input.previousSubmission : '{}', { requireReport: config.supervisionContext !== 'legacy',
+          ...(prior.formattedReports ? { generate: true, replayReceipts: prior.context.reportDraft.receipts,
+            validateResult: value => validateOutput ? validateReview(role, value, input) : value } : {}) })
+        const names = new Set(draft.tools.map(tool => tool.function.name))
+        for (const call of prior.calls) for (const tool of call.response?.message.tool_calls ?? []) {
+          if (names.has(tool.function.name) && !([REPORT_SUBMIT, REPORT_GENERATE].includes(tool.function.name) && call.response.message.tool_calls.length !== 1))
+            draft.execute(tool.function.name, tool.function.arguments)
+        }
+        const value = draft.result()
+        if (value === undefined || digest(value) !== prior.resultHash || digest(value) !== digest(prior.submittedReport)
+            || digest(draft.snapshot()) !== digest(prior.context.reportDraft)) fail('REVISION_ROLE_RECEIPT_INVALID')
+        return returned(value)
+      }
+      const rawResult = parseModelJSON(prior.response.text, { envelope: true }).value
+      const result = digest(rawResult) === prior.resultHash ? rawResult : validateResult
+        ? validateResult(rawResult) : validateReview(role, rawResult, JSON.parse(messages[1].content))
       if (prior.response.finish !== 'stop' || prior.response.message.tool_calls?.length || digest(result) !== prior.resultHash)
         fail('REVISION_ROLE_RECEIPT_INVALID')
-      return result
+      return returned(result)
     }
-    if (!['PREPARED', 'NOT_SENT'].includes(prior.phase)) fail('REVISION_ROLE_REQUIRES_RECONCILIATION')
+    if (!['PREPARED', 'NOT_SENT', 'PAUSED', 'REJECTED', ...(request.revalidateCompleted ? ['COMPLETE'] : [])].includes(prior.phase)
+        && (!runner.workflowControl?.recoverModel || runner.revisionAccounting)) fail('REVISION_ROLE_REQUIRES_RECONCILIATION')
+    record = prior
   }
+  // An old, uncompressed role may have been rejected before producing any
+  // response. Explicit manual recovery may start a new preparation generation,
+  // preserving every old uncertain receipt and its financial status unchanged.
+  if (prior && !prior.contextPolicyVersion && direct.compaction?.strategy === 'dsh-native'
+      && !prior.context?.actions?.length && prior.calls.length && prior.calls.every(row => !row.response)
+      && (prior.phase === 'REJECTED' || runner.workflowControl?.recoverModel && !runner.revisionAccounting)) {
+    record.contextGenerations ??= []
+    record.contextGenerations.push({ generation: (record.contextGeneration ?? 0) + 1,
+      reason: 'PREPARE_NATIVE_COMPACTION_BEFORE_ROLE', priorSequences: record.calls.map(row => row.sequence),
+      previousPhase: record.phase, unknownOutcomePreserved: true, financialStatus: 'UNCHANGED' })
+    record.contextGeneration = record.contextGenerations.at(-1).generation
+  }
+  record.contextPolicyVersion = 2
+  record.structuredToolErrors ??= !prior
+  if (blocked) {
+    record.acknowledgedToolErrors = [...new Set([...(record.acknowledgedToolErrors ?? []), blocked.id])]
+    delete record.toolErrorBlock
+    delete record.error
+    delete record.validationFeedback
+  }
+  record.formattedReports ??= !prior
+  if (record.formattedReports && !prior) record.reportTemplate = standardReportTemplate(request.messages[0].content)
+  const compactPrompt = prior ? prior.compactionPrompt ?? { contributions: [], content: COMPACTION_INSTRUCTION } : rolePrompt(runner, 'compaction', COMPACTION_INSTRUCTION, JSON.parse(messages[1].content))
+  if (compactPrompt.contributions.length) record.compactionPrompt = compactPrompt
   save(path.join(directory, 'role.json'), record)
   const spec = roleWindow(config)
+  record.imageTools ??= !prior && Boolean(config.projectRoot && fs.existsSync(config.projectRoot))
+  const toolScope = roleScope(runner, JSON.parse(messages[1].content)), registry = roleTools(runner)
+  if (!prior && record.imageTools && registry.extensions(role, toolScope, config.projectRoot).some(row => row.auditArtifacts))
+    record.auditArtifacts = true
+  const suppliedTools = request.readOnlyTools
+  const images = record.imageTools && !suppliedTools?.tools.some(row => row.function.name === 'read_image')
+    ? workspaceAuditTools({ ...runner, config }, path.join(directory, 'image-reader'), new Map(), signal, { imagesOnly: true, evidenceDirectory: directory }) : null
+  const readOnlyTools = images ? { tools: [...(suppliedTools?.tools ?? []), ...images.tools], execute: tool =>
+    tool.function.name === 'read_image' ? images.execute(tool) : suppliedTools.execute(tool) } : suppliedTools
+  const auditArtifacts = record.auditArtifacts ? (images ?? suppliedTools)?.auditArtifacts : undefined
   const persist = () => save(path.join(directory, 'role.json'), record)
-  const call = async (wirePayload, details) => {
-    const request = { sequence: record.calls.length + 1, ...details, phase: 'PREPARED',
-      requestHash: digest(wirePayload), payload: wirePayload }
+  const policy = runner.toolErrorPolicy?.snapshot()
+  const imageFailures = new Map(record.imageFailures)
+  const reportedImageFailures = new Set(imageFailures.keys())
+  const existingResponses = record.calls.length
+  let replayingDelivered = false, legacyImageBatch = false
+  const inspectTool = (toolRole, tool, value, ordinal) => {
+    if (!policy || replayingDelivered) return
+    const block = toolErrorBlock(policy, roleToolOutcome(value), { role: toolRole, toolId: tool.function.name, callId: tool.id, runId, ordinal })
+    if (!block || record.acknowledgedToolErrors?.includes(block.id)) return
+    throw toolErrorBlocked(block)
+  }
+  let logicalStep = 0
+  const call = async (normalizedPayload, details) => {
+    const position = ++logicalStep
+    const previous = record.calls.findLast(row => (row.logicalStep ?? row.sequence) === position
+      && (row.contextGeneration ?? 0) === (record.contextGeneration ?? 0))
+    replayingDelivered = Boolean(previous?.response && previous.sequence < existingResponses)
+    const requestImageFailures = new Map()
+    legacyImageBatch = replayingDelivered && previous.imageWindow === undefined
+    const prepareWire = legacyImageHistory => prepareDirectRequest(normalizedPayload, config, ctx, signal, { legacyImageHistory, failures: imageFailures, replay: previous,
+      onFailure(callId, value, key) {
+        requestImageFailures.set(key, value)
+        if (previous || reportedImageFailures.has(key)) return
+        reportedImageFailures.add(key)
+        record.imageFailures = [...imageFailures].filter(([key]) => reportedImageFailures.has(key))
+        inspectTool(details.purpose === 'compaction' ? 'compaction' : role, { id: callId, function: { name: 'read_image' } }, value, key)
+      } })
+    let wirePayload = await prepareWire(Boolean(previous && previous.imageWindow === undefined))
+    const endpoint = directEndpoint(direct)
+    if (previous && previous.requestHash !== digest(wirePayload)) fail('REVISION_RESUME_REQUEST_CHANGED')
+    if (previous?.phase === 'COMPLETE' || previous?.response && !runner.revisionAccounting) return previous.response
+    if (previous?.phase === 'REJECTED') throw Object.assign(new Error(previous.error), {
+      code: previous.error, directReceipt: previous.transportReceipt, providerError: previous.providerError })
+    if (previous && previous.imageWindow === undefined) wirePayload = await prepareWire(false)
+    runner.workflowControl?.beforeRequest()
+    const request = { imageWindow: IMAGE_WINDOW, sequence: record.calls.length + 1, logicalStep: position, contextGeneration: record.contextGeneration ?? 0, ...details, phase: 'PREPARED',
+      ...(previous ? { resumedFrom: previous.sequence, previousOutcome: previous.phase, financialStatus: 'UNCHANGED' } : {}),
+      requestHash: digest(wirePayload), payload: wirePayload, endpoint,
+      ...(requestImageFailures.size ? { imageFailures: [...requestImageFailures] } : {}) }
     record.calls.push(request); persist()
-    const headers = await directAuthHeaders(ctx, direct, signal), body = JSON.stringify(wirePayload)
-    if (direct.maxRequestBytes !== null && Buffer.byteLength(body) > direct.maxRequestBytes) fail('DIRECT_REQUEST_BYTE_LIMIT')
-    const measured = await measureInput(runner.inputMeter, wirePayload, signal, config.maxInputTokens)
-    request.inputMeasurement = measured ?? { tokens: rolePressureTokens(wirePayload), method: 'utf8-byte-bound' }
-    if (spec && rolePressureTokens(wirePayload, measured) + wirePayload.max_tokens > spec.contextWindow) fail('REVISION_CONTEXT_WINDOW_EXCEEDED_BEFORE_SEND')
     const metadata = { runId, role, directory, sequence: request.sequence, ...details }
-    await runner.revisionAccounting?.beforeRequest?.(wirePayload, metadata)
-    signal.throwIfAborted()
-    request.phase = 'MODEL_PENDING'; record.phase = 'MODEL_PENDING'; persist()
+    let observed
     try {
-      const response = await fetch(direct.endpoint, { method: 'POST', redirect: 'error', signal,
-        headers: { 'content-type': 'application/json', ...headers }, body })
+      const body = JSON.stringify(wirePayload)
+      request.bodySha256 = createHash('sha256').update(body).digest('hex')
+      if (direct.maxRequestBytes !== null && Buffer.byteLength(body) > direct.maxRequestBytes) fail('DIRECT_REQUEST_BYTE_LIMIT')
+      const measured = await measureInput(runner.inputMeter, wirePayload, signal, config.maxInputTokens)
+      request.inputMeasurement = measured ?? { tokens: Math.max(rolePressureTokens(normalizedPayload), normalizedPayload.messages.some(m => m.images?.length) ? imageWireByteBound(wirePayload) : Buffer.byteLength(body)), method: 'utf8-byte-bound' }
+      if (spec && rolePressureTokens(normalizedPayload, measured) + wirePayload.max_tokens > spec.contextWindow)
+        fail('REVISION_CONTEXT_WINDOW_EXCEEDED_BEFORE_SEND', { contextWindow: spec.contextWindow,
+          inputTokens: request.inputMeasurement.tokens, reservedOutputTokens: wirePayload.max_tokens })
+      const headers = await directAuthHeaders(ctx, { ...direct, endpoint }, signal)
+      runner.workflowControl?.beforeRequest()
+      await runner.revisionAccounting?.beforeRequest?.(wirePayload, metadata)
+      signal.throwIfAborted()
+      runner.workflowControl?.beforeRequest()
+      request.phase = 'MODEL_PENDING'; record.phase = 'MODEL_PENDING'; persist()
+      runner.activity = { stage: role, kind: 'model', sessionId: null, step: request.sequence, tool: null, at: new Date().toISOString() }
+      observed = runner.output?.model({ stage: details.purpose === 'compaction' ? 'compaction' : role, step: request.sequence }, `role:${runId}:${request.sequence}`,
+        { payload: normalizedPayload, inputMeasurement: request.inputMeasurement, group: 'role:' + runId })
+      const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal,
+        headers: { 'content-type': 'application/json', ...directProtocolHeaders(direct, details.purpose), ...headers }, body })
       const completed = await readCompletion(response, { signal, model: config.model, direct,
-        maxResponseBytes: direct.maxResponseBytes, onProgress: runner.inputMeter?.observe })
+        maxResponseBytes: direct.maxResponseBytes, onProgress: value => { observed?.progress?.(value); runner.inputMeter?.observe?.(value) }, onDelta: observed?.delta })
+      observed?.end('complete', completed.finish, completed.usage)
       request.response = completed; request.responseHash = digest(completed); request.phase = 'RESPONSE_RECEIVED'
       record.phase = 'RESPONSE_RECEIVED'; persist()
       await runner.revisionAccounting?.afterResponse?.(completed, metadata)
       request.phase = 'COMPLETE'; persist()
+      runner.activity = { ...runner.activity, kind: 'result', at: new Date().toISOString() }
       return completed
     } catch (error) {
+      if (!request.response) observed?.end('interrupted', error.code ?? error.name, error.directReceipt?.usage)
       request.error = error.code ?? error.message
-      request.phase = request.response ? 'RESPONSE_RECEIVED' : 'UNKNOWN_NO_REPLAY'
+      const notSent = request.phase === 'PREPARED'
+      request.phase = notSent ? 'NOT_SENT' : request.response ? 'RESPONSE_RECEIVED'
+        : error.code === 'DIRECT_CONTEXT_LENGTH_EXCEEDED' && error.directReceipt?.responseRejected ? 'REJECTED' : 'UNKNOWN_NO_REPLAY'
+      if (notSent) error.directReceipt = { ...(error.directReceipt ?? {}), execution: 'NOT_SENT', notSent: true }
       if (error.directReceipt) request.transportReceipt = error.directReceipt
       if (error.providerError) request.providerError = error.providerError
       persist()
@@ -171,36 +329,120 @@ export async function directRevisionRole(runner, request) {
       throw error
     }
   }
-  const context = createRoleContext({ config, messages, directory, call, signal,
-    measureTokens: async payload => rolePressureTokens(payload, await measureInput(runner.inputMeter, payload, signal)) })
+  let context
   try {
+    context = createRoleContext({ config, messages, directory, call, signal, role,
+      inspectTool, structuredToolErrors: record.structuredToolErrors,
+      formattedReports: record.formattedReports, reportTemplate: record.reportTemplate,
+      reportReceipts: prior?.context?.reportDraft?.receipts,
+      validateSubmission: raw => {
+        let value = validateOutput ? validateReview(role, raw, JSON.parse(messages[1].content)) : raw
+        if (validateResult) value = validateResult(value)
+        request.validateToolResult?.(value)
+        images?.checkCurrent({ action: 'COMPLETE' })
+        return value
+      },
+      compactionInstruction: compactPrompt.content,
+      toolPolicy: registry, toolScope,
+      toolHostContext: { runner, sourceAgent: request.sourceAgent ?? runner.controller ?? runner.current?.sourceAgent, signal, directory, runId, auditArtifacts,
+        savedToolSchemas: savedRoleToolSchemas(prior), returnToolErrors: true },
+      limitImageBatch: () => !legacyImageBatch,
+      beforeTool: () => runner.workflowControl?.beforeTool?.(),
+      ...(readOnlyTools ? { readOnlyTools } : {}),
+      imageTools: record.imageTools,
+      directorySnapshots: role === 'result_repair' && config.supervisionContext !== 'legacy'
+        && (!prior || !prior.calls?.length || prior.context?.directorySnapshots === true),
+      observeTool: (type, data) => runner.output?.tool({ stage: role, step: record.calls.length }, type, data, `role:${runId}`),
+      measureTokens: async payload => {
+        const normalized = { ...direct.generation, ...apiParameters(direct), model: config.model,
+          max_tokens: config.revision?.maxOutputTokens ?? config.maxOutputTokens, stream: true, ...payload }
+        return rolePressureTokens(normalized, await measureInput(runner.inputMeter, await prepareDirectRequest(normalized, config, ctx, signal, { failures: imageFailures }), signal))
+      } })
+    let lastRejection, forceCompaction = false, overflowRetries = 0, overflowError, rejectedPayloadHash
     for (;;) {
-      const prepared = await context.prepare()
+      const prepared = await context.prepare({ force: forceCompaction })
+      forceCompaction = false
       record.context = context.snapshot(); persist()
-      const completed = await call(prepared, { purpose: role })
+      if (overflowError && digest(prepared) === rejectedPayloadHash) throw overflowError
+      let completed
+      try { completed = await call(prepared, { purpose: role }) }
+      catch (error) {
+        if (error.code !== 'DIRECT_CONTEXT_LENGTH_EXCEEDED' || !error.directReceipt?.responseRejected
+            || direct.compaction?.strategy !== 'dsh-native' || overflowRetries >= 1) throw error
+        record.overflowRecovery = { sequence: record.calls.length, retry: ++overflowRetries, reason: error.code }
+        overflowError = error; rejectedPayloadHash = digest(prepared)
+        forceCompaction = true; persist(); continue
+      }
       if (completed.finish === 'tool_calls') {
         await context.continueRead(completed)
         record.context = context.snapshot(); persist()
+        const submitted = context.submitted()
+        if (submitted !== undefined) {
+          const receipt = record.calls.findLast(row => (row.logicalStep ?? row.sequence) === logicalStep && (row.contextGeneration ?? 0) === (record.contextGeneration ?? 0))
+          if (request.revalidateCompleted && receipt?.validationRejection) {
+            const error = new Error(receipt.validationRejection.code); error.diagnostic = receipt.validationRejection
+            context.reject(completed, error); continue
+          }
+          if (request.revalidateCompleted && validateResult) try { validateResult(submitted) } catch (error) {
+            if (signal.aborted) throw error
+            receipt.validationRejection = diagnostic(error, { stage: role }); persist()
+            context.reject(completed, error); continue
+          }
+          record.response = completed; record.submittedReport = submitted
+          record.phase = 'COMPLETE'; record.resultHash = digest(submitted); persist()
+          return returned(submitted)
+        }
         continue
       }
       record.response = completed; persist()
       if (completed.finish !== 'stop' || completed.message.tool_calls?.length) fail('REVISION_ROLE_TOOLS_FORBIDDEN')
-      const value = JSON.parse(completed.text)
+      const recordedCall = record.calls.findLast(row => (row.logicalStep ?? row.sequence) === logicalStep
+        && (row.contextGeneration ?? 0) === (record.contextGeneration ?? 0))
+      // Filesystem-dependent final checks are time-sensitive. During replay,
+      // preserve an earlier rejection verbatim even if files have reverted;
+      // otherwise an obsolete response could silently replace the later audit.
+      if (request.revalidateCompleted && recordedCall?.validationRejection) {
+        const error = new Error(recordedCall.validationRejection.code)
+        error.diagnostic = recordedCall.validationRejection
+        lastRejection = recordedCall.validationRejection
+        context.reject(completed, error); continue
+      }
+      let value
+      try {
+        const parsed = parseModelJSON(completed.text, { envelope: true }); record.syntaxRepairs = parsed.repairs
+        value = validateOutput ? validateReview(role, parsed.value, JSON.parse(messages[1].content)) : parsed.value
+        if (validateResult) value = validateResult(value)
+        images?.checkCurrent({ action: 'COMPLETE' })
+      } catch (error) {
+        if (!validateOutput) throw error
+        const feedback = diagnostic(error, { stage: role })
+        error.diagnostic = feedback
+        error.message = feedbackText(error)
+        if (request.revalidateCompleted && recordedCall) recordedCall.validationRejection = feedback
+        if (lastRejection && digest(lastRejection) === digest(feedback)) throw error
+        lastRejection = feedback; record.lastRejection = feedback; context.reject(completed, error); persist(); continue
+      }
       record.phase = 'COMPLETE'; record.resultHash = digest(value); persist()
-      return value
+      return returned(value)
     }
   } catch (error) {
     record.error = error.code ?? error.message
-    record.phase = record.calls.some(call => ['MODEL_PENDING', 'UNKNOWN_NO_REPLAY', 'RESPONSE_RECEIVED'].includes(call.phase)) ? 'UNKNOWN_NO_REPLAY'
+    record.validationFeedback = diagnostic(error, { stage: role })
+    if (error.code === 'DIRECT_TOOL_ERROR_BLOCKED') record.toolErrorBlock = error.details
+    record.phase = ['WORKFLOW_PAUSE_REQUESTED', 'WORKFLOW_GUIDANCE_REQUESTED', 'DIRECT_TOOL_ERROR_BLOCKED'].includes(error.code) ? 'PAUSED'
+      : record.calls.some(call => ['MODEL_PENDING', 'UNKNOWN_NO_REPLAY', 'RESPONSE_RECEIVED'].includes(call.phase)) ? 'UNKNOWN_NO_REPLAY'
+      : record.calls.at(-1)?.phase === 'REJECTED' ? 'REJECTED'
       : record.calls.some(call => call.phase === 'COMPLETE') ? 'INVALID_RESPONSE' : 'NOT_SENT'
     if (error.directReceipt) record.transportReceipt = error.directReceipt
     if (error.providerError) record.providerError = error.providerError
-    record.context = context.snapshot(); persist()
+    if (context) record.context = context.snapshot()
+    persist()
+    runner.output?.interrupt({ prefix: `role:${runId}` })
     throw error
-  }
+  } finally { images?.close() }
 }
 
-export function revisionSnapshot(runner) {
+export function revisionSnapshot(runner, hostAllowedTools = runner.config.allowedTools) {
   const state = runner.graph.read()
   if (!state) fail('CONTEXT_GRAPH_NOT_SUBMITTED')
   const contextGraph = contextDefinition(state)
@@ -214,7 +456,7 @@ export function revisionSnapshot(runner) {
     ...(sharedContexts.length ? { sharedContexts } : {}),
     taskGraph: planDefinition(state.graph.state.plan),
     revision: state.revision, checksum: state.checksum, linked: true, active: state.graph.state.active,
-    hostAllowedTools: [...runner.config.allowedTools],
+    hostAllowedTools: [...hostAllowedTools],
     taskStates: Object.fromEntries(state.graph.state.plan.nodes.filter(node => node.kind === 'leaf').map(node => [node.key, state.graph.state.leaves[node.id]])),
     execution: state.graph.state.leaves, reports: state.reports.map(report => ({ ...report, task: task(report.taskId) })),
     invalidatedReports: (state.invalidatedReports ?? []).map(task),
@@ -252,20 +494,38 @@ export function revisionSnapshot(runner) {
 }
 
 /** The caller holds the workflow lease through the final compare-and-swap. */
-export async function runJointRevision(runner, { expectedRevision, facts, verifyFacts, reason, feedback, sourceAgent, signal }) {
-  if (revisionRecoveryState(runner).length) fail('REVISION_UNKNOWN_ROLE_REQUIRES_RECONCILIATION')
-  if (runner.config.supervision && runner.graph.read().supervision.phase !== 'REVISE') fail('SUPERVISION_REVISION_SIGNAL_REQUIRED')
+export async function runJointRevision(runner, { expectedRevision, facts, verifyFacts, reason, feedback, sourceAgent, signal, blockage, roleRunIds }) {
+  if (revisionRecoveryState(runner).some(row => !(blockage && runner.workflowControl?.recoverModel && Object.values(roleRunIds ?? {}).includes(row.runId)))) fail('REVISION_UNKNOWN_ROLE_REQUIRES_RECONCILIATION')
+  const verifyBlockage = () => {
+    if (!blockage) return
+    const state = runner.graph.read(), record = readRoleRecord(runner, blockage.runId)
+    if (!blockageSituation(state) || state.checksum !== blockage.baseChecksum || !record || record.phase !== 'COMPLETE'
+        || record.role !== 'blockage' || record.requestHash !== blockage.requestHash || record.resultHash !== blockage.resultHash
+        || JSON.parse(record.payload.messages[1].content).baseChecksum !== state.checksum
+        || digest(roleRecordValue(record)) !== digest({ action: 'REPLAN' }))
+      fail('BLOCKAGE_REVISION_SIGNAL_INVALID')
+  }
+  verifyBlockage()
+  if (runner.config.supervision && runner.graph.read().supervision.phase !== 'REVISE' && !blockage) fail('SUPERVISION_REVISION_SIGNAL_REQUIRED')
+  const allowedTools = leafBindingTools(runner)
+  // A resumed blockage update keeps the original input identity. The host still
+  // validates proposed bindings against its current capabilities.
+  const priorUpdater = blockage && roleRunIds?.updater && readRoleRecord(runner, roleRunIds.updater)
+  const snapshotTools = priorUpdater
+    ? JSON.parse(priorUpdater.payload.messages[1].content).snapshot.hostAllowedTools
+    : allowedTools
   const checkTools = proposal => {
     runner.graph.expandRevision(proposal)
-    for (const row of proposal.contextGraph.bindings) {
-      if (row.tools.some(name => !runner.config.allowedTools.includes(name))) fail('CONTEXT_CANNOT_GRANT_TOOL_PERMISSION')
+    for (const [index, row] of proposal.contextGraph.bindings.entries()) {
+      const unauthorized = row.tools.filter(name => !allowedTools.includes(name))
+      if (unauthorized.length) fail('CONTEXT_CANNOT_GRANT_TOOL_PERMISSION', { path: `/contextGraph/bindings/${index}/tools`, item: row.task, reason: 'A context binding can select only host-authorized tools.', unauthorized, allowed: allowedTools })
       if (!runner.config.direct.runtime && row.tools.some(name => !runner.config.direct.agentlessTools.includes(name)))
-        fail('DIRECT_TOOL_REQUIRES_EXPLICIT_AGENTLESS_PERMISSION')
+        fail('DIRECT_TOOL_REQUIRES_EXPLICIT_AGENTLESS_PERMISSION', { path: `/contextGraph/bindings/${index}/tools`, item: row.task, reason: 'This worker has no execution Agent; only explicitly agentless tools are permitted.', allowed: runner.config.direct.agentlessTools })
     }
   }
   const adapter = {
-    snapshot: () => revisionSnapshot(runner),
-    authority: () => sourceAgent ? revisionAuthority(runner.ctx, sourceAgent) : { hostConfig: digest(runner.config) },
+    snapshot: () => revisionSnapshot(runner, snapshotTools),
+    authority: () => sourceAgent ? livePermissionAuthority(revisionAuthority(runner.ctx, sourceAgent)) : { hostConfig: digest(runner.config) },
     verifyFacts,
     ...(runner.config.supervision ? { rejectProposal(error, calls) {
       const updater = calls.find(call => call.role === 'updater')
@@ -275,26 +535,50 @@ export async function runJointRevision(runner, { expectedRevision, facts, verify
       // repair by proposing another graph. Keep them visible to the host.
       if (!(error instanceof GraphError || error instanceof ZodError
           || error.name === 'DynamicContextError' && typeof error.code === 'string'
-          || error instanceof SyntaxError && receipt.phase === 'INVALID_RESPONSE')) throw error
-      return { status: 'REJECT', stage: 'PROGRAM', error: error.message ?? error.code, roles: calls }
+          || (error instanceof SyntaxError || error.diagnostic?.category === 'syntax') && receipt.phase === 'INVALID_RESPONSE')) throw error
+      return { status: 'REJECT', stage: 'PROGRAM', error: feedbackText(error, { stage: 'graph-program-check' }), diagnostic: diagnostic(error, { stage: 'graph-program-check' }), roles: calls }
     } } : {}),
-    prepare(proposal) { checkTools(proposal); return runner.graph.prepareRevision(proposal) },
+    prepare(proposal) {
+      checkTools(proposal)
+      if (!blockage) return runner.graph.prepareRevision(proposal)
+      // A paused exception audit must receive the identical candidate IDs and
+      // prepared hash. The existing revision path retains its original allocator.
+      let ordinal = 0
+      const seed = { base: blockage.baseChecksum, updater: roleRunIds.updater, proposal: digest(proposal) }
+      return runner.graph.prepareRevision(proposal, { id: prefix => `${prefix}_${digest({ ...seed, prefix, ordinal: ++ordinal }).slice(0,40)}` })
+    },
     describePrepared(prepared) {
       return describeContextBindings(prepared.contexts, prepared.plan, runner.graph.read().graph.state.leaves)
     },
     revalidate(prepared, proposal) {
+      verifyBlockage()
       checkTools(proposal)
       if (runner.graph.read().checksum !== prepared.baseChecksum) fail('REVISION_STALE_BASE')
     },
     commit(prepared, review) {
-      const result = runner.graph.commitRevision({ expectedRevision, prepared, review })
+      verifyBlockage()
+      const result = runner.graph.commitRevision({ expectedRevision, prepared, review: blockage ? { ...review, blockageSignal: blockage } : review })
       runner.publish('revised')
       return result
     },
   }
-  const result = await new RevisionCoordinator({ adapter, policy: runner.config.revision.policy,
-    runRole: request => directRevisionRole(runner, request),
-  }).run({ expectedRevision, facts, reason, feedback, signal })
+  const resumableRoles = runner.workflowControl?.ackToolError?.revisionRoles
+  const runs = {}
+  let result
+  try {
+    result = await new RevisionCoordinator({ adapter, policy: runner.config.revision.policy,
+      runRole: request => {
+        runs[request.role] = request.runId
+        return directRevisionRole(runner, { ...request, sourceAgent, validateOutput: true })
+      },
+    }).run({ expectedRevision, facts, reason, feedback, signal,
+      roleRunIds: blockage ? roleRunIds : resumableRoles?.base === runner.graph.read().checksum ? resumableRoles.runs : undefined })
+  } catch (error) {
+    if (!blockage && error.code === 'DIRECT_TOOL_ERROR_BLOCKED' && Object.values(runs).includes(error.details.runId)) {
+      error.details = { ...error.details, revisionRoles: { base: runner.graph.read().checksum, runs } }
+    }
+    throw error
+  }
   const file = path.join(runner.config.directory, 'revisions', 'decision-' + randomUUID() + '.json')
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   save(file, result)

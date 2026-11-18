@@ -22,9 +22,9 @@ async function fixture(t, options = {}) {
   return { ...h, storageRoot, projectRoot, home, credential }
 }
 
-test('native shell and broad search conceal private state and credentials while ordinary project work continues', async t => {
+for (const mode of ['workspace-write', 'danger-full-access']) test(`native ${mode} shell and broad search conceal private state and credentials while ordinary project work continues`, async t => {
   let h
-  h = await fixture(t, { respond: ({ index, payload }) => {
+  h = await fixture(t, { mode, respond: ({ index, payload }) => {
     if (index > 1) {
       const outputs = payload.messages.filter(m => m.role === 'tool').map(m => m.content).join('\n')
       assert.doesNotMatch(outputs, /SYNTHETIC_SECRET_CREDENTIAL|SYNTHETIC_PRIVATE_HISTORY/)
@@ -61,14 +61,16 @@ print('PRIVATE_BOUNDARY_CHECKS_PASSED')`
 
 for (const kind of ['credential', 'credential-temp', 'file-alias', 'directory-alias']) test(`native file reads reject the protected ${kind} before dispatch`, async t => {
   let target
-  const h = await fixture(t, { respond: () => ({ tools: [{ name: 'read', arguments: { file_path: target } }] }) })
+  const h = await fixture(t, { respond: ({ index, payload }) => index === 1 ? { tools: [{ name: 'read', arguments: { file_path: target } }] } : { text: payload.messages.at(-1).content } })
   if (kind === 'file-alias') { fs.symlinkSync(h.credential, h.projectRoot + '/alias'); target = 'alias' }
   else if (kind === 'directory-alias') { fs.symlinkSync(h.home, h.projectRoot + '/alias'); target = 'alias/.credentials.yaml' }
   else target = '.dsh/.credentials.yaml' + (kind === 'credential-temp' ? '.abcdef.tmp' : '')
   h.runner.submit(runtimeProposal(['read']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_RUNTIME_PRIVATE_PATH_DENIED/)
-  assert.equal(h.backend.requests.length, 1)
-  assert.equal(h.runner.graph.read().reports.length, 0)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.match(result.report.text, /DIRECT_RUNTIME_PRIVATE_PATH_DENIED/)
+  assert.doesNotMatch(JSON.stringify(h.backend.requests), /SYNTHETIC_SECRET_CREDENTIAL|SYNTHETIC_PRIVATE_HISTORY/)
+  assert.equal(result.trace.events.some(row => row.type === 'tool/call'), false)
+  assert.equal(h.backend.requests.length, 2)
 })
 
 test('an atomic host credential refresh and its new temporary siblings stay hidden from a running native command', async t => {

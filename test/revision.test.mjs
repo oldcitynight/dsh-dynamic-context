@@ -132,7 +132,7 @@ for (const mode of ['reject', 'permission', 'cycle', 'unknown']) test(`joint ${m
       if (mode === 'cycle') p.contextGraph.nodes[0].parents = [p.contextGraph.nodes[0].key]
       return { text: JSON.stringify(p) }
     }
-    return { text: JSON.stringify({ ...verdict, verdict: 'REJECT', violations: ['No justified semantic change.'] }) }
+    return { text: JSON.stringify({ ...verdict, verdict: 'REJECT', violations: ['No justified semantic change.'], issues: [{ path: '/proposal/reason', item: 'change necessity', reason: 'No justified semantic change.' }] }) }
   })
   const before = h.runner.graph.read(), action = () => h.runner.revise({ expectedRevision: 1, evidence: h.evidence, reason: 'Check evidence.' })
   if (mode === 'reject') assert.equal((await action()).status, 'REJECT')

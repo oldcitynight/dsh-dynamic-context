@@ -33,7 +33,7 @@ test('explicit null removes added limits while finite defaults and native output
   assert.throws(() => validateConfig({ ...config, transport: 'native-guarded' }), /require the direct route/)
 })
 
-test('the real direct loop crosses the former 256-call ceiling and preserves a long final report', async t => {
+test('the real direct loop crosses the former 256-call ceiling and preserves a long final report', { timeout: 180000 }, async t => {
   const root = temporary(t)
   const report = 'Completed synthetic observation. '.repeat(560)
   const backend = await startFakeLlama({ maxRequests: 270, maxRequestBytes: 8388608,

@@ -1,5 +1,3 @@
-# Candidate 0.1.1-rc.40
+# 0.1.1-rc.60 verification
 
-See [the compatibility manifest](DSH-COMPATIBILITY.json) for the exact host versions and package pairing.
-
-The local acceptance uses independently installed DSH distributions, a loopback fake backend and native tools. The package archive and installation checks are recorded in the local matrix results. The compatibility run makes no paid model requests.
+The release includes the exact host compatibility manifest. Qualification runs source tests against the representative host and installs both bundles on every listed host, with a standalone task graph and a local fake model. See the signed release evidence for counts and package hashes.

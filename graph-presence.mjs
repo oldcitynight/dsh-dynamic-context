@@ -38,7 +38,7 @@ export class TrackedGraphStore {
     return this.witness.compareAndSwap(previous?.revision ?? 0, () => seal({ revision: (previous?.revision ?? 0) + 1,
       binding: this.binding, phase, committed: committed ? copy(committed) : null, candidateChecksum }))
   }
-  inspect() {
+  inspect({ reconcilePrepared = true } = {}) {
     let witness, state, readError
     try { witness = this.witness.read() } catch (error) { return { presence: { state: 'WITNESS_INVALID', previouslyCommitted: null, code: error.code ?? error.name } } }
     try { state = this.raw.read() } catch (error) { readError = error }
@@ -58,7 +58,7 @@ export class TrackedGraphStore {
     }
     if (!witness) return { state, presence: { state: state ? 'COMMIT_WITNESS_MISSING' : 'NEVER_CREATED', previouslyCommitted: state ? null : false } }
     if (witness.phase === 'PREPARED') {
-      if (state?.checksum === witness.candidateChecksum) {
+      if (reconcilePrepared && state?.checksum === witness.candidateChecksum) {
         // The atomic graph publication is observable and matches its intent.
         witness = this.writeWitness(witness, 'COMMITTED', state, state.checksum)
       } else return { witness, state, presence: { state: 'COMMIT_REQUIRES_RECONCILIATION', previouslyCommitted: prior } }

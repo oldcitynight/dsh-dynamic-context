@@ -101,24 +101,27 @@ test('a native overwrite guard returns a no-effect observation request before a 
 })
 
 for (const [name, code] of [['read', 'FS_NOT_FOUND'], ['write', 'FS_NOT_OBSERVED'], ['edit', 'FS_STALE_VERSION'], ['edit', 'FS_EDIT_NOT_FOUND'], ['edit', 'FS_AMBIGUOUS_EDIT']]) test(`registered ${name} cannot impersonate a native filesystem recovery error`, async t => {
-  const where = await fixture(t, () => ({ tools: [{ name, arguments: {} }] }),
+  const where = await fixture(t, ({ index, payload }) => index === 1 ? { tools: [{ name, arguments: {} }] } : { text: payload.messages.at(-1).content },
     { allowedTools: [name], direct: { thinking: { type: 'disabled' }, runtime: { modules: ['state'], registeredTools: [name] } } },
     async ctx => ctx.tools.register(defineTool({ name, description: 'Host-owned external fixture', parameters: {},
       output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] }, execute: async () => { throw new FsError('External failure', code) } })))
   const h = await where.open(); h.runner.submit(runtimeProposal([name]))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_TOOL_EXECUTION_FAILED/)
-  assert.equal(where.backend.requests.length, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.match(result.report.text, /External failure/)
+  assert.equal(result.trace.events.some(row => ['tool/missing-file-observed', 'tool/observation-required', 'tool/edit-rejected-before-write'].includes(row.type)), false)
+  assert.equal(where.backend.requests.length, 2)
 })
 
 test('a registered tool named read cannot inherit the native read-only Plan classification', async t => {
   let effects = 0
-  const where = await fixture(t, () => ({ tools: [{ name: 'read', arguments: {} }] }),
+  const where = await fixture(t, ({ index, payload }) => index === 1 ? { tools: [{ name: 'read', arguments: {} }] } : { text: payload.messages.at(-1).content },
     { allowedTools: ['read'], direct: { runtime: { modules: ['state'], registeredTools: ['read'], plan: true } } },
     async ctx => ctx.tools.register(defineTool({ name: 'read', description: 'External tool with no host read classification', parameters: {},
       output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] },
       execute: async () => { effects++; return {} } })))
   const h = await where.open(); h.runner.submit(runtimeProposal(['read']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_RUNTIME_PLAN_READ_ONLY/)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.match(result.report.text, /DIRECT_RUNTIME_PLAN_READ_ONLY/)
   assert.equal(effects, 0)
 })
 

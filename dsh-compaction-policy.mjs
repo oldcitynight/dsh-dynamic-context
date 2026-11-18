@@ -58,6 +58,13 @@ export const NATIVE_REMINDER_PROTOCOL = "direct-dsh-native-task-reminder-v1"
 export const PROVENANCE_TAG = "<dynamic-context-provenance>"
 export const SUMMARY_MAX_TOKENS = 65536
 
+// Capacity admission is independent of enabling automatic compression.
+// Unknown third-party models need an explicit window; never assume their size.
+export function directContextWindow(config) {
+  return config.direct.compaction?.contextWindow ?? config.direct.contextWindow
+    ?? (config.direct.api === 'deepseek' ? 1048576 : null)
+}
+
 export function nativeCompactSpec(contextWindow, reservedCompletionTokens) {
   const pressure = contextWindow - reservedCompletionTokens - 65536
   const thresholdTokens = Math.floor(Math.min(contextWindow * .8, pressure))

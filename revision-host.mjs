@@ -4,6 +4,7 @@ import path from 'node:path'
 import { BlockAssembler, createMessage } from '@deepseek-ai/dsh-llm'
 import { copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { artifactProof } from './artifacts.mjs'
+import { authorityInputs, authorityHeader } from './authority.mjs'
 
 export function revisionAuthority(ctx, agent) {
   const sessions = ctx.get?.('sessions') ?? ctx.sessions
@@ -13,8 +14,8 @@ export function revisionAuthority(ctx, agent) {
   const plan = ctx.get('runtimeQuality')?.planActive(agent)
     ?? ctx.get('agentPresets')?.serviceFor(agent, 'planMode')?.loggedActive(agent.session)
     ?? agent.ctx?.get('planMode')?.loggedActive(agent.session)
-  return { cwd: ctx.get?.('workingDirectory')?.get(agent.session) ?? agent.session.header.cwd, header: agent.session.header,
-    input: agent.session.deriveMessages().filter(message => ['user', 'developer', 'system'].includes(message.role)),
+  return { cwd: ctx.get?.('workingDirectory')?.get(agent.session) ?? agent.session.header.cwd, header: authorityHeader(agent.session.header),
+    input: authorityInputs(agent.session),
     sandbox: sandbox ? { mode: sandbox.mode, workspaceRoot: sandbox.workspaceRoot } : null,
     approval: ctx.get('approval')?.effectivePolicy(agent.session) ?? null, plan: Boolean(plan),
     goal: goal ? { id: goal.id, revision: goal.revision, phase: goal.phase } : null }

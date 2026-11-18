@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { digest } from 'dsh-better-task-grapth/core'
+import { guidanceData } from './guidance-state.mjs'
+import { permissionUpdateData } from './permissions.mjs'
 import { criticalPins, evidenceFlags } from './evidence-policy.mjs'
 import { deepFreeze } from './request-policy.mjs'
 import { fail } from './core.mjs'
 import { NATIVE_CHECKPOINT_PROTOCOL, NATIVE_REMINDER_PROTOCOL, PROVENANCE_TAG } from './dsh-compaction-policy.mjs'
 
 export const CHECKPOINT_PROTOCOL = 'direct-extractive-checkpoint-v1'
+export const VALIDATION_FEEDBACK_PROTOCOL = 'direct-validation-feedback-v1'
+export function validationFeedbackData(message) {
+  try { const value = JSON.parse(message.content); return value.protocol === VALIDATION_FEEDBACK_PROTOCOL ? value : null } catch { return null }
+}
 export function checkpointData(message) {
   try {
     if (typeof message.content !== 'string') return null
@@ -24,7 +30,7 @@ export function checkDirectHistory(history, approved = []) {
   const allowed = new Set(approved.map(message => digest(message))), ids = new Set(), pending = new Set()
   for (const [index, message] of history.slice(2).entries()) {
     if (message.role === 'user') {
-      if (pending.size || (index !== 0 && checkpointData(message)?.protocol !== NATIVE_REMINDER_PROTOCOL)
+      if (pending.size || (index !== 0 && checkpointData(message)?.protocol !== NATIVE_REMINDER_PROTOCOL && !validationFeedbackData(message) && !guidanceData(message) && !permissionUpdateData(message))
           || !allowed.has(digest(message))) fail('DIRECT_UNAPPROVED_CHECKPOINT')
     } else if (message.role === 'assistant') {
       if (message.reasoning_content !== undefined && typeof message.reasoning_content !== 'string') fail('DIRECT_HISTORY_REASONING_SHAPE')

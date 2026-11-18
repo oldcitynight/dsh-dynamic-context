@@ -25,11 +25,12 @@
       enabled: true
       workflowId: project-workflow
     direct:
-      endpoint: https://api.deepseek.com/chat/completions
+      endpoint: https://api.deepseek.com/anthropic/v1/messages
       apiKeyEnv: DEEPSEEK_API_KEY
       api: deepseek
+      protocol: auto
       thinking: { type: enabled }
-      reasoningEffort: high
+      reasoningEffort: auto
       durable: true
       maxJournalBytes: 134217728
       compaction:
@@ -39,8 +40,8 @@
         maxCheckpointCharacters: 16000
       runtime:
         modules: [filesystem, search, skills, state]
-        sandboxMode: workspace-write
-        approvalPolicy: never
+        sandboxMode: auto
+        approvalPolicy: auto
         instructions: true
         timeZone: Asia/Shanghai
         skills: []

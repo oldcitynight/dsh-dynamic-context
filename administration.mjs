@@ -1,3 +1,5 @@
+import { activeOriginRevision } from './suspension.mjs'
+import { acceptanceEnabled } from './acceptance-protocol.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
 import { supervisionAuthority } from './supervision-runtime.mjs'
@@ -29,9 +31,9 @@ async function exclusive(runner, action, signal) {
 }
 
 function journalFor(runner, state, active) {
-  return DirectJournal.open(path.join(runner.config.directory, active.attemptId), {
+  return DirectJournal.open(runner.activeRunDirectory(state), {
     taskId: active.nodeId, attemptId: active.attemptId, contextVersion: state.contexts.version,
-    owner: active.owner, graphRevision: state.revision,
+    owner: active.owner, graphRevision: activeOriginRevision(state),
   }, { maxBytes: runner.config.direct.maxJournalBytes })
 }
 const authority = (runner, agent) => {
@@ -59,7 +61,7 @@ export async function reconcileActive(runner, { expectedRevision, expectedAttemp
   return exclusive(runner, async lifecycle => {
     const state = runner.graph.read(), active = state?.graph.state.active
     if (state?.revision !== expectedRevision || active?.attemptId !== expectedAttemptId) fail('DIRECT_RECONCILE_STALE_OR_DIFFERENT_ATTEMPT')
-    if (state.supervision && state.supervision.phase !== 'READY') fail('SUPERVISION_SCHEDULING_BLOCKED')
+    if (state.supervision && !['READY', ...(acceptanceEnabled(state) ? ['REWORK_RESULT'] : [])].includes(state.supervision.phase)) fail('SUPERVISION_SCHEDULING_BLOCKED')
     const journal = journalFor(runner, state, active), head = journal.latest()
     if (!head || checkpointChecksum !== head.checksum) fail('DIRECT_RESUME_CHECKPOINT_CHANGED')
     const owner = authority(runner, sourceAgent)
@@ -105,10 +107,22 @@ export async function collectOrphans(runner, { expectedRevision, planChecksum, s
       ...state.graph.events.flatMap(event => Array.isArray(event.data.evidence) ? event.data.evidence : [])]
       .filter(reference => reference.kind === 'artifact').map(reference => ({ ...reference,
         ref: path.resolve(runner.config.storageRoot ?? runner.config.projectRoot, reference.ref) }))
+    const journals = new Map(attempts.map(item => [path.join(runner.config.directory, item.attemptId), { ...item, contextVersion: state.contexts.version }]))
+    const visited = new Set()
+    for (let i = 0; i < references.length; i++) {
+      const ref = references[i]
+      if (visited.has(ref.ref) || path.basename(ref.ref) !== 'trace.json' || path.dirname(path.dirname(ref.ref)) !== runner.config.directory) continue
+      visited.add(ref.ref)
+      artifactProof(runner.graph.storageRoot, ref, lifecycle, runner.graph.artifactOptions)
+      const trace = JSON.parse(fs.readFileSync(ref.ref, 'utf8'))
+      if (!trace.assembly?.task) continue
+      journals.set(path.dirname(ref.ref), { nodeId: trace.assembly.task.id, attemptId: trace.assembly.task.attemptId, contextVersion: trace.assembly.contextVersion })
+      if (trace.previousReport) references.push(...trace.previousReport.evidence)
+    }
     const files = []
-    for (const item of attempts) {
+    for (const [runDirectory, item] of journals) {
       lifecycle.throwIfAborted()
-      const journal = DirectJournal.open(path.join(runner.config.directory, item.attemptId), { taskId: item.nodeId, attemptId: item.attemptId, contextVersion: state.contexts.version })
+      const journal = DirectJournal.open(runDirectory, { taskId: item.nodeId, attemptId: item.attemptId, contextVersion: item.contextVersion })
       files.push(...journal.orphans(references))
     }
     const plan = { expectedRevision, stateChecksum: state.checksum, files }

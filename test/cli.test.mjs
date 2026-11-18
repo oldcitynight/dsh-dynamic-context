@@ -16,7 +16,7 @@ async function fixture(t) {
     : { reasoning: 'FAKE_CLI_FINAL', text: 'CLI report, still unverified.' } })
   t.after(async () => { await backend.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const config = { projectRoot, storageRoot: root, directory: path.join(root, 'state'), transport: 'direct', provider: 'api-acceptance', model: 'fake-llama', systemPrompt: 'Keep host policy and task binding.', allowedTools: ['write'],
-    direct: { endpoint: backend.origin + '/v1/chat/completions', apiKeyEnv: 'DYNAMIC_CONTEXT_CLI_FIXTURE_KEY', api: 'deepseek', durable: true,
+    direct: { endpoint: backend.origin + '/v1/chat/completions', apiKeyEnv: 'DYNAMIC_CONTEXT_CLI_FIXTURE_KEY', api: 'deepseek', protocol: 'chat-completions', durable: true,
       runtime: { modules: ['filesystem', 'state'], sandboxMode: 'workspace-write', instructionHomes: { dshHome: projectRoot + '/.dsh', agentsHome: projectRoot + '/.agents' } } } }
   const configFile = path.join(root, 'config.json'), proposalFile = path.join(root, 'proposal.json')
   fs.writeFileSync(configFile, JSON.stringify(config)); fs.writeFileSync(proposalFile, JSON.stringify(runtimeProposal(['write'])))

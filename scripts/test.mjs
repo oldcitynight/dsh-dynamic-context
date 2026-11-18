@@ -1,3 +1,7 @@
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { patchNativeHost } from 'dsh-better-task-grapth/prepare-host'
+patchNativeHost(path.resolve(path.dirname(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh/package.json'))), '../..'))
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
 import { spawn } from 'node:child_process'

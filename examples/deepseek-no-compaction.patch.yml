@@ -23,11 +23,12 @@
       enabled: true
       workflowId: coding-without-compaction
     direct:
-      endpoint: https://api.deepseek.com/chat/completions
+      endpoint: https://api.deepseek.com/anthropic/v1/messages
       auth: deepseek-account
       api: deepseek
+      protocol: auto
       thinking: { type: enabled }
-      reasoningEffort: low
+      reasoningEffort: auto
       durable: true
       reserveFinalReport: true
       maxRequestBytes: 8388608
@@ -35,6 +36,6 @@
       maxResponseBytes: 8388608
       runtime:
         modules: [filesystem, search, shell, state]
-        sandboxMode: workspace-write
-        approvalPolicy: never
+        sandboxMode: auto
+        approvalPolicy: auto
         timeZone: Asia/Shanghai

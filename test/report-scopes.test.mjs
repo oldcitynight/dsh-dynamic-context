@@ -9,6 +9,7 @@ import { inspectExecutionReport, parseExecutionDisposition } from '../report-evi
 import { dispositionSchema } from '../supervision-state.mjs'
 import { revisionProposalSchema, revisionVerdictSchema } from '../revision.mjs'
 import { digest } from 'dsh-better-task-grapth/core'
+import { validateReview } from '../review-feedback.mjs'
 
 const sha = text => createHash('sha256').update(text).digest('hex')
 const examples = prompt => [...prompt.matchAll(/```json\n([^\n]+)\n```/g)].map(match => JSON.parse(match[1]))
@@ -42,6 +43,34 @@ const work = index => index === 1 ? { tools: [{ name: 'bash', arguments: { comma
   : index === 2 ? { tools: [{ name: 'bash', arguments: { command: "printf '1 check passed\\n'", description: 'Verify the local criterion' } }] }
   : { text: JSON.stringify(submitted()) }
 
+test('selected report repair still passes host SHA and receipt checks before independent acceptance', async t => {
+  const h = await fixture(t, ({ payload, index }) => {
+    if (index <= 2) return work(index)
+    if (index === 3) { const report = submitted(); report.executionReport.tests[0].quote = 'not in the receipt'; return { text: JSON.stringify(report) } }
+    if (index === 4) {
+      const input = JSON.parse(payload.messages[1].content)
+      assert.equal(input.execution.tools.length, 2)
+      assert.ok(input.execution.localContext.contexts.length)
+      return { tools: [{ name: 'dynamic_context_rewrite_report', arguments: { expectedRevision: 0,
+        edits: [{ op: 'set', path: '/executionReport/tests/0/quote', value: '1 check passed' }] } }] }
+    }
+    if (index === 5) return { tools: [{ name: 'dynamic_context_submit_report', arguments: { expectedRevision: 1 } }] }
+    if (index === 6) {
+      const input = JSON.parse(payload.messages[1].content)
+      assert.equal(input.programValidation.verifiedArtifacts[0].source.sha256, artifact.sha256)
+      assert.equal(input.acceptanceEvidence.tests[0].keyOutput, '1 check passed')
+      return { text: '{"verdict":"ACCEPT","reason":"Static evidence and local result agree."}' }
+    }
+    return { text: '{"verdict":"CURRENT"}' }
+  })
+  assert.equal((await h.runner.runNext({ expectedRevision: 1 })).status, 'RESULT_RETURNED')
+  assert.equal(h.runner.graph.read().supervision.phase, 'REPAIR_RESULT')
+  const result = await h.runner.continueSupervision({ expectedRevision: h.runner.graph.read().revision, checkpointChecksum: h.runner.graph.read().checksum })
+  assert.equal(result.status, 'RESULT_COMMITTED')
+  assert.equal(h.backend.requests.length, 7)
+  assert.equal(h.runner.graph.read().graph.state.active, null)
+})
+
 test('acceptance receives outcomes, host static checks and selected test output; plan review gets results and original planning only', async t => {
   const h = await fixture(t, ({ payload, index }) => {
     if (index <= 3) return work(index)
@@ -54,7 +83,7 @@ test('acceptance receives outcomes, host static checks and selected test output;
       assert.equal(input.programValidation.directories[0].completeMembershipVerified, true)
       assert.equal(input.acceptanceEvidence.tests[0].keyOutput, '1 check passed')
       assert.ok(!input.programValidation.artifactContents)
-      assert.ok(!payload.tools, 'Acceptance does not calculate SHA through model tools')
+      assert.ok(payload.tools.every(tool => ['read_image', 'dynamic_context_generate_report', 'dynamic_context_read_report', 'dynamic_context_rewrite_report', 'dynamic_context_submit_report'].includes(tool.function.name)), 'Acceptance receives declaration tools, not filesystem/hash tools')
       return { text: '{"verdict":"ACCEPT","reason":"The local result, tree, hashes and check agree."}' }
     }
     assert.equal(input.snapshot.planningRecord.report.assumptions[0], 'ASSUMPTION_ORIGINAL')
@@ -92,6 +121,7 @@ test('updater explains each actual change with an original report citation; revi
       return { text: JSON.stringify(proposal) }
     }
     reviewerSeen = true
+    for (const sample of examples(payload.messages[0].content)) validateReview('reviewer', sample, input)
     assert.deepEqual(examples(payload.messages[0].content).map(value => revisionVerdictSchema.parse(value).verdict),
       ['APPROVE', 'REJECT', 'NEEDS_USER'])
     assert.ok(!input.snapshot && !input.proposal && !input.facts && !input.executionReports)
@@ -177,7 +207,7 @@ test('execution and repair receive the same valid report examples while repair r
     if (index <= 2) return work(index)
     if (index === 3) {
       samples = payload.messages.filter(row => row.role === 'user').flatMap(row => examples(row.content))
-      assert.deepEqual(samples.map(row => dispositionSchema.parse(row).outcome), ['COMPLETE', 'BLOCKED', 'FAILED'])
+      assert.deepEqual(samples.map(row => dispositionSchema.parse(row).outcome), ['COMPLETE', 'BLOCKED', 'FAILED', 'COMPLETE'])
       const draft = submitted()
       draft.executionReport.tests[0].quote = 'incorrect quote'
       return { text: JSON.stringify(draft) }
@@ -246,16 +276,25 @@ for (const change of ['modified', 'missing']) test(`historical report inheritanc
   // Exercise historical inheritance as used by a later leaf after an authorized
   // middle stage modified a previously delivered shared file.
   state.contexts.bindings.find(b => b.taskId === later.id).inheritReports = [state.reports[0].taskId]
+  const pinned = h.runner.graph.checkInputs(state, later.id)
   if (change === 'modified') fs.writeFileSync(path.join(h.projectRoot, artifact.ref), 'New current bytes from a later development stage\n')
   else fs.unlinkSync(path.join(h.projectRoot, artifact.ref))
   const inherited = h.runner.graph.checkInputs(state, later.id)[0]
   assert.equal(inherited.currentArtifactChecks[0].status, change === 'modified' ? 'CHANGED' : 'MISSING')
   assert.equal(inherited.currentArtifactChecks[0].acceptedSha256, artifact.sha256)
   assert.notEqual(inherited.currentArtifactChecks[0].currentSha256, artifact.sha256)
+  assert.deepEqual(h.runner.graph.checkInputs(state, later.id, pinned), pinned)
+  assert.equal(pinned[0].currentArtifactChecks[0].status, 'UNCHANGED')
+  for (const different of [{ ref: 'another-file' }, { acceptedSha256: '0'.repeat(64) }]) {
+    const swapped = structuredClone(pinned)
+    Object.assign(swapped[0].currentArtifactChecks[0], different)
+    assert.throws(() => h.runner.graph.checkInputs(state, later.id, swapped), /DIRECT_RESUME_CONTEXT_CHANGED/)
+  }
   assert.equal(state.reports[0].currentArtifactChecks, undefined, 'Historical report is not rewritten')
   const trace = state.reports[0].evidence[0].ref
   fs.appendFileSync(path.resolve(h.root, trace), '\nTAMPERED')
   assert.throws(() => h.runner.graph.checkInputs(state, later.id), /ARTIFACT_CHANGED_OR_HASH_MISMATCH/)
+  assert.throws(() => h.runner.graph.checkInputs(state, later.id, pinned), /ARTIFACT_CHANGED_OR_HASH_MISMATCH/)
 })
 
 test('plan review accumulates all accepted result reports across leaves without inheriting their raw test output', async t => {

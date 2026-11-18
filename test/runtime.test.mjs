@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import * as RepeatReminder from '@deepseek-ai/dsh-repeat-tool-reminder'
 import WebRuntime from '@deepseek-ai/dsh-web'
@@ -108,27 +109,36 @@ test('real ripgrep and confined shell execute through direct function tools', as
 })
 
 for (const [name, runtime, requested, expected] of [
-  ['read-only filesystem', { sandboxMode: 'read-only' }, tool('write', { file_path: 'blocked.txt', content: 'blocked' }), /DIRECT_TOOL_EXECUTION_FAILED/],
+  ['read-only filesystem', { sandboxMode: 'read-only' }, tool('write', { file_path: 'blocked.txt', content: 'blocked' }), /denied|read.only/i],
   ['Plan mutation', { plan: true }, tool('write', { file_path: 'blocked.txt', content: 'blocked' }), /DIRECT_RUNTIME_PLAN_READ_ONLY/],
   ['Plan shell', { plan: true }, tool('bash', { command: 'pwd' }), /DIRECT_RUNTIME_PLAN_READ_ONLY/],
   ['permission escalation', {}, tool('write', { file_path: 'blocked.txt', content: 'blocked', sandbox_permissions: 'danger-full-access', justification: 'model request' }), /DIRECT_RUNTIME_ESCALATION_NOT_ALLOWED/],
   ['background shell', {}, tool('bash', { command: 'pwd', run_in_background: true }), /DIRECT_RUNTIME_UNMANAGED_SHELL/],
-]) test(`runtime blocks ${name} and leaves the task unresolved`, async t => {
-  const h = await fixture(t, { respond: () => requested, config: { direct: { runtime } } })
+]) test(`runtime denies ${name} without effects and returns feedback for reconsideration`, async t => {
+  const h = await fixture(t, { respond: ({ index, payload }) => index === 1 ? requested : { text: payload.messages.at(-1).content }, config: { direct: { runtime } } })
   h.runner.submit(runtimeProposal([requested.tools[0].name]))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), expected)
-  unresolved(h, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.match(result.report.text, expected)
+  assert.equal(h.backend.requests.length, 2)
   assert.equal(fs.existsSync(path.join(h.projectRoot, 'blocked.txt')), false)
 })
 
 test('a later malformed call in a batch prevents the earlier write', async t => {
-  const h = await fixture(t, { respond: () => ({ tools: [
-    { name: 'write', arguments: { file_path: 'blocked.txt', content: 'must not execute' } },
-    { name: 'read', arguments: { file_path: 42 } },
-  ] }) })
+  const h = await fixture(t, { respond: ({ index, payload }) => {
+    if (index === 1) return { tools: [
+      { name: 'write', arguments: { file_path: 'blocked.txt', content: 'must not execute' } },
+      { name: 'read', arguments: { file_path: 42 } },
+    ] }
+    const rejected = JSON.parse(payload.messages.at(-1).content)
+    assert.equal(rejected.execution, 'NOT_EXECUTED')
+    assert.equal(rejected.diagnostic.code, 'DIRECT_TOOL_ARGUMENT_SCHEMA_MISMATCH')
+    assert.match(rejected.diagnostic.issues[0].path, /tool_calls\/1\/function\/arguments/)
+    assert.match(JSON.stringify(rejected.diagnostic), /file_path/)
+    return { text: 'The rejected batch had no effects; no work claimed.' }
+  } })
   h.runner.submit(runtimeProposal(['write', 'read']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_TOOL_ARGUMENT_SCHEMA_MISMATCH/)
-  unresolved(h, 1)
+  await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(h.backend.requests.length, 2)
   assert.equal(fs.existsSync(path.join(h.projectRoot, 'blocked.txt')), false)
 })
 
@@ -206,13 +216,14 @@ test('oversize mandatory instructions fail before HTTP instead of silently omitt
 })
 
 test('native owner session restrictions cannot be widened by runtime configuration', async t => {
-  const h = await fixture(t, { respond: () => tool('write', { file_path: 'blocked.txt', content: 'must not write' }) })
+  const h = await fixture(t, { respond: ({ index, payload }) => index === 1 ? tool('write', { file_path: 'blocked.txt', content: 'must not write' }) : { text: payload.messages.at(-1).content } })
   const owner = await h.ctx.agents.create({ sessionId: 'fixture-owner', meta: { cwd: h.projectRoot },
     setup: (_ctx, agent) => setSandboxMode(agent.session, 'read-only') })
   t.after(() => owner.dispose())
   h.runner.submit(runtimeProposal(['write']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent }), /DIRECT_TOOL_EXECUTION_FAILED/)
-  unresolved(h, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
+  assert.ok(result.trace.events.some(row => row.type === 'tool/result' && row.data.isError))
+  assert.equal(h.backend.requests.length, 2)
   assert.match(h.backend.requests[0].payload.messages[0].content, /"sandboxMode":"read-only"/)
   assert.equal(fs.existsSync(path.join(h.projectRoot, 'blocked.txt')), false)
 })
@@ -320,22 +331,22 @@ for (const decision of ['allowed-once', 'rejected', 'unavailable']) test(`native
       ctx.on('approval/request', request => { prompts++; assert.equal(ctx.agents.get(request.agent.id), request.agent); return decision })
     } })
   h.runner.submit(runtimeProposal(['gated_fixture']))
+  const result = await h.runner.runNext({ expectedRevision: 1 })
   if (decision === 'allowed-once') {
-    const result = await h.runner.runNext({ expectedRevision: 1 })
     assert.equal(result.trace.executionEvents.filter(row => row.type === 'approval/asked').length, 1)
     assert.equal(result.trace.executionEvents.find(row => row.type === 'approval/decided').data.outcome, decision)
     assert.equal(effects, 1)
   } else {
-    await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
+    assert.ok(result.trace.events.some(row => row.type === 'tool/result' && row.data.isError))
     assert.equal(effects, 0)
-    unresolved(h, 1)
+    assert.equal(h.backend.requests.length, 2)
   }
   assert.equal(prompts, 1)
 })
 
 test('never approval policy rejects a native ask without contacting an answerer', async t => {
   let prompts = 0, effects = 0
-  const h = await fixture(t, { respond: () => tool('gated_fixture', {}),
+  const h = await fixture(t, { respond: ({ index }) => index === 1 ? tool('gated_fixture', {}) : { text: 'Denied by native approval policy.' },
     config: { allowedTools: ['gated_fixture'], direct: { runtime: { modules: [], registeredTools: ['gated_fixture'] } } },
     setup: ctx => {
       registered(ctx, 'gated_fixture', async () => { effects++; return {} })
@@ -343,10 +354,11 @@ test('never approval policy rejects a native ask without contacting an answerer'
       ctx.on('approval/request', () => { prompts++; return 'allowed-once' })
     } })
   h.runner.submit(runtimeProposal(['gated_fixture']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.ok(result.trace.events.some(row => row.type === 'tool/result' && row.data.isError))
   assert.equal(prompts, 0)
   assert.equal(effects, 0)
-  unresolved(h, 1)
+  assert.equal(h.backend.requests.length, 2)
 })
 
 test('new root instructions appearing during a report stop acceptance', async t => {
@@ -493,12 +505,15 @@ test('controller tools reject a different workspace before graph submission', as
 })
 
 test('an execution worker cannot become a workflow controller through a registered tool', async t => {
-  const h = await fixture(t, { respond: () => tool('dynamic_context_status', {}),
+  const h = await fixture(t, { respond: ({ index, payload }) => index === 1 ? tool('dynamic_context_status', {}) : { text: payload.messages.at(-1).content },
     config: { exposeControlTools: true, allowedTools: ['dynamic_context_status'],
       direct: { runtime: { modules: [], registeredTools: ['dynamic_context_status'] } } } })
   h.runner.submit(runtimeProposal(['dynamic_context_status']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
-  unresolved(h, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.ok(!h.backend.requests[0].payload.tools?.some(row => row.function.name === 'dynamic_context_status'))
+  assert.ok(result.trace.events.some(row => row.type === 'task/validation-rejected' && row.data.diagnostic.code === 'ROLE_TOOL_DENIED'))
+  assert.ok(!result.trace.events.some(row => row.type === 'tool/call'))
+  assert.equal(h.backend.requests.length, 2)
 })
 
 test('runtime task switches inherit only declared reports, not prior file output or private context', async t => {
@@ -550,17 +565,20 @@ test('closing the runner cancels and drains a real native tool before removing i
   unresolved(h, 1)
 })
 
-test('live source policy changes stop a prepared mutation before dispatch', async t => {
+test('live source policy changes reject the mutation and let the model continue', async t => {
   let owner
-  const h = await fixture(t, { respond: () => {
+  const h = await fixture(t, { respond: ({ index, payload }) => {
+    if (index > 1) return { text: JSON.stringify(payload.messages.slice(-2)) }
     setSandboxMode(owner.agent.session, 'read-only')
     return tool('write', { file_path: 'blocked.txt', content: 'must not write' })
   } })
   owner = await h.ctx.agents.create({ sessionId: 'policy-owner', meta: { cwd: h.projectRoot } })
   t.after(() => owner.dispose())
   h.runner.submit(runtimeProposal(['write']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent }), /DIRECT_RUNTIME_POLICY_CHANGED/)
-  unresolved(h, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
+  assert.match(result.report.text, /read.only|denied/i)
+  assert.match(result.report.text, /direct-host-permissions-v1/)
+  assert.equal(h.backend.requests.length, 2)
   assert.equal(fs.existsSync(path.join(h.projectRoot, 'blocked.txt')), false)
 })
 
@@ -613,10 +631,8 @@ test('real shell confinement prevents a write outside its execution workspace', 
     ? tool('bash', { command: `printf controlled-fixture > ${quote(target)}`, timeoutMs: 1000 })
     : { text: 'Observed the shell denial; no success claim.' } })
   h.runner.submit(runtimeProposal(['bash']))
-  let result
-  try { result = await h.runner.runNext({ expectedRevision: 1 }) }
-  catch (error) { assert.match(error.message, /DIRECT_RUNTIME_SHELL_NOT_COMPLETED|DIRECT_TOOL_EXECUTION_FAILED/) }
-  const trace = result?.trace ?? JSON.parse(fs.readFileSync(path.join(h.runner.config.directory, h.runner.graph.status().active.attemptId, 'trace.json')))
+  const { trace } = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(h.backend.requests.length, 2)
   const observation = trace.events.find(row => row.type === 'tool/result')
   assert.ok(observation)
   assert.equal(observation.data.value.sandbox.mode, 'workspace-write')
@@ -627,13 +643,14 @@ test('real shell confinement prevents a write outside its execution workspace', 
 
 test('the private graph ledger cannot be overwritten through the migrated shell', async t => {
   let h, committedBytes
-  h = await fixture(t, { respond: () => {
+  h = await fixture(t, { config: { direct: { durable: true } }, respond: () => {
     const file = path.join(h.runner.config.directory, 'dynamic-context.json')
     committedBytes = fs.readFileSync(file)
     return tool('bash', { command: `printf forged-ledger > '${file.replaceAll("'", "'\\''")}'`, timeoutMs: 1000 })
   } })
   h.runner.submit(runtimeProposal(['bash']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_RUNTIME_SHELL_NOT_COMPLETED|DIRECT_TOOL_EXECUTION_FAILED/)
+  const result = await h.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  assert.equal(result.paused, true)
   assert.deepEqual(fs.readFileSync(path.join(h.runner.config.directory, 'dynamic-context.json')), committedBytes)
   unresolved(h, 1)
 })
@@ -650,7 +667,7 @@ test('runtime refuses a state directory inside the tool workspace before HTTP', 
 test('an owner policy update cancels and drains a running native tool', async t => {
   let started, drained = false
   const entered = new Promise(resolve => { started = resolve })
-  const h = await fixture(t, { respond: () => tool('wait_fixture', {}),
+  const h = await fixture(t, { respond: ({ index, payload }) => index === 1 ? tool('wait_fixture', {}) : { text: JSON.stringify(payload.messages.slice(-2)) },
     config: { allowedTools: ['wait_fixture'], direct: { runtime: { modules: [], registeredTools: ['wait_fixture'] } } },
     setup: ctx => registered(ctx, 'wait_fixture', async (_args, exec) => {
       started()
@@ -662,12 +679,13 @@ test('an owner policy update cancels and drains a running native tool', async t 
   t.after(() => owner.dispose())
   h.runner.submit(runtimeProposal(['wait_fixture']))
   const running = h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
-  const rejected = assert.rejects(running, /DIRECT_RUNTIME_POLICY_CHANGED/)
   await entered
   setSandboxMode(owner.agent.session, 'read-only')
-  await rejected
+  const result = await running
   assert.equal(drained, true)
-  unresolved(h, 1)
+  assert.match(result.report.text, /DIRECT_TOOL_PERMISSION_REVOKED/)
+  assert.match(result.report.text, /POSSIBLE_PARTIAL_EFFECTS/)
+  assert.equal(h.backend.requests.length, 2)
 })
 
 test('a partial shell backend is refused before the first model request', async t => {
@@ -854,4 +872,135 @@ for (const [code, originalText, badSearch] of [
   assert.equal(facts.activeLeaf.key, result.trace.assembly.task.key)
   assert.equal(facts.activeLeaf.instruction, result.trace.assembly.task.instruction)
   assert.deepEqual(facts.activeLeaf.completion, result.trace.assembly.completion)
+})
+
+for (const ambiguous of [false, true]) test(`direct tool syntax ${ambiguous ? 'returns an exact ambiguity and resumes from durable feedback' : 'normalizes unambiguous text before one effect'}`, async t => {
+  const h = await fixture(t, { config: { direct: { durable: true } }, respond: ({ index, payload }) => {
+    if (index === 1) return { tools: [{ name: 'write', argumentsText: ambiguous
+      ? '{"file_path":"result.txt","content":"literal\\q"}'
+      : '{"file_path":"result.txt","content":"line\nbreak",}' }] }
+    if (ambiguous && index === 2) {
+      const detail = JSON.parse(payload.messages.at(-1).content)
+      assert.equal(detail.diagnostic.code, 'MODEL_JSON_AMBIGUOUS_ESCAPE')
+      assert.equal(detail.execution, 'NOT_EXECUTED')
+      assert.ok(detail.diagnostic.issues[0].location.column > 1)
+      return tool('write', { file_path: 'result.txt', content: 'literal\\q' })
+    }
+    return { text: 'The fixture write completed.' }
+  } })
+  h.runner.submit(runtimeProposal(['write']))
+  let result = await h.runner.runNext({ expectedRevision: 1, ...(ambiguous ? { pauseAfterRequests: 1 } : {}) })
+  if (ambiguous) {
+    assert.equal(result.paused, true)
+    assert.equal(fs.existsSync(path.join(h.projectRoot, 'result.txt')), false)
+    const status = h.runner.status()
+    result = await h.runner.resumeActive({ expectedRevision: status.revision, checkpointChecksum: status.continuation.checksum })
+  }
+  assert.equal(fs.readFileSync(path.join(h.projectRoot, 'result.txt'), 'utf8'), ambiguous ? 'literal\\q' : 'line\nbreak')
+  assert.equal(result.trace.events.filter(row => row.type === 'tool/result').length, 1)
+  assert.equal(h.backend.requests.length, ambiguous ? 3 : 2)
+  assert.ok(result.trace.events.some(row => row.type === (ambiguous ? 'task/validation-rejected' : 'tool/arguments-normalized')))
+})
+
+for (const mode of ['read-only', 'workspace-write', 'danger-full-access']) test(`auto runtime inherits the main conversation ${mode} permissions`, async t => {
+  const h = await fixture(t, { config: { direct: { runtime: { sandboxMode: 'auto', approvalPolicy: 'auto' } } },
+    respond: ({ index, payload }) => index === 1 ? tool('write', { file_path: 'auto.txt', content: 'inherited' }) : { text: JSON.stringify(payload.messages.slice(-1)) } })
+  const owner = await h.ctx.agents.create({ sessionId: 'auto-owner-' + mode, meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose()); setSandboxMode(owner.agent.session, mode)
+  h.runner.submit(runtimeProposal(['write']))
+  const result = await h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
+  assert.equal(result.trace.executionHost.policy.sandboxMode, mode)
+  assert.equal(fs.existsSync(path.join(h.projectRoot, 'auto.txt')), mode !== 'read-only')
+})
+
+test('full main permissions allow external ordinary files while privacy protection remains active', async t => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ordinary-external-'))
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }))
+  let h
+  h = await fixture(t, { mode: 'danger-full-access', config: { direct: { runtime: { sandboxMode: 'auto' } } },
+    respond: ({ index, payload }) => index === 1 ? tool('write', { file_path: path.join(outside, 'file.txt'), content: 'external-allowed' })
+      : index === 2 ? tool('bash', { workdir: outside, command: 'printf shell-allowed > shell.txt' })
+        : index === 3 ? tool('read', { file_path: path.join(h.storageRoot, 'host-only.txt') }) : { text: JSON.stringify(payload.messages.slice(-2)) } })
+  fs.writeFileSync(path.join(h.storageRoot, 'host-only.txt'), 'MUST_REMAIN_PRIVATE')
+  h.runner.submit(runtimeProposal(['write', 'bash', 'read']))
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(fs.readFileSync(path.join(outside, 'file.txt'), 'utf8'), 'external-allowed')
+  assert.equal(fs.readFileSync(path.join(outside, 'shell.txt'), 'utf8'), 'shell-allowed')
+  assert.match(result.report.text, /DIRECT_RUNTIME_PRIVATE_PATH_DENIED/)
+  assert.doesNotMatch(result.report.text, /MUST_REMAIN_PRIVATE/)
+})
+
+test('loosening main permissions between serial tools updates the next tool without replay', async t => {
+  let owner, writes = 0
+  const h = await fixture(t, { config: { direct: { runtime: { sandboxMode: 'auto' } } },
+    respond: ({ index }) => index === 1 ? { tools: [
+      { name: 'read', arguments: { file_path: 'input.txt' } },
+      { name: 'write', arguments: { file_path: 'new.txt', content: 'once' } },
+    ] } : { text: 'Continued after host permission update.' },
+    setup: ctx => ctx.on('tools/execute', async (exec, next) => {
+      const result = await next()
+      if (exec.name === 'read') setSandboxMode(owner.agent.session, 'workspace-write')
+      if (exec.name === 'write') writes++
+      return result
+    }) })
+  owner = await h.ctx.agents.create({ sessionId: 'expanding-owner', meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose()); setSandboxMode(owner.agent.session, 'read-only')
+  fs.writeFileSync(path.join(h.projectRoot, 'input.txt'), 'read first')
+  h.runner.submit(runtimeProposal(['read', 'write']))
+  await h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
+  assert.equal(writes, 1); assert.equal(fs.readFileSync(path.join(h.projectRoot, 'new.txt'), 'utf8'), 'once')
+  assert.match(JSON.stringify(h.backend.requests[1].payload.messages), /direct-host-permissions-v1/)
+})
+
+test('a main approval-policy change cancels pending approval without cancelling the task', async t => {
+  let entered, effects = 0
+  const waiting = new Promise(resolve => { entered = resolve })
+  const h = await fixture(t, { approval: 'ask', config: { allowedTools: ['gated_fixture'], direct: { runtime: { modules: [], sandboxMode: 'auto', approvalPolicy: 'auto', registeredTools: ['gated_fixture'] } } },
+    respond: ({ index, payload }) => index === 1 ? tool('gated_fixture', {}) : { text: JSON.stringify(payload.messages.slice(-2)) },
+    setup: ctx => {
+      registered(ctx, 'gated_fixture', async () => { effects++; return {} })
+      ctx.on('tools/pre-execute', (exec, next) => exec.name === 'gated_fixture' ? { kind: 'ask', reason: 'Live approval test' } : next())
+      ctx.on('approval/request', async request => {
+        entered()
+        await new Promise(resolve => request.signal.aborted ? resolve() : request.signal.addEventListener('abort', resolve, { once: true }))
+        return 'rejected'
+      })
+    } })
+  const owner = await h.ctx.agents.create({ sessionId: 'approval-owner', meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose()); h.runner.submit(runtimeProposal(['gated_fixture']))
+  const result = h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent })
+  await waiting; setApprovalPolicy(owner.agent.session, 'never')
+  assert.match((await result).report.text, /DIRECT_TOOL_PERMISSION_REVOKED/)
+  assert.equal(effects, 0); assert.equal(h.backend.requests.length, 2)
+})
+
+test('a paused direct request resumes under changed owner permissions without replaying completed effects', async t => {
+  let writes = 0
+  const h = await fixture(t, { config: { direct: { durable: true, runtime: { sandboxMode: 'auto' } } },
+    respond: ({ index, payload }) => index === 1 ? tool('write', { file_path: 'once.txt', content: 'once' })
+      : { text: JSON.stringify(payload.messages.slice(-2)) },
+    setup: ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() }) })
+  const owner = await h.ctx.agents.create({ sessionId: 'paused-policy-owner', meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose()); h.runner.submit(runtimeProposal(['write']))
+  const pause = await h.runner.runNext({ expectedRevision: 1, sourceAgent: owner.agent, pauseAfterRequests: 1 })
+  assert.equal(pause.paused, true); setSandboxMode(owner.agent.session, 'read-only')
+  const result = await h.runner.resumeActive({ expectedRevision: 2, sourceAgent: owner.agent, checkpointChecksum: pause.checkpoint.checksum })
+  assert.match(result.report.text, /direct-host-permissions-v1/)
+  assert.match(result.report.text, /read-only/)
+  assert.equal(writes, 1); assert.equal(h.backend.requests.length, 2)
+})
+
+test('supervision accepts only live permission differences, retaining task authority', async t => {
+  const { assertAuthority, supervisionAuthority } = await import('../supervision-runtime.mjs')
+  const h = await fixture(t, { respond: () => ({ text: 'unused' }), config: { direct: { runtime: { sandboxMode: 'auto', approvalPolicy: 'auto' } } } })
+  const owner = await h.ctx.agents.create({ sessionId: 'supervision-permissions-owner', meta: { cwd: h.projectRoot } })
+  t.after(() => owner.dispose())
+  const config = structuredClone(h.runner.config)
+  config.direct.runtime.sandboxMode = 'workspace-write'; config.direct.runtime.approvalPolicy = 'ask'
+  const before = supervisionAuthority({ ...h.runner, config }, owner.agent)
+  setSandboxMode(owner.agent.session, 'read-only')
+  assertAuthority(h.runner, before, owner.agent, new AbortController().signal)
+  assert.throws(() => assertAuthority({ ...h.runner, config: { ...h.runner.config, model: 'changed' } }, before, owner.agent, new AbortController().signal), /SUPERVISION_AUTHORITY_CHANGED/)
+  owner.agent.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Changed scope must still be handled as guidance.' }] }), { surfaceOp: 'append' })
+  assert.throws(() => assertAuthority(h.runner, before, owner.agent, new AbortController().signal), /SUPERVISION_AUTHORITY_CHANGED/)
 })

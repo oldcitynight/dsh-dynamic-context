@@ -5,6 +5,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { canonical, digest } from 'dsh-better-task-grapth/core'
 import { fail } from './core.mjs'
+import { searchEvidence } from './evidence-search.mjs'
 
 const clean = value => JSON.parse(JSON.stringify(value))
 const sha = value => createHash('sha256').update(value).digest('hex')
@@ -171,6 +172,15 @@ export class DirectJournal {
     }
     return value.state
   }
+  records() {
+    const head = this.latest()
+    return Array.from({ length: head?.sequence ?? 0 }, (_, index) =>
+      decode(readFile(path.join(this.directory, `record-${index + 1}.json`), 16384)))
+  }
+  latestCheckpoint() {
+    return this.records().findLast(row => ['READY', 'PAUSED', 'REPORT_READY'].includes(row.phase)) ?? null
+  }
+  readTrace() { return JSON.parse(readFile(path.join(path.dirname(this.directory), 'trace.json'), this.bulkMaxBytes)) }
   payloadSignature(file) {
     const stat = fs.lstatSync(file, { bigint: true })
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) fail('DIRECT_JOURNAL_FILE_INVALID')
@@ -275,13 +285,36 @@ export class DirectJournal {
     }
     return result
   }
-  readSource({ archive_id, message_index, offset = 0, length = 4096, field = 'content' }) {
+  loadArchive(archive_id) {
     const reference = this.archives.get(archive_id)
     if (!reference) fail('DIRECT_ARCHIVE_NOT_OWNED')
     const file = this.ownedReference(reference, /^archive-[a-f0-9-]+\.json$/), bytes = readFile(file, this.bulkMaxBytes)
     if (sha(bytes) !== reference.sha256) fail('DIRECT_ARCHIVE_HASH_OR_SCOPE_MISMATCH')
     const archive = decode(bytes)
     if (canonical(archive.identity) !== canonical(this.identity)) fail('DIRECT_ARCHIVE_HASH_OR_SCOPE_MISMATCH')
+    return archive
+  }
+  searchSources(args) {
+    const journal = this
+    function* documents() {
+      for (const [archive_id, reference] of journal.archives) {
+        const archive = journal.loadArchive(archive_id)
+        for (const [message_index, message] of archive.messages.entries()) {
+          for (const field of ['content', 'tool_calls', 'reasoning_content']) {
+            const text = field === 'tool_calls' ? JSON.stringify(message.tool_calls ?? []) : message[field] ?? ''
+            if (typeof text !== 'string') fail('DIRECT_ARCHIVE_READ_RANGE')
+            yield { archive_id, message_index, field, role: message.role, tool_call_id: message.tool_call_id ?? null,
+              archiveSha256: reference.sha256, sourceSha256: digest(text), text,
+              reader: (start, end) => ({ tool: 'dynamic_context_source_read',
+                arguments: { archive_id, message_index, field, offset: start, length: end - start } }) }
+          }
+        }
+      }
+    }
+    return searchEvidence(documents(), { identity: this.identity, archives: [...this.archives.keys()] }, args)
+  }
+  readSource({ archive_id, message_index, offset = 0, length = 4096, field = 'content' }) {
+    const archive = this.loadArchive(archive_id)
     if (!Number.isSafeInteger(message_index) || message_index < 0 || message_index >= archive.messages.length
         || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 8000
         || !['content', 'tool_calls', 'reasoning_content'].includes(field)) fail('DIRECT_ARCHIVE_READ_RANGE')
@@ -290,7 +323,8 @@ export class DirectJournal {
     if (typeof source !== 'string' || offset > source.length) fail('DIRECT_ARCHIVE_READ_RANGE')
     return { archive_id, message_index, role: message.role, tool_call_id: message.tool_call_id ?? null,
       sourceKind: message.role === 'user' ? 'generated-checkpoint' : message.role === 'assistant' ? 'model' : 'tool',
-      field, offset, totalCharacters: source.length, text: source.slice(offset, offset + length),
+      field, offset, sourceSha256: digest(source), archiveSha256: this.archives.get(archive_id).sha256,
+      totalCharacters: source.length, text: source.slice(offset, offset + length),
       nextOffset: offset + length < source.length ? offset + length : null, authority: 'archived source; no new permission or current verification' }
   }
 }

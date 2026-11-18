@@ -13,6 +13,8 @@ import { startFakeLlama } from '../testing/fake-llama.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { readCompletion } from '../direct-http.mjs'
 import { DEFAULT_MAX_TOKENS } from '@deepseek-ai/dsh-llm-deepseek'
+import { roleInputTokens } from '../role-context.mjs'
+import { DirectJournal } from '../durable-store.mjs'
 
 function fixture({ count = 450, length = 7800 } = {}) {
   const config = { model: 'fake-llama', systemPrompt: 'Pinned host policy.', maxOutputTokens: 32768, maxContextCharacters: 8388608,
@@ -80,6 +82,32 @@ test('pressure-triggered pruning can avoid a paid summary entirely', async () =>
   const result = await compactNativeHistory({ ...f, summarize: () => assert.fail('must not summarize') })
   assert.deepEqual(result.actions.map(a => a.kind), ['tool-result-prune'])
   assert.equal(result.count, 0); assert.equal(f.archives.length, 1)
+})
+
+test('prune-only compression keeps its omitted middle searchable in the original journal', async t => {
+  const f = fixture({ count: 1, length: 3400000 })
+  f.history[3].content = 'a'.repeat(1700000) + 'MIDDLE_ORIGINAL_EVIDENCE' + 'b'.repeat(1700000)
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'prune-source-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const journal = new DirectJournal(directory, { taskId: 'task', attemptId: 'attempt' }, { maxBytes: null })
+  const result = await compactNativeHistory({ ...f, journal, summarize: () => assert.fail('no model summary needed') })
+  assert.ok(!result.history[3].content.includes('MIDDLE_ORIGINAL_EVIDENCE'))
+  const hits = journal.searchSources({ query: 'MIDDLE_ORIGINAL_EVIDENCE' }).hits
+  assert.equal(hits.length, 1)
+  assert.match(journal.readSource(hits[0].read.arguments).text, /MIDDLE_ORIGINAL_EVIDENCE/)
+})
+
+test('mutable shared-context tool batches are neither pruned nor replaced by summaries', async () => {
+  const f = fixture()
+  f.history[2].tool_calls[0].function.name = 'dynamic_context_shared_update'
+  f.history[3].content = JSON.stringify({ id: 'ctx_shared', revision: 9, content: 'LATEST_VALUE '.repeat(2000) })
+  const pinned = structuredClone(f.history.slice(2, 4))
+  assert.deepEqual(pruneNativeTools(f.history).history.slice(2, 4), pinned)
+  const result = await compactNativeHistory({ ...f, summarize: async () => summary('Historical exploration reduced.') })
+  const position = result.history.findIndex(row => row.tool_calls?.[0].function.name === 'dynamic_context_shared_update')
+  assert.ok(position >= 3)
+  assert.deepEqual(result.history.slice(position, position + 2), pinned)
+  checkDirectHistory(result.history, f.contract.checkpoints)
 })
 
 test('a later compaction consolidates prior checkpoints and keeps only one current task reminder', async () => {
@@ -175,7 +203,19 @@ test('real native tools continue after auxiliary compression; both HTTP paths ar
     if (payload.messages.at(-1).content === COMPACTION_INSTRUCTION) { summaries++; return { text: '## Current Work\n- Read observations established input evidence; output.txt is still pending.' } }
     normal++
     if (normal <= 6) return { text: 'Historical exploration detail. '.repeat(2000), tools: [{ name: 'read', arguments: { file_path: 'input.txt' } }] }
-    if (normal === 7) { assert.ok(checkpointData(payload.messages[2])); return { tools: [{ name: 'write', arguments: { file_path: 'output.txt', content: 'continued after native summary' } }] } }
+    if (normal === 7) {
+      assert.ok(checkpointData(payload.messages[2]))
+      assert.ok(payload.tools.some(row => row.function.name === 'dynamic_context_source_search'))
+      return { tools: [{ name: 'dynamic_context_source_search', arguments: { query: 'Historical exploration detail.', limit: 1 } }] }
+    }
+    if (normal === 8) {
+      const hit = JSON.parse(payload.messages.at(-1).content).hits[0]
+      return { tools: [{ name: hit.read.tool, arguments: hit.read.arguments }] }
+    }
+    if (normal === 9) {
+      assert.match(JSON.parse(payload.messages.at(-1).content).text, /Historical exploration detail/)
+      return { tools: [{ name: 'write', arguments: { file_path: 'output.txt', content: 'continued after native summary' } }] }
+    }
     return { text: 'File written. Independent acceptance NOT_RUN.' }
   } })
   const options = { projectRoot, directory: path.join(root, 'state'), backend,
@@ -193,7 +233,7 @@ test('real native tools continue after auxiliary compression; both HTTP paths ar
   second = await createRuntimeHarness(options); second.runner.registerInputMeter(meter)
   const result = await second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum })
   assert.equal(summaries, summariesBefore)
-  assert.ok(summaries >= 1); assert.equal(metered, backend.requests.length)
+  assert.ok(summaries >= 1); assert.ok(metered >= backend.requests.length, 'admission and chunk planning also measure inputs locally')
   assert.equal(result.trace.requests.filter(r => r.purpose === 'compaction').length, summaries)
   assert.deepEqual(result.trace.requests.map(r => r.ordinal), result.trace.requests.map((_, i) => i + 1))
   assert.ok(result.trace.requests.every(r => r.status === 'COMPLETE'))
@@ -222,4 +262,61 @@ test('one confirmed HTTP overflow recovers within the same native tool step with
   assert.equal(result.trace.requests[2].status, 'REJECTED_CONTEXT_OVERFLOW')
   assert.deepEqual(result.trace.requests.map(r => r.ordinal), [1, 2, 3, 4, 5])
   assert.equal(result.trace.requests[4].taskOrdinal, 3)
+})
+
+test('pause between native compression rounds reuses the completed summary after restart', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-compact-pause-')))
+  const projectRoot = path.join(root, 'workspace'); fs.mkdirSync(projectRoot)
+  fs.writeFileSync(path.join(projectRoot, 'input.txt'), 'Observed evidence.')
+  let normal = 0, summaries = 0, first, second
+  const backend = await startFakeLlama({ maxRequestBytes: 8388608, respond: ({ payload }) => {
+    if (payload.messages.at(-1).content === COMPACTION_INSTRUCTION) {
+      if (++summaries === 1) {
+        first.runner.pauseActive({ expectedRevision: 2 })
+        // A valid but weak reduction leaves enough retained history to need
+        // the native policy's second compression round.
+        return { text: 's'.repeat(200000) }
+      }
+      return { text: 'Two reads are complete; report the observed result.' }
+    }
+    if (++normal <= 2) return { text: 'x'.repeat(220000), tools: [{ name: 'read', arguments: { file_path: 'input.txt' } }] }
+    return { text: 'Observations retained; no reads repeated.' }
+  } })
+  const options = { projectRoot, directory: path.join(root, 'state'), backend,
+    config: { storageRoot: root, maxContextCharacters: 8388608, maxRequestsPerTask: 6,
+      direct: { durable: true, maxRequestBytes: 8388608, compaction: { strategy: 'dsh-native', contextWindow: 131072 } } } }
+  first = await createRuntimeHarness(options)
+  const meter = { version: 'fake-native-tokenizer', measure: async payload => ({ tokens: roleInputTokens(payload), method: 'estimate' }) }
+  first.runner.registerInputMeter(meter)
+  t.after(async () => { await second?.close(); await first.close(); await backend.close(); fs.rmSync(root, { recursive: true, force: true }) })
+  first.runner.submit(runtimeProposal(['read']))
+  const paused = await first.runner.runNext({ expectedRevision: 1 })
+  assert.equal(paused.paused, true); assert.equal(normal, 2); assert.equal(summaries, 1)
+  await first.close(); second = await createRuntimeHarness(options)
+  second.runner.registerInputMeter(meter)
+  const result = await second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum })
+  assert.equal(normal, 3); assert.equal(summaries, 2)
+  assert.equal(result.trace.events.filter(row => row.type === 'tool/call').length, 2)
+  assert.equal(result.trace.requests.filter(row => row.purpose === 'compaction').length, 2)
+  assert.deepEqual(backend.errors, [])
+})
+
+test('oversized worker history is summarized in separately admitted spans with fixed prompts unchanged', async () => {
+  const f = fixture({ count: 120, length: 7800 })
+  f.contract.config.direct.compaction.contextWindow = 262144
+  const measured = payload => Buffer.byteLength(JSON.stringify({ messages: payload.messages, tools: payload.tools }))
+  let calls = 0
+  const result = await compactNativeHistory({ ...f, measureTokens: measured, summarize: async payload => {
+    calls++
+    assert.ok(measured(payload) + payload.max_tokens <= 262144)
+    assert.deepEqual(payload.messages.slice(0, 2), f.history.slice(0, 2))
+    checkDirectHistory(payload.messages.slice(0, -1), f.contract.checkpoints)
+    return summary('An independently compressed historical span; original records remain evidence.')
+  } })
+  assert.ok(calls > 1)
+  const spans = result.actions.filter(row => row.kind === 'llm-summary').flatMap(row => row.spans)
+  assert.equal(spans[0].start, 0)
+  spans.slice(1).forEach((span, i) => assert.equal(span.start, spans[i].end))
+  assert.deepEqual(result.history.slice(0, 2), f.history.slice(0, 2))
+  assert.ok(result.measurement.tokens < result.spec.thresholdTokens)
 })

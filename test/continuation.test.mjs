@@ -11,6 +11,7 @@ import { checkpointData } from '../checkpoints.mjs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { durableConfigHash } from '../index.mjs'
 
 async function location(t, respond) {
   const storageRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-continuation-')))
@@ -25,6 +26,70 @@ async function location(t, respond) {
     } }
 }
 const writeResponse = { tools: [{ name: 'write', arguments: { file_path: 'effect.txt', content: 'written once\n' } }] }
+
+for (const migration of [
+  { label: 'hot permissions with unchanged config', file: 'index.mjs', sha: '2b3b07e8d9b5f111ed49ed6a11173cd5979402d8cbb31695767ba46bcc1aeef4' },
+  { label: 'display-only', file: 'execution-output.mjs', sha: 'e3b86b4f7cf29adf8d7e19675050086a3197ab3f6ccab3e81eff20d42c4f62e2' },
+  { label: 'performance-only', file: 'index.mjs', sha: 'dd5491148ef45a7e1d1a7bd10aeab9ecb816f4a87ab8ac7ce68462b9f1ce1cb2' },
+  { label: 'command-entry with unchanged leaf inputs', file: 'index.mjs', sha: '4c7b3e55c77226136c4924697527663eda3c3f24f24d2f19965cb6dddd5db2c2' },
+]) {
+test(`an unapproved rc.5 ${migration.label} build cannot resume or replay a normal pause`, async t => {
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Continued after the display update.' })
+  let writes = 0
+  const setup = ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
+  const first = await where.open({}, setup)
+  first.runner.submit(runtimeProposal(['write']))
+  await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const code = JSON.parse(fs.readFileSync(new URL('../testing/rc5-recovery-fixtures.json', import.meta.url))).find(code => new Map(code).get(migration.file) === migration.sha)
+  assert.ok(code)
+  const state = first.runner.graph.read(), active = state.graph.state.active
+  const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
+    contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
+  const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  saved.configHash = durableConfigHash(first.runner.config, undefined, code)
+  journal.checkpoint('PAUSED', saved)
+  const checksum = journal.latest().checksum
+  await first.close()
+  const second = await where.open({}, setup)
+  await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum }), error => {
+    assert.equal(error.code, 'DIRECT_RESUME_CONFIGURATION_CHANGED')
+    assert.ok(error.message.includes('/continuation/configHash'))
+    assert.ok(error.message.includes('does not prove that the model changed'))
+    return true
+  })
+  assert.equal(where.backend.requests.length, 1)
+  await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true }), /DIRECT_RESUME_CONFIGURATION_CHANGED/)
+  assert.equal(second.runner.checkpointStatus().checksum, checksum)
+  assert.equal(writes, 1)
+  assert.equal(where.backend.requests.length, 1)
+  assert.equal(fs.readFileSync(path.join(where.projectRoot, 'effect.txt'), 'utf8'), 'written once\n')
+})
+
+test(`foreign rc.5 ${migration.label} code cannot authorize a changed execution configuration`, async t => {
+  const where = await location(t, () => writeResponse)
+  const first = await where.open()
+  first.runner.submit(runtimeProposal(['write']))
+  await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const code = JSON.parse(fs.readFileSync(new URL('../testing/rc5-recovery-fixtures.json', import.meta.url))).find(code => new Map(code).get(migration.file) === migration.sha)
+  assert.ok(code)
+  const state = first.runner.graph.read(), active = state.graph.state.active
+  const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
+    contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
+  const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  saved.configHash = durableConfigHash(first.runner.config, undefined, code)
+  journal.checkpoint('PAUSED', saved)
+  const checksum = journal.latest().checksum
+  await first.close()
+  for (const changed of [{ model: 'another-model' }, { systemPrompt: 'Changed instructions' }, { maxOutputTokens: 700 },
+    { direct: { endpoint: where.backend.origin + '/different-route' } }]) {
+    const candidate = await where.open(changed)
+    await assert.rejects(candidate.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true }), /DIRECT_RESUME_CONFIGURATION_CHANGED/)
+    assert.equal(candidate.runner.checkpointStatus().checksum, checksum)
+    await candidate.close()
+  }
+  assert.equal(where.backend.requests.length, 1)
+})
+}
 
 test('the runner retains its kernel lock after the acquisition helper exits, until explicit release', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-direct-lease-'))
@@ -374,6 +439,36 @@ test('changed tool declarations are rejected before a resumed model request', as
   assert.equal(where.backend.requests.length, 1)
 })
 
+for (const changedArguments of [false, true]) {
+  test(`a paused leaf keeps its extension wording and checks its argument contract (changed=${changedArguments})`, async t => {
+    const name = 'fixture_inspect_design', original = 'Original workspace instructions'
+    let effects = 0
+    const where = await location(t, ({ index, payload }) => {
+      assert.equal(payload.tools.find(tool => tool.function.name === name).function.description, original)
+      return index === 1 ? { tools: [{ name, arguments: {} }] } : { text: 'Observation received.' }
+    })
+    function register(h, description, properties = {}) {
+      h.ctx.get('dynamicContextRoleTools').registerTool({ pluginId: 'fixture', registrationId: 'design', toolId: name,
+        roles: ['executor'], effect: 'read', workspaceRoot: where.projectRoot,
+        schema: { type: 'function', function: { name, description, parameters: { type: 'object', properties, additionalProperties: false } } },
+        authorize: () => true, execute: () => { effects++; return { observed: true } } })
+    }
+    const first = await where.open()
+    register(first, original)
+    first.runner.submit(runtimeProposal([name]))
+    const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+    await first.close()
+    const next = await where.open()
+    register(next, 'New tool instructions', changedArguments ? { page: { type: 'integer' } } : {})
+    const resume = next.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum })
+    if (changedArguments) await assert.rejects(resume, /DIRECT_RESUME_TOOL_DEFINITIONS_CHANGED/)
+    else assert.equal((await resume).report.text, 'Observation received.')
+    assert.equal(effects, 1)
+    assert.equal(where.backend.requests.length, changedArguments ? 1 : 2)
+    assert.deepEqual(where.backend.errors, [])
+  })
+}
+
 test('an uncommitted journal tail blocks recovery instead of trusting an older READY head', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-journal-tail-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -414,7 +509,9 @@ test('another task cannot read the preceding task archive even when its ID is gu
     assert.match(JSON.stringify(payload.messages), /ONLY_A_DECLARED_REPORT/)
     assert.doesNotMatch(JSON.stringify(payload.messages), /TASK_A_PRIVATE_SOURCE|Observed status/)
     assert.equal(payload.messages.map(checkpointData).filter(Boolean).length, 0)
-    return { tools: [{ name: 'dynamic_context_source_read', arguments: { archive_id: reference.archiveId, message_index: reference.messageIndex } }] }
+    if (index === 3) return { tools: [{ name: 'dynamic_context_source_read', arguments: { archive_id: reference.archiveId, message_index: reference.messageIndex } }] }
+    assert.match(JSON.stringify(payload.messages), /DIRECT_ARCHIVE_NOT_OWNED/)
+    return { text: 'Foreign archive denied; only the declared report was accessible.' }
   })
   writeLongSource(where, 'a.txt', 'TASK_A_PRIVATE_SOURCE')
   const h = await where.open(compactionConfig), proposal = runtimeProposal(['read', 'dynamic_context_source_read'])
@@ -423,11 +520,10 @@ test('another task cannot read the preceding task archive even when its ID is gu
   proposal.contextGraph.bindings.push({ task: 'b', instruction: 'Inspect only the declared report.', contexts: [], tools: ['dynamic_context_source_read'], inheritReports: ['task'] })
   h.runner.submit(proposal)
   await h.runner.runNext({ expectedRevision: 1 })
-  await assert.rejects(h.runner.runNext({ expectedRevision: h.runner.graph.read().revision }), /DIRECT_TOOL_EXECUTION_FAILED/)
-  const trace = JSON.parse(fs.readFileSync(path.join(h.runner.config.directory, h.runner.graph.read().graph.state.active.attemptId, 'trace.json')))
+  const { trace } = await h.runner.runNext({ expectedRevision: h.runner.graph.read().revision })
   assert.match(JSON.stringify(trace.events.findLast(row => row.type === 'tool/result')), /DIRECT_ARCHIVE_NOT_OWNED/)
-  assert.equal(h.runner.graph.read().reports.length, 1)
-  assert.equal(where.backend.requests.length, 3)
+  assert.equal(h.runner.graph.read().reports.length, 2)
+  assert.equal(where.backend.requests.length, 4)
 })
 
 test('tool call IDs remain used after both compaction and restart', async t => {
@@ -501,4 +597,52 @@ test('restart does not reset the total model request budget', async t => {
   const second = await where.open(config)
   await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum }), /TASK_REQUEST_LIMIT/)
   assert.equal(where.backend.requests.length, 3)
+})
+
+test('explicit recovery of a crashed tool submits its saved log and UNKNOWN notice without replaying the write', async t => {
+  const where = await location(t, ({ index, payload }) => {
+    if (index === 1) return writeResponse
+    assert.match(JSON.stringify(payload.messages), /UNKNOWN|意外中断/)
+    assert.equal(payload.messages.filter(row => row.role === 'tool').length, 1)
+    return { text: 'Recovered the saved write with its original uncertainty recorded.' }
+  })
+  const worker = crashWorker(t, where, 'tool-pending'); await worker.exited
+  const h = await where.open(), status = h.runner.checkpointStatus()
+  assert.equal(status.recoverable, true)
+  const result = await resumeAfterLeaseRelease(h, { expectedRevision: 2, checkpointChecksum: status.checksum, recover: true })
+  assert.equal(where.backend.requests.length, 2)
+  assert.equal(fs.readFileSync(path.join(where.projectRoot, 'effect.txt'), 'utf8'), 'written once\n')
+  const recovery = result.trace.events.find(row => row.type === 'task/interruption-recovered')
+  assert.equal(recovery.data.kind, 'tools'); assert.equal(recovery.data.repeatedTools, false)
+})
+
+test('explicit recovery of an interrupted model resends the same request without repeating prior tool effects', async t => {
+  const where = await location(t, ({ index }) => index === 1 ? { hang: true } : { text: 'Recovered model request.' })
+  const worker = crashWorker(t, where, 'hang'); await waitFor(() => where.backend.requests.length === 1); worker.child.kill('SIGKILL'); await worker.exited
+  const h = await where.open(), status = h.runner.checkpointStatus()
+  await resumeAfterLeaseRelease(h, { expectedRevision: 2, checkpointChecksum: status.checksum, recover: true })
+  assert.equal(where.backend.requests.length, 2)
+  assert.deepEqual(where.backend.requests[1].payload, where.backend.requests[0].payload)
+})
+
+test('rc.5 permission migration cannot authorize a foreign host even when the model is unchanged', async t => {
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Continued with live inherited permissions.' })
+  const first = await where.open({ direct: { runtime: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' } } })
+  first.runner.submit(runtimeProposal(['write']))
+  await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const code = JSON.parse(fs.readFileSync(new URL('../testing/rc5-recovery-fixtures.json', import.meta.url))).find(code => new Map(code).get('index.mjs') === '2b3b07e8d9b5f111ed49ed6a11173cd5979402d8cbb31695767ba46bcc1aeef4')
+  const state = first.runner.graph.read(), active = state.graph.state.active
+  const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
+    contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
+  const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  saved.configHash = durableConfigHash(first.runner.config, undefined, code)
+  journal.checkpoint('PAUSED', saved); const checksum = journal.latest().checksum
+  await first.close()
+  const changed = await where.open({ model: 'another-model', direct: { runtime: { sandboxMode: 'auto', approvalPolicy: 'auto' } } })
+  await assert.rejects(changed.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true }), /DIRECT_RESUME_CONFIGURATION_CHANGED/)
+  await changed.close()
+  const second = await where.open({ direct: { runtime: { sandboxMode: 'auto', approvalPolicy: 'auto' } } })
+  await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true }), /DIRECT_RESUME_CONFIGURATION_CHANGED/)
+  assert.equal(second.runner.checkpointStatus().checksum, checksum)
+  assert.equal(where.backend.requests.length, 1)
 })

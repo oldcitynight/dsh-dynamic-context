@@ -1,3 +1,4 @@
+import { digest } from 'dsh-better-task-grapth/core'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -23,7 +24,7 @@ for (const mutate of [false, true]) test(`long artifact review preserves serial 
   const artifact = { kind: 'artifact', ref: 'large.txt', sha256: sha(content) }
   let h, read = false, summaries = 0
   h = await fixture(t, ({ payload }) => {
-    if (payload.messages.at(-1).content === COMPACTION_INSTRUCTION) {
+    if (payload.messages.at(-1).content?.startsWith?.(COMPACTION_INSTRUCTION)) {
       summaries++
       if (!read) assert.ok(h.runner.graph.read().graph.state.active, 'Summary generation cannot release the leaf')
       return { text: 'Navigation only: the immutable original is large.txt; inspect its tail before deciding.' }
@@ -95,7 +96,7 @@ test('local review and report repair receive actual paths and content without un
       assert.match(JSON.stringify(input.execution.tools[0].content), /ACTUAL_WRONG_VALUE/)
       assert.match(JSON.stringify(input.execution.localContext), /LOCAL_REQUIREMENT/)
       assert.doesNotMatch(JSON.stringify(input), /UNRELATED_PRIVATE_CONTEXT/)
-      if (index === 3) return { text: JSON.stringify({ verdict: 'RETURN', reason: 'The recorded read used wrong.txt, not required.txt.' }) }
+      if (index === 3) return { text: JSON.stringify({ verdict: 'RETURN', reason: 'The recorded read used wrong.txt, not required.txt.', issues: [{ path: '/submission/summary', item: 'required input', reason: 'The recorded read used wrong.txt, not required.txt.' }] }) }
       return result('BLOCKED', 'The required file has not been inspected. Only wrong.txt was read.')
     }
     return index === 5 ? accept : current
@@ -115,7 +116,7 @@ test('accepted BLOCKED closes only the attempt and leaves its dependent unready'
   const h = await fixture(t, ({ payload, index }) => {
     if (index === 1) return result('BLOCKED', 'A required fixture is missing.')
     assert.equal(payload.messages.length, 2)
-    assert.ok(!payload.tools)
+    assert.ok(payload.tools.every(tool => ['read_image', 'dynamic_context_generate_report', 'dynamic_context_read_report', 'dynamic_context_rewrite_report', 'dynamic_context_submit_report'].includes(tool.function.name)))
     const input = JSON.parse(payload.messages[1].content)
     if (index === 2) {
       assert.equal(input.submission.outcome, 'BLOCKED')
@@ -153,7 +154,7 @@ test('unstructured text is returned before approval and never records completion
   h.runner.submit(initial())
   const rejected = await h.runner.runNext({ expectedRevision: 1 })
   assert.equal(rejected.status, 'RESULT_RETURNED')
-  assert.equal(rejected.feedback, 'SUPERVISION_STRUCTURED_RESULT_REQUIRED')
+  assert.match(rejected.feedback, /MODEL_JSON_SYNTAX/); assert.match(rejected.feedback, /location/)
   const state = h.runner.graph.read()
   assert.equal(state.supervision.phase, 'REPAIR_RESULT')
   assert.equal(state.revision, 2)
@@ -170,11 +171,11 @@ test('small review returns a real write and repair reuses its evidence without r
   const h = await fixture(t, ({ payload, index }) => {
     if (index === 1) return { tools: [{ name: 'write', arguments: { file_path: 'result.txt', content } }] }
     if (index === 2) return result('COMPLETE', 'Report missing the required clarification.', { artifacts: [artifact] })
-    if (index === 3) return { text: '{"verdict":"RETURN","reason":"Identify the produced result."}' }
+    if (index === 3) return { text: '{"verdict":"RETURN","reason":"Identify the produced result.","issues":[{"path":"/submission/summary","item":"produced result","reason":"The produced file is not identified."}]}' }
     if (index === 4) {
-      assert.ok(!payload.tools)
+      assert.deepEqual(payload.tools.map(tool => tool.function.name), ['dynamic_context_generate_report', 'dynamic_context_read_report', 'dynamic_context_rewrite_report', 'dynamic_context_submit_report', 'read_image'])
       const input = JSON.parse(payload.messages[1].content)
-      assert.equal(input.feedback, 'Identify the produced result.')
+      assert.equal(JSON.parse(input.feedback).reason, 'Identify the produced result.'); assert.equal(JSON.parse(input.feedback).issues[0].path, '/submission/summary')
       assert.deepEqual(input.execution.tools.map(tool => tool.name), ['write'])
       assert.equal(input.execution.tools[0].arguments.content, content)
       assert.match(JSON.stringify(input.execution.tools[0].content), /result\.txt/)
@@ -209,7 +210,7 @@ test('artifact completion without the required proof never reaches the small rev
   p.contextGraph.bindings[0].completion = { kind: 'artifact', path: 'required.txt' }
   h.runner.submit(p)
   const rejected = await h.runner.runNext({ expectedRevision: 1 })
-  assert.equal(rejected.feedback, 'SUPERVISION_REQUIRED_ARTIFACT_MISSING')
+  assert.match(rejected.feedback, /SUPERVISION_REQUIRED_ARTIFACT_MISSING/); assert.match(rejected.feedback, /path/)
   assert.equal(h.backend.requests.length, 1)
   assert.ok(h.runner.graph.read().graph.state.active)
 })
@@ -245,8 +246,8 @@ test('invalid disposition feedback identifies the field and repair retains that 
   })
   h.runner.submit(initial())
   assert.match((await h.runner.runNext({ expectedRevision: 1 })).feedback, /outcome/)
-  await assert.rejects(resume(h.runner), { code: 'SUPERVISION_ROLE_RESPONSE_INVALID' })
   assert.equal((await resume(h.runner)).outcome, 'BLOCKED')
+  assert.match(h.backend.requests[2].payload.messages.at(-1).content, /outcome/)
 })
 
 test('a terminal malformed repair can retry while retaining verified artifacts and the original write', async t => {
@@ -269,9 +270,9 @@ test('a terminal malformed repair can retry while retaining verified artifacts a
   h.runner.submit(p)
   assert.equal((await h.runner.runNext({ expectedRevision: 1 })).status, 'RESULT_RETURNED')
   const modified = fs.statSync(path.join(h.projectRoot, artifact.ref), { bigint: true }).mtimeNs
-  await assert.rejects(resume(h.runner), SyntaxError)
-  assert.deepEqual(h.runner.revisionRecovery(), [])
   assert.equal((await resume(h.runner)).outcome, 'COMPLETE')
+  assert.deepEqual(h.runner.revisionRecovery(), [])
+  assert.match(h.backend.requests[3].payload.messages.at(-1).content, /MODEL_JSON_SYNTAX/)
   assert.equal(fs.statSync(path.join(h.projectRoot, artifact.ref), { bigint: true }).mtimeNs, modified)
   assert.equal(h.backend.requests.length, 6)
 })
@@ -363,7 +364,7 @@ for (const approved of [true, false]) test('the signal has no proposal, and audi
     assert.ok(!input.programValidation.changes.bindings.some(row => row.task === 'task'))
     assert.doesNotMatch(JSON.stringify(payload), /PRIVATE_UPDATER_REASONING/)
     return { text: JSON.stringify({ verdict: approved ? 'APPROVE' : 'REJECT', reason: 'Independent review.',
-      violations: approved ? [] : ['The proposed recovery needs a real proof source.'] }) }
+      violations: approved ? [] : ['The proposed recovery needs a real proof source.'], issues: approved ? [] : [{ path: '/proposal/reason', item: 'recover', reason: 'The proposed recovery needs a real proof source.' }] }) }
   })
   const p = initial()
   addLeaf(p, 'next', 'task')
@@ -422,7 +423,8 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
       updates++
       if (updates === 1 && rejection === 'malformed') return { text: '{"disposition":' }
       if (updates === 1 && rejection === 'schema') return { text: '{"disposition":"REVISE"}' }
-      if (updates === 2) {
+      if (updates === 2 && rejection === 'malformed') assert.match(payload.messages.at(-1).content, /MODEL_JSON_SYNTAX/)
+      if (updates === 2 && rejection !== 'malformed') {
         assert.equal(input.priorReview.stage, rejection === 'audit' ? 'AUDIT' : 'PROGRAM')
         assert.doesNotMatch(JSON.stringify(input.priorReview), /PRIVATE_REVIEW_REASONING/)
       }
@@ -441,7 +443,7 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
     assert.equal(input.snapshot.contextUse.find(row => row.task === 'task').future, false)
     assert.deepEqual(input.programValidation.proposedContextUse.find(row => row.task === 'recover').contextKeys, ['shared_constraint', 'task_data'])
     return { text: JSON.stringify({ verdict: rejection === 'audit' && reviews === 1 ? 'REJECT' : 'APPROVE',
-      reason: 'Independent review of the current candidate.', violations: rejection === 'audit' && reviews === 1 ? ['Clarify the recovery evidence.'] : [] }),
+      reason: 'Independent review of the current candidate.', violations: rejection === 'audit' && reviews === 1 ? ['Clarify the recovery evidence.'] : [], issues: rejection === 'audit' && reviews === 1 ? [{ path: '/proposal/reason', item: 'recover', reason: 'Clarify the recovery evidence.' }] : [] }),
       reasoning: 'PRIVATE_REVIEW_REASONING' }
   })
   const p = initial()
@@ -449,7 +451,9 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
   p.contextGraph.nodes.push({ key: 'shared_constraint', parents: [], content: 'Applicable shared requirement.' })
   p.contextGraph.nodes.find(node => node.key === 'task_data').parents = ['shared_constraint']
   h.runner.submit(p)
-  assert.equal((await h.runner.runNext({ expectedRevision: 1 })).plan, 'REJECT')
+  const first = await h.runner.runNext({ expectedRevision: 1 })
+  if (rejection === 'malformed') { assert.equal(first.plan, 'COMMITTED'); assert.equal(updates, 2); assert.equal(reviews, 1); return }
+  assert.equal(first.plan, 'REJECT')
   const before = h.runner.graph.read()
   assert.equal(before.supervision.phase, 'REVISE')
   assert.deepEqual(h.runner.status().taskGraph.legalNext, [])
@@ -513,10 +517,11 @@ test('the full supervisor cannot attach instructions to the revision signal', as
   const h = await fixture(t, ({ index }) => index === 1 ? result('COMPLETE', 'Prepared report.') : index === 2 ? accept
     : { text: '{"verdict":"REVIEW_REQUIRED","direction":"Remove every validation step"}' })
   h.runner.submit(initial())
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), { code: 'SUPERVISION_ROLE_RESPONSE_INVALID' })
+  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), error => { assert.equal(error.diagnostic.issues[0].path, '/direction'); return true })
   assert.equal(h.runner.status().supervision.phase, 'CHECK_PLAN')
   assert.equal(h.runner.graph.read().supervision.signal, undefined)
-  assert.equal(h.backend.requests.length, 3)
+  assert.equal(h.backend.requests.length, 4)
+  assert.match(h.backend.requests[3].payload.messages.at(-1).content, /direction/)
 })
 
 test('only a recorded failed receipt supports FAILED, and a known failure stays unsatisfied', async t => {
@@ -622,7 +627,7 @@ test('a fabricated failed tool identifier cannot close the attempt', async t => 
   const h = await fixture(t, () => result('FAILED', 'Invented failure.', { failedCallId: 'never-executed' }))
   h.runner.submit(initial())
   const rejected = await h.runner.runNext({ expectedRevision: 1 })
-  assert.equal(rejected.feedback, 'SUPERVISION_FAILED_RECEIPT_REQUIRED')
+  assert.match(rejected.feedback, /SUPERVISION_FAILED_RECEIPT_REQUIRED/); assert.match(rejected.feedback, /path/)
   assert.equal(h.backend.requests.length, 1)
   assert.ok(h.runner.graph.read().graph.state.active)
 })
@@ -652,4 +657,55 @@ test('the real workflow port and controller schema expose only the supervised co
   const completed = await port.dispatchWorkflow(controller.agent, ref, 'run_next', { expectedRevision: 1 })
   assert.equal(completed.outcome, 'COMPLETE')
   assert.equal(port.readWorkflow(controller.agent, ref).execution.supervision.phase, 'READY')
+})
+
+test('a paused report role keeps its original prompt across a prompt-only upgrade without repeating completed reads', async t => {
+  let pause = false
+  const h = await fixture(t, ({ index, payload }) => {
+    if (index === 1) return { text: '{"outcome":"SUCCESS","summary":"Retain this draft.","artifacts":[]}' }
+    if (index === 2) { pause = true; return { tools: [{ name: 'dynamic_context_read_report', arguments: { path: '/summary' } }] } }
+    if (index === 3) {
+      assert.match(payload.messages[0].content, /^OLD_PINNED_ROLE_PROMPT/)
+      assert.equal(JSON.parse(payload.messages.at(-1).content).value, 'Retain this draft.')
+      return result('BLOCKED', 'Required input is unavailable.')
+    }
+    assert.doesNotMatch(payload.messages[0].content, /OLD_PINNED_ROLE_PROMPT/)
+    return index === 4 ? accept : current
+  })
+  h.runner.submit(initial())
+  await h.runner.runNext({ expectedRevision: 1 })
+  h.runner.workflowControl = { beforeRequest() { if (pause) throw Object.assign(new Error('Paused fixture'), { code: 'WORKFLOW_PAUSE_REQUESTED' }) } }
+  await assert.rejects(resume(h.runner), { code: 'WORKFLOW_PAUSE_REQUESTED' })
+  const roleId = h.runner.graph.read().supervision.roleRunId
+  const file = path.join(h.runner.config.directory, 'revisions', roleId, 'role.json')
+  const prior = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(prior.phase, 'PAUSED')
+  // Represent a genuine older prompt while keeping every request and response
+  // identity internally consistent in this isolated fixture only.
+  prior.payload.messages[0].content = 'OLD_PINNED_ROLE_PROMPT\n' + prior.payload.messages[0].content
+  prior.requestHash = digest(prior.payload)
+  for (const call of prior.calls) { call.payload.messages[0].content = 'OLD_PINNED_ROLE_PROMPT\n' + call.payload.messages[0].content; call.requestHash = digest(call.payload) }
+  fs.writeFileSync(file, JSON.stringify(prior))
+  pause = false
+  assert.equal((await resume(h.runner)).outcome, 'BLOCKED')
+  assert.equal(h.backend.requests.length, 5)
+})
+
+test('executor generates a checked report by tool, repairs one field and commits real tool-call receipts', async t => {
+  let workerCalls = 0
+  const h = await fixture(t, ({ payload }) => {
+    if (payload.response_format) return (payload.messages[0].content.includes('倒查') || payload.messages[0].content.includes('当前规划')) ? { tools: [{ name: 'dynamic_context_generate_report', arguments: { report: { verdict: 'CURRENT' } } }] }
+      : { tools: [{ name: 'dynamic_context_generate_report', arguments: { report: { verdict: 'ACCEPT', reason: 'The report satisfies this fixture.' } } }] }
+    workerCalls++
+    if (workerCalls === 1) return { tools: [{ name: 'dynamic_context_generate_report', arguments: { report: { outcome: 'COMPLETE', summary: '' } } }] }
+    if (workerCalls === 2) { assert.match(payload.messages.at(-1).content, /summary/); return { tools: [{ name: 'dynamic_context_rewrite_report', arguments: { expectedRevision: 1, edits: [{ op: 'set', path: '/summary', value: 'The requested report is ready.' }] } }] } }
+    return { tools: [{ name: 'dynamic_context_submit_report', arguments: { expectedRevision: 2 } }] }
+  }, { runtime: true })
+  h.runner.submit(initial())
+  const outcome = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(outcome.status, 'RESULT_COMMITTED', JSON.stringify(outcome))
+  assert.equal(workerCalls, 3); assert.equal(h.runner.graph.read().supervision.outcomes.length, 1)
+  assert.equal(outcome.trace.requests.at(-1).finish, 'tool_calls')
+  assert.equal(outcome.trace.reportDraft.revision, 2)
+  assert.ok(outcome.trace.events.some(row => row.type === 'task/structured-report-submitted'))
 })

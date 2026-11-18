@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { fail } from './core.mjs'
+import { directProtocol } from './api-protocol.mjs'
 
 /** Resolve only authentication; model payloads never pass through a native provider. */
 export async function directAuthHeaders(ctx, direct, signal) {
@@ -30,5 +31,5 @@ export async function directAuthHeaders(ctx, direct, signal) {
   const credentials = ctx.get('credentials')
   const key = credentials ? (await wait(credentials.resolve(direct.apiKeyEnv)))?.value : process.env[direct.apiKeyEnv]
   if (!key) fail('DIRECT_MISSING_CONFIGURED_CREDENTIAL')
-  return { authorization: `Bearer ${key}` }
+  return directProtocol(direct) === 'messages' ? { 'x-api-key': key } : { authorization: `Bearer ${key}` }
 }

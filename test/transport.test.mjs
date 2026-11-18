@@ -10,11 +10,11 @@ import { bridge, composeHooks } from '../adapter-bridge.mjs'
 import { createHarness, GLOBAL_PRIVATE, HOST_POLICY } from '../testing/harness.mjs'
 import { proposal, scenarioResponse } from '../testing/scenario.mjs'
 
-async function fixture(t, { transport = 'direct', respond = () => ({ text: 'Synthetic report' }), config = {} } = {}) {
+async function fixture(t, { transport = 'direct', respond = () => ({ text: 'Synthetic report' }), config = {}, setup } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-context-transport-')))
   let h
   t.after(async () => { if (h) await h.close(); fs.rmSync(root, { recursive: true, force: true }) })
-  h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'), respond, config: { transport, ...config } })
+  h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'), respond, setup, config: { transport, ...config } })
   return h
 }
 const extraTool = h => h.ctx.systemPrompt.tools(() => ({ schemas: [{ name: 'probe_unlisted_schema',
@@ -114,8 +114,9 @@ test('direct mode retains the native global tool guard', async t => {
   const h = await fixture(t, { transport: 'direct', respond: scenarioResponse })
   h.ctx.tools.guard(() => 'Synthetic host policy denial')
   h.runner.submit(proposal())
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_TOOL_EXECUTION_FAILED/)
-  assertBlocked(h, 1)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.match(JSON.stringify(result.trace.events.filter(row => row.type === 'tool/result')), /Synthetic host policy denial/)
+  assert.equal(h.backend.requests.length, 2)
   assert.deepEqual(h.toolCalls, [])
 })
 
@@ -123,7 +124,7 @@ test('an around-tool callback cannot redirect a direct execution after permissio
   const h = await fixture(t, { transport: 'direct', respond: scenarioResponse })
   h.ctx.on('tools/execute', async (exec, next) => { exec.name = 'fixture_forbidden'; return next() })
   h.runner.submit(proposal())
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
+  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_TOOL_EXECUTION_CONTRACT_MISMATCH/)
   assertBlocked(h, 1)
   assert.deepEqual(h.toolCalls, [])
 })
@@ -169,10 +170,10 @@ for (const [name, respond] of [
 ]) test(`direct ${name} preserves ACTIVE without replay or tool side effects`, async t => {
   const h = await fixture(t, { transport: 'direct', respond }); h.runner.submit(proposal())
   await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
-  assertBlocked(h, 1)
+  assertBlocked(h, ['bad tool argument JSON', 'forbidden tool', 'invalid whole tool batch'].includes(name) ? 4 : 1)
   assert.deepEqual(h.toolCalls, [])
   await assert.rejects(h.runner.runNext({ expectedRevision: 2 }), /ONE_ACTIVE_LEAF_ONLY/)
-  assert.equal(h.backend.requests.length, 1)
+  assert.equal(h.backend.requests.length, ['bad tool argument JSON', 'forbidden tool', 'invalid whole tool batch'].includes(name) ? 4 : 1)
 })
 
 test('direct redirect is rejected rather than followed or retried', async t => {
@@ -238,24 +239,62 @@ test('direct cancellation rejects concurrent work and records uncertainty', asyn
 })
 
 test('direct timeout stops HTTP and preserves ACTIVE', async t => {
-  const h = await fixture(t, { transport: 'direct', respond: () => ({ hang: true }), config: { timeoutMs: 80 } })
+  const h = await fixture(t, { transport: 'direct', respond: () => ({ hang: true }), config: { timeoutMs: 1000 } })
   h.runner.submit(proposal())
   await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
   assertBlocked(h, 1)
   assert.equal(failedTrace(h).status, 'TIMEOUT_UNKNOWN')
 })
 
-test('a hot tool registration cancels the direct task before tool dispatch', async t => {
-  let h
-  h = await fixture(t, { transport: 'direct', respond: () => {
-    h.ctx.tools.register(defineTool({ name: 'fixture_added_mid_task', description: 'Synthetic registration change', parameters: {},
-      output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] }, execute: async () => ({}) }))
-    return { tools: [{ name: 'fixture_read_a' }] }
-  } })
-  h.runner.submit(proposal())
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }))
-  assertBlocked(h, 1)
-  assert.deepEqual(h.toolCalls, [])
+function registration(ctx, name, execute) {
+  return ctx.tools.register(defineTool({ name, description: 'Isolated registration fixture', parameters: {},
+    output: { schema: { type: 'object', properties: {}, additionalProperties: false },
+      render: () => [{ type: 'text', text: 'Pinned tool completed' }] }, execute }))
+}
+
+for (const revoke of [false, true]) test(revoke
+  ? 'revoking a pinned tool during its execution interrupts the Direct task without replay'
+  : 'unrelated registrations during a pending tool do not change its payload or interrupt it', { timeout: 10000 }, async t => {
+  const entered = Promise.withResolvers(), finish = Promise.withResolvers()
+  const name = 'fixture_pending'
+  let unregister, calls = 0, completed = false
+  const h = await fixture(t, { config: { allowedTools: [name], direct: { agentlessTools: [name] } },
+    setup(ctx) {
+      unregister = registration(ctx, name, async (_args, exec) => {
+        calls++; entered.resolve()
+        await finish.promise
+        exec.signal.throwIfAborted()
+        completed = true
+        return {}
+      })
+    },
+    respond: ({ index }) => index === 1 ? { tools: [{ name }] } : { text: 'Completed once.' } })
+  const plan = proposal()
+  for (const binding of plan.contextGraph.bindings) binding.tools = binding.task === 'a' ? [name] : []
+  h.runner.submit(plan)
+  const run = h.runner.runNext({ expectedRevision: 1 })
+  const result = revoke ? assert.rejects(run, error => error.code === 'DIRECT_TOOL_REGISTRY_CHANGED' && error.message.includes(name)) : run
+  try {
+    await Promise.race([entered.promise, run.then(() => { throw Error('Direct finished before the tool started') })])
+    if (revoke) {
+      unregister()
+      registration(h.ctx, name, () => { throw Error('replacement must not run') })
+    } else {
+      const remove = registration(h.ctx, 'fixture_added_mid_task', () => { throw Error('not authorized') })
+      remove()
+      registration(h.ctx, 'fixture_added_mid_task', () => ({}))
+    }
+  } finally { finish.resolve() }
+  const outcome = await result
+  assert.equal(calls, 1)
+  assert.equal(completed, !revoke)
+  if (revoke) assertBlocked(h, 1)
+  else {
+    assert.equal(outcome.report.text, 'Completed once.')
+    assert.equal(h.backend.requests.length, 2)
+    assert.match(h.backend.requests[1].payload.messages.at(-1).content, /Pinned tool completed/)
+    for (const { payload } of h.backend.requests) assert.deepEqual(payload.tools.map(row => row.function.name), [name])
+  }
 })
 
 for (const transport of ['direct']) test(`${transport} input budget includes host policy and tool schemas`, async t => {

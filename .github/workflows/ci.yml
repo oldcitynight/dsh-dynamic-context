@@ -55,16 +55,22 @@ jobs:
           execFileSync('npm', ['cache', 'add', local], { stdio: 'inherit' })
           NODE
       - run: npm ci --prefer-offline
-      - name: Run the Direct suite on Node 22
-        if: matrix.node == '22.x'
+      - name: Run the complete npm test entry point
         shell: bash
         timeout-minutes: 15
         run: |
-          # Node 22 applies the default timeout to the whole file. The slowest
-          # integration files contain many individually bounded, serial cases.
-          mapfile -t files < <(find test -maxdepth 1 -type f -name '*.test.mjs' ! -name 'native-*.test.mjs' | LC_ALL=C sort)
-          node --test --test-concurrency=4 --test-reporter=tap --test-timeout=180000 "${files[@]}"
-      - name: Run npm test on Node 24
-        if: matrix.node != '22.x'
-        run: npm test
+          if [[ "$(node --version)" == v22.* ]]; then
+            # Node 22 also times the entire file. Retain npm lifecycle hooks,
+            # documentation checks and the matching host compatibility bootstrap.
+            trap 'git restore -- scripts/test.mjs' EXIT
+            python3 - <<'PYTHON'
+          from pathlib import Path
+          runner = Path('scripts/test.mjs')
+          source = runner.read_text()
+          old, new = "'--test-timeout=60000'", "'--test-timeout=180000'"
+          assert source.count(old) == 1, 'Direct test runner timeout changed'
+          runner.write_text(source.replace(old, new))
+          PYTHON
+          fi
+          npm test
       - run: npm pack --dry-run

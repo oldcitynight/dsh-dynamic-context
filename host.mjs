@@ -44,10 +44,10 @@ export async function createDirectHost(input) {
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(Persistence, { root: path.join(config.directory, 'native-sessions') })
     const runtime = config.direct.runtime
-    await ctx.plugin(SandboxPolicy, { mode: runtime.sandboxMode, workspaceRoot: config.projectRoot })
+    await ctx.plugin(SandboxPolicy, { ...(runtime.sandboxMode === 'auto' ? {} : { mode: runtime.sandboxMode }), workspaceRoot: config.projectRoot })
     await ctx.plugin(Filesystem, { cwd: config.projectRoot })
     await ctx.plugin(WorkingDirectory, { defaultDirectory: config.projectRoot })
-    await ctx.plugin(Approval, { policy: runtime.approvalPolicy })
+    await ctx.plugin(Approval, runtime.approvalPolicy === 'auto' ? {} : { policy: runtime.approvalPolicy })
     await ctx.plugin(Subprocess)
     await ctx.plugin(Sandbox)
     await ctx.plugin(ShellEnv, { dshHome: runtime.instructionHomes?.dshHome ?? path.join(config.projectRoot, '.dsh') })

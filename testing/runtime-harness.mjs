@@ -11,11 +11,11 @@ import * as FsObservation from '@deepseek-ai/dsh-fs-observation-policy'
 import { createHarness } from './harness.mjs'
 
 /** Real local execution services; model HTTP is the isolated fake endpoint. */
-export async function createRuntimeHarness({ projectRoot, directory, respond, backend, config = {}, setup, taskGraph = true, mode = 'workspace-write', approval = 'never' }) {
+export async function createRuntimeHarness({ projectRoot, directory, respond, backend, config = {}, setup, taskGraph = true, imageInput = false, mode = 'workspace-write', approval = 'never' }) {
   const direct = config.direct ?? {}
   const runtime = { modules: ['filesystem', 'search', 'shell', 'skills', 'state'], sandboxMode: mode,
     instructionHomes: { dshHome: projectRoot + '/.dsh', agentsHome: projectRoot + '/.agents' }, ...direct.runtime }
-  return createHarness({ projectRoot, directory, respond, backend, taskGraph,
+  return createHarness({ projectRoot, directory, respond, backend, taskGraph, imageInput,
     config: { transport: 'direct', allowedTools: ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'skill', 'dynamic_task_status'],
       ...config, direct: { ...direct, agentlessTools: direct.agentlessTools ?? [], runtime } },
     setup: async ctx => {

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
+import { parseModelJSON } from 'dsh-better-task-grapth/validation'
+import { revisionCheckSchema, validateReview, REVIEW_FEEDBACK_INSTRUCTION } from './review-feedback.mjs'
 import { canonical, copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { modificationReportSchema, validateModificationReport, scopedReviewInput, UPDATE_REPORT_INSTRUCTION, REVIEW_REPORT_INSTRUCTION, revisionEvidenceCatalog, EVIDENCE_POINTER_INSTRUCTION } from './revision-report.mjs'
 import { revisionProposalExamples, revisionReviewExamples } from './format-examples.mjs'
 
-const fail = code => { throw new GraphError(code) }
+const fail = (code, detail) => { throw new GraphError(code, detail) }
 const key = z.string().regex(/^[a-z][a-z0-9_-]{0,79}$/)
 const text = z.string().min(1).refine(value => value.trim().length > 0)
 export const revisionPolicySchema = z.object({ objective: text,
@@ -22,14 +24,12 @@ export const revisionProposalSchema = z.object({
   invalidateReports: z.array(key),
   modificationReport: modificationReportSchema.optional(),
 }).strict()
-export const revisionVerdictSchema = z.object({ verdict: z.enum(['APPROVE', 'REJECT', 'NEEDS_USER']),
-  reason: text, violations: z.array(text),
-}).strict()
+export const revisionVerdictSchema = revisionCheckSchema
 
 export function planDefinition(plan) {
   const keys = new Map(plan.nodes.map(node => [node.id, node.key]))
-  return { title: plan.title, nodes: plan.nodes.map(({ key, kind, label, parent, switchCases }) => ({ key, kind, label,
-    ...(parent === null ? {} : { parent: keys.get(parent) }), ...(switchCases.length ? { switchCases } : {}) })),
+  return { title: plan.title, ...(plan.hierarchy ? { hierarchy: copy(plan.hierarchy) } : {}), nodes: plan.nodes.map(({ key, kind, label, parent, switchCases, terminal, acceptance }) => ({ key, kind, label,
+    ...(parent === null ? {} : { parent: keys.get(parent) }), ...(terminal ? { terminal: keys.get(terminal), acceptance } : {}), ...(switchCases.length ? { switchCases } : {}) })),
   edges: plan.edges.map(({ kind, from, to, outcome, case: selected }) => ({ kind, from: keys.get(from), to: keys.get(to),
     ...(outcome === undefined ? {} : { outcome }), ...(selected === undefined ? {} : { case: selected }) })) }
 }
@@ -83,7 +83,7 @@ function roleContext(role, linked) {
       '根据证据选择 trigger：COUNTEREXAMPLE（反例）、MISSING_DEPENDENCY（遗漏依赖）、CONTEXT_GAP（上下文缺失）或 STALE_REPORT（报告失效）。无需修改时用 NONE，需要用户另行授权时用 USER_CHANGE。',
       '移除尚未开始的任务时，在 retirements 中加入形如 {"task":"old_check","replacements":["new_check"],"reason":"新的检查覆盖原验收条件"} 的记录。invalidateReports 填失效报告对应的任务 key。',
       'NO_CHANGE 或 NEEDS_USER 的两张图均为 null。'].join(' ')
-    : '按审计结论仅输出一个 JSON 对象。APPROVE 的 violations 必须为空。'
+    : '按审计结论仅输出一个 JSON 对象。APPROVE 的 violations 必须为空。' + REVIEW_FEEDBACK_INSTRUCTION
   const grounding = role === 'reviewer'
     ? '输出最小充分的审计依据。REJECT 以可定位的直接反例成立，不要求附加其他可能风险来加强语气，也不必填满 violations 数组。每个保留的问题必须独立指出适用规则、具体输入字段或事实、受影响叶，以及为什么该改动本身违反规则；相同缺陷及其后果不要重复列项。已找到足够支持拒绝的反例时，集中说明它及修复所需边界，不把其他合法修改连带指责为违规。区分已观察的冲突与推测的后果，后果不能替代违规证据。尤其是：移除前置边不等于删除历史；受污染的生成输入不等于未改变的验证机制被削弱；与授权源一致的摘要引用仍可交给宿主核验。APPROVE 说明覆盖与推进路径；REJECT 的主结论正确也不能为无依据的附加理由背书。保持原有 JSON 字段。'
     : '若前次审计意见与宿主 runtimeSemantics 或本次可核对事实冲突，不把错误意见升级为合同；保留原目标，在 reason 中说明该项不采纳的具体依据。修改范围以真实问题为准，不为消除措辞歧义无谓改图。'
@@ -102,7 +102,7 @@ export class RevisionCoordinator {
     if (typeof runRole !== 'function') fail('REVISION_ROLE_RUNNER_REQUIRED')
     this.adapter = adapter; this.runRole = runRole; this.policy = revisionPolicySchema.parse(policy); this.busy = false
   }
-  async run({ expectedRevision, facts, reason, feedback, signal = new AbortController().signal }) {
+  async run({ expectedRevision, facts, reason, feedback, roleRunIds, signal = new AbortController().signal }) {
     if (this.busy) fail('REVISION_SERIAL_EXECUTION_REQUIRED')
     this.busy = true
     try {
@@ -124,9 +124,9 @@ export class RevisionCoordinator {
       const calls = []
       const invoke = async (role, data) => {
         await unchanged()
-        const runId = `revision_${role}_${randomUUID()}`
+        const runId = roleRunIds?.[role] ?? `revision_${role}_${randomUUID()}`
         const scoped = snapshot.supervisionReview?.mode === 'report-scoped-v1'
-        const messages = [{ role: 'system', content: scoped && role === 'reviewer' ? REVIEW_REPORT_INSTRUCTION
+        const messages = [{ role: 'system', content: scoped && role === 'reviewer' ? REVIEW_REPORT_INSTRUCTION + '\n' + REVIEW_FEEDBACK_INSTRUCTION
           : roleContext(role, snapshot.linked) + (scoped ? '\n\n' + UPDATE_REPORT_INSTRUCTION + '\n\n' + EVIDENCE_POINTER_INSTRUCTION : '')
             + '\n\n' + (role === 'updater' ? revisionProposalExamples(snapshot.linked, scoped) : revisionReviewExamples) },
           { role: 'user', content: JSON.stringify(data) }]
@@ -134,7 +134,7 @@ export class RevisionCoordinator {
         calls.push(call)
         const result = await this.runRole({ role, runId, messages: copy(messages), signal })
         signal.throwIfAborted()
-        const value = typeof result === 'string' ? JSON.parse(result) : copy(result)
+        const value = typeof result === 'string' ? parseModelJSON(result, { envelope: true }).value : copy(result)
         call.outputHash = digest(value)
         await unchanged()
         return value
@@ -148,21 +148,21 @@ export class RevisionCoordinator {
           if (snapshot.supervisionReview?.mode === 'report-scoped-v1') validateModificationReport(snapshot, proposal, facts)
           return { status: proposal.disposition, proposal, roles: calls }
         }
-        if (proposal.trigger === 'NONE' || proposal.trigger === 'USER_CHANGE') fail('REVISION_NEW_AUTHORIZATION_REQUIRED')
+        if (proposal.trigger === 'NONE' || proposal.trigger === 'USER_CHANGE') fail('REVISION_NEW_AUTHORIZATION_REQUIRED', { path: '/trigger', reason: 'A revision needs a concrete evidence trigger; NONE cannot revise, and USER_CHANGE needs user authorization.', observed: proposal.trigger })
         if (!proposal.evidenceIds.length || new Set(proposal.evidenceIds).size !== proposal.evidenceIds.length
-            || proposal.evidenceIds.some(id => !facts.some(fact => fact.id === id))) fail('REVISION_UNKNOWN_EVIDENCE')
+            || proposal.evidenceIds.some(id => !facts.some(fact => fact.id === id))) fail('REVISION_UNKNOWN_EVIDENCE', { path: '/evidenceIds', reason: 'A revision requires unique IDs of facts supplied in this request.', supplied: proposal.evidenceIds, allowed: facts.map(fact => fact.id) })
         if (!proposal.taskGraph || snapshot.linked !== Boolean(proposal.contextGraph)
-            || !snapshot.linked && proposal.invalidateReports.length) fail('REVISION_MODE_MISMATCH')
+            || !snapshot.linked && proposal.invalidateReports.length) fail('REVISION_MODE_MISMATCH', { path: '/contextGraph', reason: 'REVISE must provide taskGraph and match the current linked or standalone mode; standalone mode cannot invalidate dynamic reports.', linked: snapshot.linked })
         const tasks = new Set(proposal.taskGraph.nodes?.filter(node => node.kind === 'leaf').map(node => node.key))
         if (proposal.coverage.length !== this.policy.requirements.length || new Set(proposal.coverage.map(row => row.requirement)).size !== proposal.coverage.length
             || this.policy.requirements.some(row => !proposal.coverage.some(item => item.requirement === row.id))
-            || proposal.coverage.some(row => row.tasks.some(task => !tasks.has(task)))) fail('REVISION_REQUIREMENT_COVERAGE')
+            || proposal.coverage.some(row => row.tasks.some(task => !tasks.has(task)))) fail('REVISION_REQUIREMENT_COVERAGE', { path: '/coverage', reason: 'Cover each fixed requirement exactly once using only declared leaf keys.', required: this.policy.requirements.map(row => row.id), allowedTasks: [...tasks], supplied: proposal.coverage })
         const removed = snapshot.taskGraph.nodes.filter(node => node.kind === 'leaf' && !tasks.has(node.key)).map(node => node.key)
         if (new Set(proposal.retirements.map(row => row.task)).size !== proposal.retirements.length
             || canonical([...removed].sort()) !== canonical(proposal.retirements.map(row => row.task).sort())
-            || proposal.retirements.some(row => row.replacements.some(task => !tasks.has(task)))) fail('REVISION_RETIREMENT_COVERAGE')
+            || proposal.retirements.some(row => row.replacements.some(task => !tasks.has(task)))) fail('REVISION_RETIREMENT_COVERAGE', { path: '/retirements', reason: 'Every removed leaf must be listed exactly once with existing replacement leaf tasks.', removed, allowedTasks: [...tasks], supplied: proposal.retirements })
         prepared = await this.adapter.prepare(proposal)
-        if (prepared.effect === false) fail('REVISION_NO_EFFECT')
+        if (prepared.effect === false) fail('REVISION_NO_EFFECT', { path: '/taskGraph', reason: 'The proposed graphs do not change the current effective plan; return NO_CHANGE when no revision is necessary.' })
         if (snapshot.supervisionReview?.mode === 'report-scoped-v1') reportValidation = validateModificationReport(snapshot, proposal, facts)
       } catch (error) {
         if (!this.adapter.rejectProposal) throw error
@@ -178,7 +178,7 @@ export class RevisionCoordinator {
           recheckedBeforeCommit: ['evidence_hash', 'controller_authority', 'current_revision', 'tool_authorization'] }
       const reviewInput = reportValidation ? scopedReviewInput({ contract: base.contract, snapshot, proposal, validated: reportValidation, programValidation })
         : { ...base, proposal, proposalHash, programValidation }
-      const verdict = revisionVerdictSchema.parse(await invoke('reviewer', reviewInput))
+      const verdict = validateReview('reviewer', await invoke('reviewer', reviewInput), reviewInput)
       if (verdict.verdict !== 'APPROVE') return { status: verdict.verdict, proposal, verdict, roles: calls }
       if (verdict.violations.length) fail('REVISION_APPROVAL_HAS_UNRESOLVED_VIOLATIONS')
       await unchanged()

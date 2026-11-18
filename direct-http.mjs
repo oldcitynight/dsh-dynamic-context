@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { fail } from './core.mjs'
-import { checkUsage } from './api-protocol.mjs'
+import { checkUsage, directProtocol } from './api-protocol.mjs'
+import { readMessages } from './messages-stream.mjs'
+import { isContextWindowExceededError } from '@deepseek-ai/dsh-llm'
 
 /** Parse bounded OpenAI/llama SSE. A partial stream is never a successful answer. */
-export async function readCompletion(response, { signal, model, direct, maxResponseBytes, onProgress }) {
+export async function readCompletion(response, { signal, model, direct, maxResponseBytes, onProgress, onDelta }) {
   if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream')) {
     const chunks = [], reader = response.body?.getReader()
     let bytes = 0, timer, truncated = false
@@ -25,12 +27,14 @@ export async function readCompletion(response, { signal, model, direct, maxRespo
     try { supplied = JSON.parse(body).error } catch {}
     const providerError = { httpStatus: response.status, type: supplied?.type, code: supplied?.code,
       message: String(supplied?.message ?? body).slice(0, 4096), bodyTruncated: truncated || body.length > 4096 }
-    const overflow = response.status === 400 && (supplied?.code === 'context_length_exceeded'
-      || /maximum context length is \d+ tokens/i.test(providerError.message))
+    const overflow = [400, 413].includes(response.status) && (supplied?.code === 'context_length_exceeded'
+      || /maximum context length is \d+ tokens/i.test(providerError.message)
+      || directProtocol(direct) === 'messages' && isContextWindowExceededError(`${supplied?.type ?? ''} ${supplied?.code ?? ''} ${providerError.message}`))
     const code = overflow ? 'DIRECT_CONTEXT_LENGTH_EXCEEDED' : response.ok ? 'DIRECT_EXPECTED_SSE' : `DIRECT_HTTP_STATUS_${response.status}`
     throw Object.assign(Error(code), { code, providerError,
       directReceipt: { httpStatus: response.status, responseRejected: !response.ok, terminated: false } })
   }
+  if (directProtocol(direct) === 'messages') return readMessages(response, { signal, model, direct, maxResponseBytes, onProgress, onDelta })
   const decoder = new TextDecoder('utf-8', { fatal: true }), calls = new Map()
   let buffer = '', bytes = 0, done = false, finish = null, text = '', reasoning = '', usage = null, responseId = null
   try {
@@ -78,6 +82,8 @@ export async function readCompletion(response, { signal, model, direct, maxRespo
         if (call.id.length > 128 || call.function.name.length > 128 || maxResponseBytes !== null && call.function.arguments.length > 32768) fail('DIRECT_TOOL_FRAGMENT_LIMIT')
         calls.set(part.index, call)
       }
+      // Observation follows validation and cannot change request execution.
+      try { onDelta?.({ text: delta.content ?? '', reasoning: delta.reasoning_content ?? delta.reasoning ?? '', tools: delta.tool_calls ?? [] }) } catch {}
       if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
         if (finish !== null) fail('DIRECT_DUPLICATE_FINISH')
         finish = choice.finish_reason

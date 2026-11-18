@@ -1,3 +1,7 @@
+import { createRequire } from 'node:module'
+import path from 'node:path'
+import { patchNativeSession } from './patch-native-session.mjs'
+patchNativeSession(path.resolve(path.dirname(createRequire(import.meta.url).resolve('@deepseek-ai/dsh/package.json')), '../..'))
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
 import { spawn } from 'node:child_process'

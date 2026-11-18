@@ -15,12 +15,13 @@ export async function startFakeLlama({ respond, maxRequests = 64, maxRequestByte
       if (req.method !== 'POST' || req.url !== '/v1/chat/completions') {
         res.writeHead(404); res.end(); return
       }
-      let bytes = 0, body = ''
+      let bytes = 0; const chunks = []
       for await (const chunk of req) {
         bytes += chunk.length
         if (bytes > maxRequestBytes) throw new Error('FAKE_LLAMA_REQUEST_BYTE_LIMIT')
-        body += chunk
+        chunks.push(chunk)
       }
+      const body = Buffer.concat(chunks).toString('utf8')
       const payload = JSON.parse(body), index = requests.length + 1
       if (index > maxRequests || payload.stream !== true || !Array.isArray(payload.messages)) throw new Error('FAKE_LLAMA_UNEXPECTED_REQUEST')
       const record = { index, method: req.method, path: req.url, payload, rawBody: body, completed: false }
@@ -38,9 +39,10 @@ export async function startFakeLlama({ respond, maxRequests = 64, maxRequestByte
       if (output.status) { res.writeHead(output.status, output.headers); res.end(output.body ?? ''); return }
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
       if (output.rawSSE !== undefined) {
-        for (const chunk of Array.isArray(output.rawSSE) ? output.rawSSE : [output.rawSSE]) {
+        for (const [fragment, chunk] of (Array.isArray(output.rawSSE) ? output.rawSSE : [output.rawSSE]).entries()) {
           if (res.destroyed) return
           res.write(chunk)
+          await output.afterFragment?.(fragment)
           if (output.fragmentDelayMs) await delay(output.fragmentDelayMs)
         }
         record.completed = true; res.end(); return
@@ -60,7 +62,7 @@ export async function startFakeLlama({ respond, maxRequests = 64, maxRequestByte
       if (output.text !== undefined) send({ content: output.text })
       if (output.disconnect) { res.destroy(); return }
       send({}, output.finishReason ?? (output.tools?.length ? 'tool_calls' : 'stop'))
-      res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`)
+      res.write(`data: ${JSON.stringify({ choices: [], usage: output.usage ?? { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`)
       record.completed = true
       res.end('data: [DONE]\n\n')
     } catch (error) {
@@ -69,6 +71,9 @@ export async function startFakeLlama({ respond, maxRequests = 64, maxRequestByte
       res.end(JSON.stringify({ error: { message: error.message, type: 'synthetic_backend_error' } }))
     }
   })
+  // Long local scenarios can spend time checking files between two HTTP calls.
+  // Keep idle test sockets alive until the fixture explicitly closes them.
+  server.keepAliveTimeout = 120000
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   return { origin: `http://127.0.0.1:${server.address().port}`, requests, errors, routes,

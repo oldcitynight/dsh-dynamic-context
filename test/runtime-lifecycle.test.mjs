@@ -128,8 +128,10 @@ test('explicit checkpoint recovery recognizes only the known close defect and pr
     events: [{ seq: 0, type: 'assistant/response', data: response }, { seq: 1, type: 'tool/call', data: { callId: 'first' } },
       { seq: 2, type: 'tool/result', data: { callId: 'first', content: [{ type: 'text', text: 'Partial output; timed out.' }] } }] }
   const original = JSON.stringify({ state, trace })
-  const journal = { latestCheckpoint: () => ({ checksum: 'safe' }), latest: () => ({ checksum: 'blocked' }),
-    loadCheckpoint: () => structuredClone(state), readTrace: () => structuredClone(trace) }
+  const journal = { inspectHead: () => ({ checkpoint: { checksum: 'safe' }, head: { checksum: 'blocked' } }),
+    assertHeadUnchanged: head => assert.equal(head.checksum, 'blocked'),
+    loadResumeCheckpoint: async record => { assert.equal(record.checksum, 'safe'); return structuredClone(state) },
+    readTrace: () => structuredClone(trace) }
   const ctx = { agents: new Map(), get: () => ({ open: async () => { const error = Error('stored log is corrupt: step/end leaves unresolved tool call suffix'); error.name = 'SessionPersistenceCorruptionError'; throw error } }) }
   const recovered = await recoverDirectCheckpoint({ journal, ctx })
   assertReleasedV4Relationships(recovered.state.runtime.native, KNOWN_SESSION_EVENT_TYPES)

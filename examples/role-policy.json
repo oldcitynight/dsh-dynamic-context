@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "roleStrategies": { "group_audit": "whitelist" },
+  "skills": [
+    { "registrationId": "review-method", "role": "reviewer", "file": "skills/blueprint-review/SKILL.md" }
+  ],
+  "roleTools": [
+    { "role": "group_audit", "mode": "whitelist", "priority": 10, "tools": [
+      { "toolId": "example_records", "when": { "/action": "read" } },
+      { "toolId": "example_records", "when": { "/action": "list" } }
+    ] },
+    { "role": "group_audit", "mode": "blacklist", "priority": 10, "tools": [
+      { "toolId": "example_records", "when": { "/options/private": true } }
+    ] }
+  ],
+  "toolErrors": {
+    "mode": "blacklist",
+    "includeDefaults": true,
+    "rules": [
+      "example_storage_commit",
+      { "toolId": "example_records", "errorCode": "STORE_CORRUPT", "reason": "检查记录库后继续。" }
+    ]
+  }
+}

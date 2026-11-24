@@ -1,6 +1,10 @@
 {
   "name": "dsh-dynamic-context",
-  "version": "0.1.1-rc.67",
+  "version": "0.1.2-rc.8",
+  "workflowCompatibilityEpoch": 1,
+  "os": [
+    "linux"
+  ],
   "description": "Task-scoped direct model execution, native tools and durable context checkpoints for DeepSeek Harness",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -10,6 +14,8 @@
     "nativeEvidenceCompaction": 1,
     "toolErrorPolicy": 2,
     "roleExtensions": 1,
+    "negotiatedToolPolicies": 1,
+    "roleModelBackends": 1,
     "userGuidance": 1,
     "formattedReports": 1,
     "streamingArchiveAudit": 1,
@@ -27,11 +33,14 @@
     "./testing": "./testing/runtime-harness.mjs",
     "./client": "./client.js",
     "./tool-error-policy": "./tool-error-policy.mjs",
+    "./tool-policies": "./role-configuration.mjs",
+    "./role-models": "./role-models.mjs",
     "./role-policy": "./role-policy.mjs",
     "./role-tool-defaults": "./role-tool-defaults.mjs"
   },
   "files": [
     "index.mjs",
+    "recovery-versions.mjs",
     "core.mjs",
     "host.mjs",
     "control-tools.mjs",
@@ -88,6 +97,7 @@
     "execution-output.mjs",
     "client.js",
     "client.source.mjs",
+    "tool-display-names.mjs",
     "DSH-VALUES-LICENSE.txt",
     "report-draft.mjs",
     "performance.mjs",
@@ -98,12 +108,16 @@
     "review-feedback.mjs",
     "directory-evidence.mjs",
     "blockage-protocol.mjs",
+    "blockage-diagnosis.mjs",
     "blockage-evidence.mjs",
     "blockage-runtime.mjs",
     "BLOCKAGE-HANDLER.md",
     "hierarchy-protocol.mjs",
     "hierarchy-context.mjs",
     "hierarchy-runtime.mjs",
+    "unit-roles.mjs",
+    "unit-baseline.mjs",
+    "context-budget.mjs",
     "HIERARCHICAL-WORKFLOW.md",
     "acceptance-protocol.mjs",
     "receipt-selection.mjs",
@@ -119,6 +133,11 @@
     "tool-error-policy.mjs",
     "TOOL-ERROR-POLICY.md",
     "role-policy.mjs",
+    "role-configuration.mjs",
+    "role-models.mjs",
+    "direct-connection.mjs",
+    "policy-selectors.mjs",
+    "policies",
     "guidance-state.mjs",
     "user-guidance.mjs",
     "progress-report.mjs",
@@ -132,6 +151,20 @@
     "image-content.mjs",
     "settings.mjs",
     "settings-client.mjs",
+    "unit-limits.mjs",
+    "unit-storage.mjs",
+    "role-input-index.mjs",
+    "workflow-database.mjs",
+    "workflow-format.mjs",
+    "workflow-backup.mjs",
+    "workflow-io.mjs",
+    "workflow-backup-worker.mjs",
+    "WORKFLOW-STORAGE.md",
+    "rule-editor.mjs",
+    "rule-protocol.mjs",
+    "rule-audit.mjs",
+    "PREREQUISITE-RULES.md",
+    "docs/UNIT_WORKFLOW_20261123.html",
     "native-records.mjs"
   ],
   "engines": {
@@ -149,10 +182,13 @@
     "prepack": "npm run build",
     "docs:sync": "node scripts/release-docs.mjs --write",
     "docs:check": "node scripts/release-docs.mjs --check",
-    "tools:check": "node scripts/check-role-tools.mjs"
+    "tools:check": "node scripts/check-role-tools.mjs",
+    "test:hotpaths": "node scripts/test-hotpaths.mjs",
+    "test:storage": "node --test test/workflow-database.test.mjs test/workflow-storage-runtime.test.mjs"
   },
   "dependencies": {
     "undici": "8.11.2",
+    "yaml": "2.9.1",
     "zod": "4.6.7"
   },
   "peerDependencies": {
@@ -160,7 +196,7 @@
     "@deepseek-ai/dsh-credentials-local": "0.2.0-rc.2 || 0.2.0-rc.1",
     "@deepseek-ai/dsh-authorization": "0.2.0-rc.2 || 0.2.0-rc.1",
     "@deepseek-ai/dsh-deepseek-account-platform": "0.2.0-rc.2 || 0.2.0-rc.1",
-    "dsh-better-task-grapth": "0.3.1-rc.67",
+    "dsh-better-task-grapth": "0.3.2-rc.8",
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2 || 0.2.0-rc.1",
     "@deepseek-ai/dsh-agent-instructions": "0.2.0-rc.2 || 0.2.0-rc.1",
@@ -193,7 +229,9 @@
     "@deepseek-ai/dsh-session-format-v3-to-v4": "0.2.0-rc.2 || 0.2.0-rc.1",
     "@deepseek-ai/dsh-session-stats": "0.2.0-rc.2 || 0.2.0-rc.1",
     "@deepseek-ai/schemastery": "3.18.5",
-    "@deepseek-ai/dsh-compaction-image-offload": "0.2.0-rc.2 || 0.2.0-rc.1"
+    "@deepseek-ai/dsh-compaction-image-offload": "0.2.0-rc.2 || 0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm-retry": "0.2.0-rc.2 || 0.2.0-rc.1",
+    "@deepseek-ai/dsh-app-boot": "0.2.0-rc.2 || 0.2.0-rc.1"
   },
   "dsh": {
     "bundle": {
@@ -214,7 +252,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.2.0-rc.2",
-    "dsh-better-task-grapth": "0.3.1-rc.67",
+    "dsh-better-task-grapth": "0.3.2-rc.8",
     "@deepseek-ai/dsh-util-values": "0.2.0-rc.2"
   },
   "homepage": "https://github.com/oldcitynight/dsh-dynamic-context#readme",

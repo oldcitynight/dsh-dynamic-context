@@ -7,11 +7,12 @@ const imageOnly = Config({ read: false, readImage: true, write: false, edit: fal
 
 function nativeDefinition(services) {
   let definition
-  const view = { ...services, tools: { register(tool) { if (tool.name === 'read_image') definition = tool } } }
-  // This host registers the text suite on its outer scope. Only the
-  // attachment-gated child registration is used by a read-only review.
-  apply({ fs: {}, systemPrompt: { section() {}, getSectionOrder: () => 0 }, tools: { register() {} },
-    inject(_services, mount) { mount(view) } }, imageOnly)
+  const view = {
+    fs: {}, ...services, tools: { register(tool) { if (tool.name === 'read_image') definition = tool } },
+    systemPrompt: { getSectionOrder: () => 0, section() {} },
+    inject(_services, mount) { mount(view) },
+  }
+  apply(view, imageOnly)
   return definition
 }
 export const nativeImageDescription = nativeDefinition({}).description

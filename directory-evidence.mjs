@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { writeStored, readStored, hasStored } from './workflow-io.mjs'
 // Host-owned directory identity. No model-generated exclusions or filesystem effects.
 import fs from 'node:fs'
 import path from 'node:path'
@@ -72,9 +73,9 @@ export function issueDirectorySnapshot(config, requested, signal, pathGuard) {
   const body = { path: relative, hashScheme, sha256, entries }, record = { ...body, checksum: digest(body) }
   const file = storePath(config, relative, sha256)
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  if (fs.existsSync(file)) {
-    if (canonical(JSON.parse(fs.readFileSync(file, 'utf8'))) !== canonical(record)) reject('DIRECTORY_SNAPSHOT_RECEIPT_CHANGED', relative, 'The saved directory receipt differs from its immutable content.')
-  } else {
+  if (hasStored(file)) {
+    if (canonical(JSON.parse(readStored(file, 'utf8'))) !== canonical(record)) reject('DIRECTORY_SNAPSHOT_RECEIPT_CHANGED', relative, 'The saved directory receipt differs from its immutable content.')
+  } else if (!writeStored(file, JSON.stringify(record), {exclusive:true})) {
     const fd = fs.openSync(file, 'wx', 0o600)
     try { fs.writeFileSync(fd, JSON.stringify(record)); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
     const dir = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dir) } finally { fs.closeSync(dir) }
@@ -85,8 +86,8 @@ export function issueDirectorySnapshot(config, requested, signal, pathGuard) {
 }
 export function directoryDifference(config, current, expectedHash) {
   const file = storePath(config, current.path, expectedHash)
-  if (!fs.existsSync(file)) return { baselineAvailable: false }
-  const { checksum, ...before } = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (!hasStored(file)) return { baselineAvailable: false }
+  const { checksum, ...before } = JSON.parse(readStored(file, 'utf8'))
   if (digest(before) !== checksum || before.hashScheme !== DIRECTORY_HASH_SCHEME || before.path !== current.path
       || before.sha256 !== expectedHash || directoryDigest(before.entries) !== expectedHash)
     reject('DIRECTORY_SNAPSHOT_RECEIPT_CHANGED', current.path, 'The original directory receipt failed its integrity check.')

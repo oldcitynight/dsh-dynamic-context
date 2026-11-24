@@ -1,28 +1,146 @@
-# 角色扩展与用户引导协议 v1
+# 角色上下文、工具扩展与用户引导协议
+
+### 预装上下文和动态材料的大小
+
+`workflowLimits.preloadBytes` 按 UTF-8 字节计，默认 10,240（10 KiB）。外部 Skill 和插件提供者的文本在装配前校验，每个请求实际生效的替换、追加文本及连接分隔符也要合计校验。超过上限的注册或装配会明确报错。随包职责说明由插件维护。
+
+`workflowLimits.dynamicMaterialBytes` 是一次装配共享事实、执行报告、历史及其他背景材料的总字节预算，默认 65,536 字节。超限时提供来源摘要、字节数、SHA-256 和分页参数。角色后台使用 `dynamic_context_read_evidence`，执行者使用 `dynamic_context_source_read`，控制器和首次规划者使用各自状态或历史工具。应使用当前请求返回的工具和标识，按返回的下一偏移继续读取。配置的模型后端、角色权限及原文可见范围继续生效。
+
 
 此协议由动态上下文插件提供。任务图基础插件只增加通用的 `suspend` / `resolveSuspension` 事务端口，不包含 Skill、角色或引导业务；未使用端口的独立任务图行为不变。
+
+## 随插件分发的默认上下文
+
+插件配置项 `rolePolicyFile` 指定宿主管理的 JSON 文件。相对路径从 `projectRoot` 解析。每个 `skills[].file` 从该 JSON 文件所在目录解析，可直接指向 Skill 包内的 `SKILL.md`。插件启动时读取正文，去掉 YAML front matter，默认以 `replace` 装配。配置或 Skill 文件变更在下次加载插件时生效。可运行的配置和配套 Skill 在 [examples/role-policy.json](./examples/role-policy.json)。
+
+每条声明指定 `role`，可选 `slot`、`scope`、`priority`、`registrationId`、`skillId` 和 `mode`。缺省槽位为 `role`。每个槽位分别选择优先级最高的替换，再追加匹配声明。多个插件的同优先级声明按插件和注册 ID 排序。宿主保留用户原始输入、目标、实时权限、上下文图事实、证据、历史回执和输出校验。执行者的工作指引附在任务输入中，修订、审计和引导角色的工作指引装入系统消息。
+
+| 角色 | 可替换的默认材料 |
+|---|---|
+| `controller` | `entry` 模式入口说明、`role` 当前模式与交接指引 |
+| `preplanning` | `role` 初始探查、规划与规则编写指引 |
+| `executor`、`result_work` | `role` 已装配任务前的工作与报告指引、`runtime` Direct 原生执行环境的随包说明 |
+| `unit_planner`、`unit_plan_audit`、`unit_rebaseline`、`unit_audit`、`unit_router`、`baseline_audit`、`result_check`、`result_repair`、`plan_check`、`updater`、`reviewer`、`blockage`、`blockage_audit`、`group_audit`、`scope_plan`、`scope_update`、`scope_audit`、`scope_blockage`、`scope_pause`、`task_reporter`、`progress_reporter`、`guidance_intake`、`guidance_router` | `role` 角色指引、`tools` 报告草稿操作指引、`archive` 证据归档导航 |
+| `compaction` | `role` 检查点指引、`archive` 审查资料压缩指引、`image` 图像核验指引 |
+
+`ROLE_CONTEXT_SLOTS` 导出相同目录。使用不存在的角色或该角色没有的槽位会在注册时报告错误。宿主插件可动态生成某个槽位的正文。同步提供者在装配时获得角色、槽位、只读作用域和默认正文，可以返回正文或 `undefined`。需要异步获取材料的插件可先在自己的服务中获取，再由提供者读取。已签发并持久化的角色请求复用当时的装配结果。
+
+```js
+ctx.effect(() => ctx.get('dynamicContextRolePrompts').registerProvider({
+  pluginId: 'records', registrationId: 'audit-method', role: 'group_audit',
+  slot: 'role', mode: 'append', priority: 10,
+  assemble: ({ scope }) => methods.get(scope.workflowId),
+}))
+```
+
+## 角色模型与 API 后端
+
+单元路由者 `unit_router` 与基线审计者 `baseline_audit` 均为独立 Direct 角色。前者决定当前可执行单元直接交给执行者还是先回本层规划，后者核对单个既有单元的旧基线、新基线和修改依据。两者都提供 `role`、`tools`、`archive` 三个上下文槽位。默认工具策略为白名单，允许角色申报、读取当前角色证据及 `read_image`。第三方可登记具有 `read` 效果的工具回调。按 DSH 登记 ID 增减名单、按操作过滤及错误转交沿用下文协议。
+
+以下为 `rolePolicyFile` 的配置示例。Skill 路径相对于配置文件，两个后端可分别指向不同 API。
+
+```json
+{
+  "version": 1,
+  "skills": [
+    { "role": "unit_router", "slot": "role", "mode": "replace", "file": "skills/unit-routing/SKILL.md" },
+    { "role": "baseline_audit", "slot": "role", "mode": "append", "file": "skills/baseline-review/SKILL.md" }
+  ],
+  "roleStrategies": { "unit_router": "whitelist", "baseline_audit": "whitelist" },
+  "modelBackends": {
+    "routing": { "model": "routing-model", "direct": { "endpoint": "http://127.0.0.1:8080/v1/chat/completions" } },
+    "audit": { "model": "audit-model", "direct": { "endpoint": "http://127.0.0.1:8081/v1/chat/completions" } }
+  },
+  "roleModels": { "unit_router": "routing", "baseline_audit": "audit" }
+}
+```
+
+其他插件可在某个单元上追加审计指引，调整模型，并按宿主工具 ID 登记允许的操作。下例的 `taskId` 取自当前工作流，`audit` 引用上面的后端。对容器的验收基线登记 `scopeId`，对叶的执行指令登记 `taskId`。返回的撤销函数可交给 `ctx.effect` 管理。
+
+```js
+const role = 'baseline_audit'
+const scope = { workflowId, taskId }
+ctx.effect(() => ctx.get('dynamicContextRolePrompts').registerProvider({
+  pluginId: 'records', registrationId: 'baseline-method', role, scope,
+  slot: 'role', mode: 'append', priority: 20, assemble: () => '逐项核对当前验收指令与原始用户条件。'
+}))
+ctx.effect(() => ctx.get('dynamicContextRoleModels').register({
+  pluginId: 'records', registrationId: 'baseline-model', role, scope, priority: 20, backend: 'audit'
+}))
+const id = ctx.tools.get('record_store', agent).name
+const target = ctx.get('dynamicContextToolPolicies').forTool(id, { agent })
+  .getStrategy({ target: 'roleTools', role, scope })
+if (target.mode === 'whitelist') ctx.effect(() => target.register({
+  pluginId: 'records', registrationId: 'baseline-read', priority: 20, when: { '/operation': 'read' }
+}))
+```
+
+在 `rolePolicyFile` 指定的 JSON 文件中，`modelBackends` 定义可复用的后端，`roleModels` 按角色 ID 引用后端名，也可直接填写后端对象。上表中有 27 个角色可独立选择模型。`compaction` 始终使用触发角色当次的模型和 API 后端，单独为它配置或登记后端会收到 `ROLE_MODEL_INHERITED`。例如，执行者可在本地 Chat Completions 接口执行并压缩，结果审计者可在另一套 Messages 接口审计并压缩。[完整配置示例](./examples/role-models.json)
+
+| 调用方式 | 配置方式 |
+|---|---|
+| DSH 原生会话，包括控制器和首次预规划 | `provider` 填 DSH 已登记的提供方 ID，`model` 填该提供方的模型 ID。地址和凭据由这个提供方管理。仅填写 `model` 时沿用当前提供方。|
+| Direct 执行、审计与其他独立角色 | 仅填写 `model` 可共用原有连接。切换 API 时填写完整 `direct.endpoint`，按需指定 `api`、`protocol`、`auth`、`apiKeyEnv`、思考与采样设置。新连接只使用其自身的认证设置，`apiKeyEnv` 填凭据引用名。更换 Direct 提供方 ID 须同时指定连接。|
+
+配置文件在插件加载时读取。宿主插件可通过 Cordis 服务 `dynamicContextRoleModels` 动态登记一条选择。`register` 返回撤销函数。`resolve(role, scope)` 返回命中的 `backend`、来源和可选的 `backendId`，返回 `null` 表示沿用宿主已有路线。`list()` 提供文件配置、插件登记和压缩继承关系的副本。可选范围包括 `workflowId`、`sessionId`、`scopeId`、`taskId`，填写的字段须全部匹配。
+
+```js
+const models = ctx.get('dynamicContextRoleModels')
+ctx.effect(() => models.register({
+  pluginId: 'example.review', registrationId: 'audit-for-workflow',
+  role: 'result_check', scope: { workflowId: 'workflow_example' },
+  priority: 20, backend: 'audit'
+}))
+const effective = models.resolve('result_check', { workflowId: 'workflow_example' })
+```
+
+匹配的插件登记优先于角色的文件设置。多个插件同时命中时取最高 `priority`，同分时按插件 ID 和登记 ID 的稳定顺序取后者，登记顺序不影响结果。撤销后，新调用使用下一条匹配登记、文件设置或宿主默认。已开始的 Direct 单元和审计将有效连接、模型及凭据引用随检查点保存，重试和恢复继续使用同一份配置。独立预规划会话也保存所选 DSH 提供方与模型。控制器在每次原生请求准备时重新解析，在普通对话中沿用 DSH 的选择。
+
+## 工具功能级准入
+
+随包角色策略与工具清单在 [policies/role-defaults.json](./policies/role-defaults.json)。宿主可在 `rolePolicyFile` 的 `roleStrategies` 以角色 ID 为键设置 `whitelist` 或 `blacklist`，在 `roleTools` 手动追加整工具或参数规则。其他插件使用 Cordis 服务 `dynamicContextToolPolicies`。
+
+先从 DSH 取得当前可见定义的 `name`，再用 `forTool(id)` 绑定该登记 ID。对于登记在特定 Agent 下的工具，读取定义和绑定时传入同一 Agent。随后调用 `getStrategy` 取得目标位置的实际 `mode` 及其 `register` 方法。每次登记都与查询的工具 ID、目标和模式绑定。工具定义在这两步之间被撤销或替换时，调用者须重新绑定和查询。插件自己的 `registrationId` 用于撤销和追溯这一条声明。
+
+```js
+const toolId = ctx.tools.get('example_records').name
+const tool = ctx.get('dynamicContextToolPolicies').forTool(toolId)
+const audit = tool.getStrategy({ target: 'roleTools', role: 'group_audit' })
+// 该插件希望审计者可读已核验记录，且禁止修改。
+const operation = audit.mode === 'whitelist'
+  ? { '/action': 'read', '/options/verified': true } : { '/action': 'edit' }
+ctx.effect(() => audit.register({
+  pluginId: 'records', registrationId: 'audit-records', priority: 20, when: operation,
+}))
+
+const errors = tool.getStrategy({ target: 'toolErrors' })
+const errorType = errors.mode === 'blacklist' ? 'CorruptStore' : 'RecordMissing'
+ctx.effect(() => errors.register({
+  pluginId: 'records', registrationId: 'record-errors', priority: 20, errorType,
+}))
+```
+
+字符串条目匹配整工具，对象条目按调用参数内的 JSON Pointer 精确匹配。一个对象的条件全部满足才命中。不同条目可代表不同功能，缺失字段与 `null` 有区别。
+`priority` 为整数，缺省为 0。每个登记位置按当前角色和作用域，分别选取该工具 ID 的最高优先级，再判断操作或错误条件。因此优先级 20 的“只读”白名单可覆盖优先级 5 的“整个工具”。同级追加白名单合并允许的操作，匹配的同级禁用或暂停优先。撤销最后一条高优先级登记后，下层登记重新生效。其他 ID、其他角色及另一类名单分别计算。
+
+省略 `when` 表示整个工具。显式 `combine: "restrict"` 的白名单还限定整个角色可见的工具范围，旧 `toolIds` 写法保留这一交集语义。工具须已在该角色的宿主环境中挂载，并满足任务绑定、角色权限与宿主授权。模型请求固定签发时的权限，实际派发也检查当前权限。
 
 ## Skill 插件扩展
 
 宿主插件通过 `ctx.get('dynamicContextRolePrompts')` 和 `ctx.get('dynamicContextRoleTools')` 注册。注册接口不作为模型工具开放；Skill 文件中的文字本身不能注册权限。
 
 ```js
-import { ROLE_PROMPTS_SERVICE, ROLE_TOOLS_SERVICE } from 'dsh-dynamic-context/role-policy'
-export const inject = [ROLE_PROMPTS_SERVICE, ROLE_TOOLS_SERVICE]
+import { ROLE_PROMPTS_SERVICE } from 'dsh-dynamic-context/role-policy'
+export const inject = [ROLE_PROMPTS_SERVICE]
 export function apply(ctx) {
   const prompts = ctx.get(ROLE_PROMPTS_SERVICE)
-  const tools = ctx.get(ROLE_TOOLS_SERVICE)
   const disposePrompt = prompts.register({
     pluginId: 'example/research-skill', registrationId: 'leaf-research',
     role: 'executor', mode: 'append', priority: 10,
     text: '对于有多种合理实现的开放问题，比较证据与代价后，在本叶边界内自主选择。',
     // scope 可限定 workflowId、sessionId、taskId、scopeId；省略表示全局。
   })
-  const disposePolicy = tools.register({
-    pluginId: 'example/research-skill', registrationId: 'audit-tools',
-    role: 'group_audit', mode: 'blacklist', toolIds: ['example_remote_lookup'],
-  })
-  ctx.on('dispose', () => { disposePolicy(); disposePrompt() })
+  ctx.on('dispose', disposePrompt)
 }
 ```
 
@@ -30,11 +148,11 @@ export function apply(ctx) {
 
 `ROLE_CONTRACTS` 导出全部角色及工具效果上限。包括 controller、preplanning、executor、result_work、result_check、result_repair、plan_check、updater、reviewer、blockage、blockage_audit、group_audit、scope_plan、scope_update、scope_audit、scope_blockage、scope_pause、task_reporter、progress_reporter、guidance_intake、guidance_router、compaction。
 
-初始规划和执行默认在宿主能力内用黑名单收窄；审查、报告和路由角色默认只见各自的只读或申报工具。完整默认填写见 [ROLE-TOOL-DEFAULTS.md](./ROLE-TOOL-DEFAULTS.md)，覆盖当前原生及两插件的 98 个工具 ID。可通过 `tools.defaults(role)` 查询精确默认名单，或 `npm run tools:check` 离线核查覆盖。多份白名单取交集，黑名单优先；名单不能凭空授予工具。显示和真正分派均检查，发送后撤销工具也会在调用前生效。已有请求的提示词快照固定，更新注册不偷偷改变暂停中的旧请求。压缩角色可以通过内建 `read_image` 读取图片证据后生成检查点，其工具名单也接受收窄策略；原生检查点协议不承接其他插件的执行回调。提示词扩展不能授予业务执行或审计权限。
+初始规划和执行的默认策略为黑名单，审查、报告和路由角色使用白名单。宿主可通过 `tools.defaults(role)` 查询随包规则与已配置的角色策略，或运行 `npm run tools:check` 检查工具覆盖。角色分派会重新检查已签发权限和当前权限。压缩角色按自身名单使用内建 `read_image`，角色提示词与实际能力分别装配。详见[默认 107 个工具 ID 与角色映射](./ROLE-TOOL-DEFAULTS.md)。
 
 所有角色的默认名单均允许 `read_image`。主会话和首次规划复用原生附件通道；Direct 执行者与只读角色也将附件实体送入模型请求。必须具备宿主附件服务及当前模型路由声明的图像输入能力；缺失时返回明确错误，不将文件身份或 OCR 当作已完成视觉核验。权限名单、工具实际挂载、附件传输和模型能力是四个独立条件。新增能力用于新请求序列，已冻结的旧序列保留其原有工具和请求快照。
 
-额外工具必须独立注册，并逐次执行宿主授权检查：
+已经挂载的 DSH 工具可直接用上述 ID 协议登记名单。如果插件还要提供角色专用的执行回调，可沿用 `registerTool`，声明其效果、结构和逐次宿主授权。
 
 ```js
 const dispose = tools.registerTool({

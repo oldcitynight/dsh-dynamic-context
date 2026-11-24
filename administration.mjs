@@ -1,11 +1,12 @@
 import { activeOriginRevision } from './suspension.mjs'
+import { readStored, statStored, unlinkStored } from './workflow-io.mjs'
 import { acceptanceEnabled } from './acceptance-protocol.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
 import fs from 'node:fs'
 import { supervisionAuthority } from './supervision-runtime.mjs'
 import path from 'node:path'
 import { digest } from 'dsh-better-task-grapth/core'
-import { artifactProof } from 'dsh-better-task-grapth/host'
+import { artifactProof } from './artifacts.mjs'
 import { DirectJournal, acquireDirectLease } from './durable-store.mjs'
 import { fail } from './core.mjs'
 
@@ -34,7 +35,7 @@ function journalFor(runner, state, active) {
   return DirectJournal.open(runner.activeRunDirectory(state), {
     taskId: active.nodeId, attemptId: active.attemptId, contextVersion: state.contexts.version,
     owner: active.owner, graphRevision: activeOriginRevision(state),
-  }, { maxBytes: runner.config.direct.maxJournalBytes })
+  })
 }
 const authority = (runner, agent) => {
   if (!agent) return null // Direct program API is a trusted host port.
@@ -103,10 +104,10 @@ export async function collectOrphans(runner, { expectedRevision, planChecksum, s
     if (state?.revision !== expectedRevision) fail('DIRECT_MAINTENANCE_STALE_REVISION')
     if (state.graph.state.active) fail('DIRECT_MAINTENANCE_ACTIVE_ATTEMPT')
     const attempts = Object.entries(state.graph.state.leaves).filter(([, leaf]) => leaf.attemptId).map(([nodeId, leaf]) => ({ nodeId, attemptId: leaf.attemptId }))
-    const references = [...state.reports.flatMap(report => report.evidence),
-      ...state.graph.events.flatMap(event => Array.isArray(event.data.evidence) ? event.data.evidence : [])]
-      .filter(reference => reference.kind === 'artifact').map(reference => ({ ...reference,
-        ref: path.resolve(runner.config.storageRoot ?? runner.config.projectRoot, reference.ref) }))
+    const normalizeEvidence = evidence => evidence.filter(reference => reference.kind === 'artifact')
+      .map(reference => ({ ...reference, ref: path.resolve(runner.graph.storageRoot, reference.ref) }))
+    const references = normalizeEvidence([...state.reports.flatMap(report => report.evidence),
+      ...state.graph.events.flatMap(event => Array.isArray(event.data.evidence) ? event.data.evidence : [])])
     const journals = new Map(attempts.map(item => [path.join(runner.config.directory, item.attemptId), { ...item, contextVersion: state.contexts.version }]))
     const visited = new Set()
     for (let i = 0; i < references.length; i++) {
@@ -114,10 +115,10 @@ export async function collectOrphans(runner, { expectedRevision, planChecksum, s
       if (visited.has(ref.ref) || path.basename(ref.ref) !== 'trace.json' || path.dirname(path.dirname(ref.ref)) !== runner.config.directory) continue
       visited.add(ref.ref)
       artifactProof(runner.graph.storageRoot, ref, lifecycle, runner.graph.artifactOptions)
-      const trace = JSON.parse(fs.readFileSync(ref.ref, 'utf8'))
+      const trace = JSON.parse(readStored(ref.ref, 'utf8'))
       if (!trace.assembly?.task) continue
       journals.set(path.dirname(ref.ref), { nodeId: trace.assembly.task.id, attemptId: trace.assembly.task.attemptId, contextVersion: trace.assembly.contextVersion })
-      if (trace.previousReport) references.push(...trace.previousReport.evidence)
+      if (trace.previousReport) references.push(...normalizeEvidence(trace.previousReport.evidence))
     }
     const files = []
     for (const [runDirectory, item] of journals) {
@@ -129,12 +130,16 @@ export async function collectOrphans(runner, { expectedRevision, planChecksum, s
     const checksum = digest(plan)
     if (planChecksum === undefined) return { ...plan, planChecksum: checksum, dryRun: true, bytes: files.reduce((sum, row) => sum + row.bytes, 0) }
     if (planChecksum !== checksum || runner.graph.read().checksum !== state.checksum) fail('DIRECT_MAINTENANCE_PLAN_CHANGED')
-    for (const file of files) {
-      lifecycle.throwIfAborted()
-      const info = fs.lstatSync(file.ref)
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.ino !== file.ino || info.size !== file.bytes || info.mtimeMs !== file.mtimeMs) fail('DIRECT_MAINTENANCE_FILE_CHANGED')
-      fs.unlinkSync(file.ref)
+    const remove = () => {
+      for (const file of files) {
+        lifecycle.throwIfAborted()
+        const info = statStored(file.ref)
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.ino !== file.ino || info.size !== file.bytes || info.mtimeMs !== file.mtimeMs) fail('DIRECT_MAINTENANCE_FILE_CHANGED')
+        unlinkStored(file.ref)
+      }
     }
+    if (runner.storage) runner.storage.db.transaction(remove)
+    else remove()
     runner.publish('maintenance-completed')
     return { planChecksum: checksum, dryRun: false, removed: files.length, bytes: files.reduce((sum, row) => sum + row.bytes, 0) }
   }, signal)

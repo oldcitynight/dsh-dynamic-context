@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { readStored, statStored } from './workflow-io.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { BlockAssembler, createMessage } from '@deepseek-ai/dsh-llm'
 import { copy, digest, GraphError } from 'dsh-better-task-grapth/core'
 import { artifactProof } from './artifacts.mjs'
 import { authorityInputs, authorityHeader } from './authority.mjs'
+import { ROLE_PROMPTS_SERVICE } from './role-policy.mjs'
+import { ROLE_MODELS_SERVICE, nativeRoleModel } from './role-models.mjs'
 
 export function revisionAuthority(ctx, agent) {
   const sessions = ctx.get?.('sessions') ?? ctx.sessions
@@ -27,7 +30,7 @@ function checkFactPath(root, file, forbiddenRoots = []) {
   })
   if (blocked || parts.some(part => ['.dsh', '.git', '.agents', 'credentials', 'secrets'].includes(part.toLowerCase()))
       || /^(?:\.env.*|credentials\.json|auth\.json|tokens?\.json)$/i.test(path.basename(file))
-      || /\.(?:key|pem|p12)$/i.test(file) || fs.lstatSync(file).nlink !== 1) throw new GraphError('REVISION_PRIVATE_EVIDENCE_DENIED')
+      || /\.(?:key|pem|p12)$/i.test(file) || statStored(file).nlink !== 1) throw new GraphError('REVISION_PRIVATE_EVIDENCE_DENIED')
 }
 export function artifactFacts(root, references, signal, forbiddenRoots = []) {
   if (!Array.isArray(references) || !references.length || references.some(ref => ref.kind !== 'artifact'))
@@ -35,7 +38,7 @@ export function artifactFacts(root, references, signal, forbiddenRoots = []) {
   return references.map((ref, index) => {
     const proof = artifactProof(root, ref, signal)
     checkFactPath(root, proof.path, forbiddenRoots)
-    const text = fs.readFileSync(proof.path, 'utf8')
+    const text = readStored(proof.path, 'utf8')
     // Revalidate after reading: bytes inspected by the roles must match the receipt.
     artifactProof(root, ref, signal)
     return { id: `fact_${index}`, text, source: { ...copy(ref), ref: proof.path } }
@@ -46,7 +49,7 @@ export function artifactMetadata(root, references, signal, forbiddenRoots = []) 
   return references.map(ref => {
     const proof = artifactProof(root, ref, signal)
     checkFactPath(root, proof.path, forbiddenRoots)
-    return { source: { ...copy(ref), ref: proof.path }, bytes: fs.statSync(proof.path).size,
+    return { source: { ...copy(ref), ref: proof.path }, bytes: statStored(proof.path).size,
       verified: true, method: 'host SHA-256 of current bytes' }
   })
 }
@@ -54,14 +57,21 @@ export function verifyArtifactFacts(root, facts, signal, forbiddenRoots = []) {
   for (const fact of facts) {
     artifactProof(root, fact.source, signal)
     checkFactPath(root, fact.source.ref, forbiddenRoots)
-    if (digest(fs.readFileSync(fact.source.ref, 'utf8')) !== digest(fact.text)) throw new GraphError('REVISION_FACT_CHANGED')
+    if (digest(readStored(fact.source.ref, 'utf8')) !== digest(fact.text)) throw new GraphError('REVISION_FACT_CHANGED')
   }
 }
-export async function nativeRevisionRole(ctx, agent, { messages, runId, signal }) {
+export async function nativeRevisionRole(ctx, agent, { messages, runId, signal, role, scope = {} }) {
   const llm = ctx.get('llm')
   if (!llm) throw new GraphError('REVISION_LLM_REQUIRED')
-  const config = agent.session.requestHeader()?.config ?? agent.options
+  const roleScope = { ...scope, ...(agent.session.id ? { sessionId: agent.session.id } : {}) }
+  const selection = role && role !== 'compaction' && ctx.get(ROLE_MODELS_SERVICE)?.resolve(role, roleScope)
+  const config = nativeRoleModel(agent.session.requestHeader()?.config ?? agent.options, selection)
   if (!config.provider || !config.model) throw new GraphError('REVISION_MODEL_REQUIRED')
+  const prompts = role && ctx.get(ROLE_PROMPTS_SERVICE)
+  if (prompts && messages[0]?.role === 'system') {
+    const resolved = prompts.resolve(role, messages[0].content, roleScope)
+    messages = [{ ...messages[0], content: resolved.content }, ...messages.slice(1)]
+  }
   const assembler = new BlockAssembler()
   const options = { provider: config.provider, model: config.model,
     messages: messages.map(message => createMessage({ role: message.role, content: [{ type: 'text', text: message.content }] })),

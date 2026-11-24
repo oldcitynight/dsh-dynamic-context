@@ -1,13 +1,15 @@
 import { createReceiptSelector, RECEIPT_TOOL } from './receipt-selection.mjs'
+import { hasStored, readStored, storedEntry, writeStored } from './workflow-io.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
 // Window management for the isolated supervision/revision roles. All archives
 // belong to one role invocation; this is not a filesystem or workflow tool.
 import fs from 'node:fs'
+import { materialBundle, materialView, materialLimit } from './context-budget.mjs'
 import { roleImageResult, finishImageInspection, imageTokens, IMAGE_READ_INSTRUCTION, imageWindowPayload, excessImageCalls, imageBatchNotice } from './image-content.mjs'
 import { parseModelJSON, diagnostic, feedbackText, located } from 'dsh-better-task-grapth/validation'
 import path from 'node:path'
 import { digest } from 'dsh-better-task-grapth/core'
-import { nativeMessageEstimate } from './native-compaction.mjs'
+import { nativeMessageEstimate, summarySendWithRetry } from './native-compaction.mjs'
 import { COMPACTION_INSTRUCTION, nativeCompactSpec, SUMMARY_MAX_TOKENS } from './dsh-compaction-policy.mjs'
 import { apiParameters } from './api-protocol.mjs'
 import { fail } from './core.mjs'
@@ -15,6 +17,8 @@ import { jsonExample } from './format-examples.mjs'
 import { createReportDraft, REPORT_DRAFT_INSTRUCTION, FORMATTED_REPORT_INSTRUCTION, REPORT_GENERATE, REPORT_SUBMIT } from './report-draft.mjs'
 import { DIRECTORY_SNAPSHOT_TOOL, directorySnapshotWireTool, issueDirectorySnapshot } from './directory-evidence.mjs'
 import { searchEvidence, SEARCH_PARAMETERS, SEARCH_DESCRIPTION } from './evidence-search.mjs'
+import { blockageTools } from './blockage-evidence.mjs'
+import { INDEX_READER, roleEvidenceCandidate, chooseRoleEvidence } from './role-input-index.mjs'
 import { directContextWindow } from './dsh-compaction-policy.mjs'
 
 export const EVIDENCE_TOOL = 'dynamic_context_read_evidence'
@@ -33,11 +37,13 @@ export function roleInputTokens(payload) {
     + (payload.tools?.length ? nativeMessageEstimate({ role: 'system', content: JSON.stringify(payload.tools) }) : 0)
 }
 // A prose heuristic can undercount dense JSON/numbers by a large factor.
-// Prefer the host's model tokenizer; without it use the UTF-8 byte bound, not
-// an optimistic characters-per-token ratio. Native capacity itself is unchanged.
-export function rolePressureTokens(payload, measurement) {
+// Prefer the model meter, then a verified provider prefix plus the unpriced
+// suffix. With neither, keep the conservative full-input bound for dense data.
+export function rolePressureTokens(payload, measurement, anchoredUpperTokens) {
   payload = imageWindowPayload(payload)
-  return Math.max(roleInputTokens(payload), measurement?.tokens ?? Buffer.byteLength(JSON.stringify({ messages: payload.messages, tools: payload.tools })) + payload.messages.reduce((sum, m) => sum + imageTokens(m), 0))
+  const tokens = measurement?.tokens ?? anchoredUpperTokens
+    ?? (Buffer.byteLength(JSON.stringify({ messages: payload.messages, tools: payload.tools })) + payload.messages.reduce((sum, m) => sum + imageTokens(m), 0))
+  return Math.max(roleInputTokens(payload), tokens)
 }
 export function roleWindow(config) {
   const window = directContextWindow(config)
@@ -55,13 +61,19 @@ function protectedValues(value, parts = [], result = []) {
   if (value && typeof value === 'object') for (const [key, child] of Object.entries(value)) protectedValues(child, [...parts, key], result)
   return result
 }
-function candidates(value, parts = [], result = []) {
+function candidates(value, parts = [], result = [], indexed = false) {
+  // These handles are the only route from the projected input back to evidence.
+  // Preserve them when a later turn still needs native history compaction.
+  if (indexed && (value?._reportIndex?.source
+      || parts.length === 1 && ['roleEvidenceAccess', 'reportAccess'].includes(parts[0])
+      || parts.length === 2 && (parts[0] === 'reports' && value?.source && value.sections
+        || parts[0] === 'publicEvidence' && value?.source && value.paths))) return result
   if (parts.length && pinned.has(parts.at(-1)) || value?._dynamicContextEvidence) return result
   if (typeof value === 'string') result.push({ parts, text: value, format: 'text' })
   else if (Array.isArray(value) && parts.at(-1) === 'tools' && value.some(row => row && typeof row === 'object')) {
     result.push({ parts, text: JSON.stringify(value), format: 'json' })
   } else if (value && typeof value === 'object') {
-    for (const [key, child] of Object.entries(value)) candidates(child, [...parts, key], result)
+    for (const [key, child] of Object.entries(value)) candidates(child, [...parts, key], result, indexed)
   }
   return result
 }
@@ -86,20 +98,26 @@ function fitEnd(text, start, end, fits) {
   return boundary(text, low)
 }
 
-export function createRoleContext({ config, messages, directory, call, signal, role, observeTool, inspectTool, readOnlyTools, toolPolicy, toolScope = {}, toolHostContext = {}, beforeTool, limitImageBatch = () => true, compactionInstruction = COMPACTION_INSTRUCTION, imageTools = false, structuredToolErrors = false, formattedReports = false, reportTemplate, reportReceipts, validateSubmission, directorySnapshots = false, measureTokens = async payload => rolePressureTokens(payload) }) {
+export function createRoleContext({ config, messages, directory, call, signal, role, observeTool, inspectTool, readOnlyTools, inputIndex, toolPolicy, toolScope = {}, toolHostContext = {}, beforeTool, contextText = (_role, _slot, text) => text, limitImageBatch = () => true, compactionInstruction = COMPACTION_INSTRUCTION, imageTools = false, structuredToolErrors = false, formattedReports = false, reportTemplate, reportReceipts, validateSubmission, directorySnapshots = false, measureTokens = async payload => rolePressureTokens(payload) }) {
   const spec = roleWindow(config), original = structuredClone(messages)
   let data, structured = true, history = [], enabled = false
   try { data = JSON.parse(original[1].content) } catch { data = original[1].content; structured = false }
-  const draft = role === 'result_repair' && typeof data?.previousSubmission === 'string'
+  const repairingDraft = role === 'result_repair' && typeof data?.previousSubmission === 'string'
+  const draft = repairingDraft
     ? createReportDraft(data.previousSubmission, { requireReport: config.supervisionContext !== 'legacy', ...(formattedReports ? { generate: true, template: reportTemplate, validateResult: validateSubmission, replayReceipts: reportReceipts } : {}) })
     : formattedReports ? createReportDraft('{}', { requireReport: false, generate: true, template: reportTemplate, validateResult: validateSubmission, replayReceipts: reportReceipts }) : null
   const receipts = role === 'result_repair' && draft && data?.verificationPlan?.version === 1 ? createReceiptSelector(data.execution) : null
   const useDirectorySnapshots = Boolean(draft && directorySnapshots)
-  const draftInstruction = (formattedReports ? FORMATTED_REPORT_INSTRUCTION + (role === 'result_repair' ? '\n' + REPORT_DRAFT_INSTRUCTION : '') : REPORT_DRAFT_INSTRUCTION) + (useDirectorySnapshots ? '\nFor an existing reported deliverable directory, dynamic_context_directory_snapshot returns a host-owned identity receipt. It can only inspect directory roots declared in the current report draft. It does not edit files or prove semantic correctness. Replace just that directory row with the returned directory object; do not mix it with legacy files/subdirectories. Example (replace revision, index and value with actual tool results): {"expectedRevision":0,"edits":[{"op":"set","path":"/executionReport/directories/0","value":{"path":"deliverable","hashScheme":"dsh-directory-sha256-v1","sha256":"<host-returned hash>"}}]}. Then submit the current draft revision. Historic snapshot receipts are replayed exactly after a pause; final acceptance always rechecks the current filesystem.' : '')
+  const draftGuide = repairingDraft ? REPORT_DRAFT_INSTRUCTION : FORMATTED_REPORT_INSTRUCTION
+  const defaultDraftInstruction = draftGuide + (useDirectorySnapshots ? '\nFor an existing reported deliverable directory, dynamic_context_directory_snapshot returns a host-owned identity receipt. It can only inspect directory roots declared in the current report draft. It does not edit files or prove semantic correctness. Replace just that directory row with the returned directory object; do not mix it with legacy files/subdirectories. Example (replace revision, index and value with actual tool results): {"expectedRevision":0,"edits":[{"op":"set","path":"/executionReport/directories/0","value":{"path":"deliverable","hashScheme":"dsh-directory-sha256-v1","sha256":"<host-returned hash>"}}]}. Then submit the current draft revision. Historic snapshot receipts are replayed exactly after a pause; final acceptance always rechecks the current filesystem.' : '')
+  const draftInstruction = draft ? contextText(role, 'tools', defaultDraftInstruction) : ''
+  const archiveInstruction = contextText(role, 'archive', instructions + '\nUse dynamic_context_search_evidence to find exact original evidence across all archived sources before reading decisive ranges.')
+  const summaryInstruction = contextText('compaction', 'archive', summaryInstructions)
+  const imageInstruction = imageTools ? contextText('compaction', 'image', IMAGE_READ_INSTRUCTION) : ''
   let snapshotOrdinal = 0
   const sources = [], actions = []
-  const anchors = structured ? protectedValues(data) : []
-  const anchorHash = digest(anchors)
+  let anchors = structured ? protectedValues(data) : []
+  let anchorHash = digest(anchors)
   const base = { ...config.direct.generation, ...apiParameters(config.direct), model: config.model,
     stream: true, stream_options: { include_usage: true } }
   const imageBuiltin = imageTools && readOnlyTools ? { tools: readOnlyTools.tools.filter(t => t.function.name === 'read_image'), execute: tool => readOnlyTools.execute(tool) } : null
@@ -116,25 +134,79 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     }
     return { value, ordinal }
   }
+  let indexPrepared = false, usingIndex = false, inputReader
+  const suppliedReportReader = readOnlyTools?.tools.some(tool => tool.function.name === INDEX_READER) === true
+  async function prepareInputIndex() {
+    if (indexPrepared || !inputIndex || !structured) return
+    const saved = inputIndex.saved, raw = data, rawText = original[1].content
+    if (saved) {
+      const { checksum, ...body } = saved
+      if (checksum !== digest(body) || saved.inputHash !== digest(rawText)) fail('REVISION_ROLE_INDEX_CHANGED')
+    }
+    const remember = (decision, view) => {
+      const body = { ...decision, inputHash: digest(rawText), ...(view ? { viewHash: digest(view) } : {}) }
+      inputIndex.save({ ...body, checksum: digest(body) })
+    }
+    indexPrepared = true
+    if (saved?.mode === 'inline') return
+    const candidate = roleEvidenceCandidate(role, raw, { workflowReports: suppliedReportReader })
+    if (!candidate) {
+      if (saved) fail('REVISION_ROLE_INDEX_CHANGED')
+      remember({ mode: 'inline', basis: 'no-savings' }); return
+    }
+    const full = saved ? null : payload()
+    if (candidate.catalog.size) {
+      const pages = blockageTools(candidate.catalog, path.join(directory, 'role-input-evidence'), signal)
+      const tool = pages.tools.find(tool => tool.function.name === INDEX_READER)
+      inputReader = { ...pages, tool: { ...tool, function: { ...tool.function,
+        description: 'Read original evidence listed in this role input by source and JSON Pointer. Empty path reads the original value. For indexed JSON text, other paths address its parsed fields. Use start/end and next for UTF-16 pages.' } } }
+    }
+    data = candidate.view
+    original[1] = { ...original[1], content: JSON.stringify(data) }
+    const indexed = payload()
+    const allowed = indexed.tools?.some(tool => tool.function.name === INDEX_READER)
+    if (saved) {
+      if (!allowed) fail('REVISION_ROLE_INDEX_READER_UNAVAILABLE')
+      if (saved.mode !== 'index' || saved.viewHash !== digest(data)) fail('REVISION_ROLE_INDEX_CHANGED')
+    } else {
+      const threshold = Math.min(spec?.thresholdTokens ?? Infinity, config.maxInputTokens ?? Infinity)
+      const decision = allowed ? await chooseRoleEvidence({ full, indexed, measure: measureTokens, dynamicMaterialBytes: materialLimit(config),
+        threshold: Number.isFinite(threshold) ? threshold : null, maxRequestBytes: config.direct.maxRequestBytes,
+        fullBytes: Buffer.byteLength(JSON.stringify(full)), indexedBytes: Buffer.byteLength(JSON.stringify(indexed)) })
+        : { mode: 'inline', basis: 'reader-unavailable' }
+      remember(decision, decision.mode === 'index' ? data : null)
+      if (decision.mode === 'inline') {
+        data = raw; original[1] = { ...original[1], content: rawText }
+        inputReader = undefined; exposedTools = undefined
+        return
+      }
+    }
+    // These are the anchors of the material actually sent to the model. The
+    // original, unprojected input still controls validation and durable identity.
+    usingIndex = true
+    anchors = protectedValues(data); anchorHash = digest(anchors)
+  }
+
+
   const selectTools = () => {
-    const tools = [...(enabled ? [readTool, searchTool] : []), ...(draft?.tools ?? []), ...(receipts?.tools ?? []), ...(useDirectorySnapshots ? [directorySnapshotWireTool] : []), ...(readOnlyTools?.tools ?? [])]
+    const tools = [...(enabled ? [readTool, searchTool] : []), ...(draft?.tools ?? []), ...(receipts?.tools ?? []), ...(useDirectorySnapshots ? [directorySnapshotWireTool] : []), ...(readOnlyTools?.tools ?? []), ...(inputReader && !suppliedReportReader ? [inputReader.tool] : [])]
     exposedTools = toolPolicy ? toolPolicy.tools(role, { tools, execute: executeBuiltin }, toolScope, toolHostContext) : { tools, execute: executeBuiltin }
     return exposedTools.tools
   }
   const payload = () => ({ ...base, messages: enabled ? [
-    { ...original[0], content: original[0].content + '\n\n' + instructions + '\nUse dynamic_context_search_evidence to find exact original evidence across all archived sources before reading decisive ranges.' + (draft ? '\n\n' + draftInstruction : '') },
+    { ...original[0], content: original[0].content + '\n\n' + archiveInstruction + (draft ? '\n\n' + draftInstruction : '') },
     { ...original[1], content: structured ? JSON.stringify(data) : typeof data === 'string' ? data : JSON.stringify(data) },
     { role: 'user', content: JSON.stringify({ protocol, sources: sources.map(({ text, file, ...source }) => source) }) }, ...history,
   ] : draft ? [{ ...original[0], content: original[0].content + '\n\n' + draftInstruction }, ...original.slice(1), ...history] : [...original, ...history],
     max_tokens: config.revision?.maxOutputTokens ?? config.maxOutputTokens, response_format: { type: 'json_object' },
-    ...((enabled || draft || readOnlyTools || toolPolicy?.extensions(role, toolScope, toolHostContext.runner?.config?.projectRoot).length) ? { tools: selectTools() } : {}) })
+    ...((enabled || draft || readOnlyTools || inputReader || toolPolicy?.extensions(role, toolScope, toolHostContext.runner?.config?.projectRoot).length) ? { tools: selectTools() } : {}) })
   function directorySnapshot(tool) {
     // The filesystem may change during a pause. Replay the original read receipt,
     // never a fresh hash masquerading as the completed historical observation.
     const identity = { ordinal: ++snapshotOrdinal, callId: tool.id, arguments: tool.function.arguments }
     const folder = path.join(directory, 'directory-tool-results'), file = path.join(folder, identity.ordinal + '.json')
-    if (fs.existsSync(file)) {
-      const { checksum, ...stored } = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (hasStored(file)) {
+      const { checksum, ...stored } = JSON.parse(readStored(file, 'utf8'))
       if (digest(stored) !== checksum || digest(stored.identity) !== digest(identity)) fail('REVISION_DIRECTORY_RECEIPT_CHANGED')
       return stored.value
     }
@@ -155,6 +227,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     }
     const body = { identity, value }, saved = { ...body, checksum: digest(body) }
     fs.mkdirSync(folder, { recursive: true, mode: 0o700 })
+    if (writeStored(file, JSON.stringify(saved), {exclusive:true})) return value
     const fd = fs.openSync(file, 'wx', 0o600)
     try { fs.writeFileSync(fd, JSON.stringify(saved)); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
     const dirfd = fs.openSync(folder, 'r'); try { fs.fsyncSync(dirfd) } finally { fs.closeSync(dirfd) }
@@ -166,9 +239,9 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     const folder = path.join(directory, 'context-sources')
     fs.mkdirSync(folder, { recursive: true, mode: 0o700 })
     source.file = path.join(folder, source.id + '.json')
-    if (fs.existsSync(source.file)) {
-      if (digest(JSON.parse(fs.readFileSync(source.file))) !== digest(source)) fail('REVISION_CONTEXT_ARCHIVE_CHANGED')
-    } else {
+    if (hasStored(source.file)) {
+      if (digest(JSON.parse(readStored(source.file))) !== digest(source)) fail('REVISION_CONTEXT_ARCHIVE_CHANGED')
+    } else if (!writeStored(source.file,JSON.stringify(source),{exclusive:true})) {
       const fd = fs.openSync(source.file, 'wx', 0o600)
       try { fs.writeFileSync(fd, JSON.stringify(source)); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
     }
@@ -179,11 +252,11 @@ export function createRoleContext({ config, messages, directory, call, signal, r
   }
   const summaryPayload = (source, text, start, end, round) => ({ ...base, max_tokens: SUMMARY_MAX_TOKENS,
     ...(compactImages?.tools.length ? { tools: compactImages.tools } : {}),
-    messages: [{ role: 'system', content: summaryInstructions + '\n' + JSON.stringify(anchors) },
+    messages: [{ role: 'system', content: summaryInstruction + '\n' + JSON.stringify(anchors) },
       { role: 'user', content: JSON.stringify({ protocol, roleInstruction: original[0].content,
         source: { id: source.id, location: source.location, sha256: source.sha256, characters: source.characters },
         round, span: { start, end, sha256: digest(text) }, evidence: text }) },
-      { role: 'user', content: compactionInstruction + (compactImages?.tools.length ? '\n' + IMAGE_READ_INSTRUCTION : '') }] })
+      { role: 'user', content: compactionInstruction + (compactImages?.tools.length ? '\n' + imageInstruction : '') }] })
   async function fitMeasured(text, start, end, makePayload, limit) {
     end = fitEnd(text, start, end, part => roleInputTokens(makePayload(part)) < limit)
     while (end > start) {
@@ -204,7 +277,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
           part => summaryPayload(source, part, start, start + part.length, round), spec.contextWindow - SUMMARY_MAX_TOKENS - 65536)
         if (end <= start) fail('REVISION_CONTEXT_ANCHORS_EXCEED_WINDOW')
         const part = text.slice(start, end), request = summaryPayload(source, part, start, end, round)
-        const send = payload => call(payload, { purpose: 'compaction', sourceId: source.id, round, start, end })
+        const send = summarySendWithRetry((payload, retry) => call(payload, { purpose: 'compaction', sourceId: source.id, round, start, end, ...retry }))
         let completed = await send(request)
         if (compactImages?.tools.length) completed = await finishImageInspection(request, completed, send, async (tool) => {
           const { value, ordinal } = await toolValue(compactImages, tool)
@@ -228,15 +301,29 @@ export function createRoleContext({ config, messages, directory, call, signal, r
       text = next; round++
     }
   }
+  let budgetPrepared = false
   async function prepare({ force = false } = {}) {
+    await prepareInputIndex()
+    if (!budgetPrepared && structured) {
+      const limit = materialLimit(config), bundle = materialBundle(data, limit)
+      if (bundle) {
+        enabled = true
+        if (!selectTools().some(tool => tool.function.name === EVIDENCE_TOOL)) fail('ROLE_MATERIAL_READER_REQUIRED', { role, tool: EVIDENCE_TOOL, limit })
+        const source = archive(bundle.text, '/materialSummary', 'json')
+        const reader = { tool: EVIDENCE_TOOL, arguments: { id: source.id, start: 0, end: Math.min(1024, bundle.text.length) } }
+        data = materialView(data, bundle, reader, limit)
+        anchors = protectedValues(data); anchorHash = digest(anchors)
+      }
+      budgetPrepared = true
+    }
     if (config.direct.compaction?.strategy !== 'dsh-native') return payload()
-    if (await measureTokens({ messages: [{ role: 'system', content: original[0].content + '\n\n' + instructions },
+    if (await measureTokens({ messages: [{ role: 'system', content: original[0].content + '\n\n' + archiveInstruction },
       { role: 'user', content: JSON.stringify(anchors) }], tools: [readTool, searchTool] }) >= spec.thresholdTokens)
       fail('REVISION_CONTEXT_ANCHORS_EXCEED_WINDOW', { protectedLocations: anchors.map(row => row.location), reason: 'Protected role instructions, shared contexts and graph prompts must remain verbatim. Reduce the authorized input scope; these fields cannot be summarized.' })
     while (force || await measureTokens(payload()) >= spec.thresholdTokens) {
       signal.throwIfAborted()
       if (original.length !== 2 || original[0].role !== 'system' || original[1].role !== 'user') fail('REVISION_CONTEXT_LAYOUT_UNSUPPORTED')
-      const before = await measureTokens(payload()), choices = candidates(data)
+      const before = await measureTokens(payload()), choices = candidates(data, [], [], usingIndex)
       if (history.length) choices.push({ history: true, text: JSON.stringify(history), format: 'json' })
       const largest = choices.sort((a, b) => b.text.length - a.text.length)[0]
       if (!largest?.text.length) {
@@ -258,6 +345,11 @@ export function createRoleContext({ config, messages, directory, call, signal, r
   function storedSource(source) {
     let fd
     try {
+      if (storedEntry(source.file)) {
+        const stored=JSON.parse(readStored(source.file))
+        if(digest(stored)!==digest(source))fail('REVISION_CONTEXT_ARCHIVE_CHANGED')
+        return stored
+      }
       fd = fs.openSync(source.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
       const info = fs.fstatSync(fd)
       if (!info.isFile() || info.nlink !== 1) fail('REVISION_CONTEXT_ARCHIVE_CHANGED')
@@ -302,11 +394,16 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     const end = await fitMeasured(stored.text, args.start, args.end,
       // Size the page as text, not an orphan tool result. The full subsequent
       // request independently validates its actual assistant/tool pairing.
-      part => ({ messages: [{ role: 'user', content: JSON.stringify(page(args.start + part.length)) }] }), spec.retainTokens)
+      part => ({ messages: [{ role: 'user', content: JSON.stringify(page(args.start + part.length)) }] }), (spec?.retainTokens ?? Math.min(8192, materialLimit(config))))
     if (end <= args.start) fail('REVISION_CONTEXT_READ_CANNOT_FIT')
     return page(end)
   }
   async function executeBuiltin(tool) {
+    if (inputReader && tool.function.name === INDEX_READER) {
+      let source
+      try { source = parseModelJSON(tool.function.arguments).value?.source } catch { /* The reader returns the exact argument diagnostic. */ }
+      if (!suppliedReportReader || typeof source === 'string' && source.startsWith('role-input:')) return inputReader.execute(tool)
+    }
     return tool.function.name === RECEIPT_TOOL ? receipts.execute(tool.function.arguments)
       : tool.function.name === EVIDENCE_TOOL ? await read(tool.function.arguments)
       : tool.function.name === EVIDENCE_SEARCH_TOOL ? search(tool.function.arguments)

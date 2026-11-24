@@ -101,9 +101,9 @@ const foldStages = {
   result_repair: '报告补正', result_work: '成果返工', plan_check: '计划复查',
   updater: '图更新', reviewer: '修改审计', compaction: '上下文压缩',
   blockage: '阻塞处理', blockage_audit: '中断审核', group_audit: '组级终审',
-  scope_plan: '本层计划复查', scope_update: '本层蓝图更新', scope_audit: '修改审计',
+  unit_planner: '单元规划', unit_rebaseline: '单元重基线', unit_plan_audit: '规划审计', unit_audit: '单元终审', scope_plan: '本层计划复查', scope_update: '本层蓝图更新', scope_audit: '修改审计',
   scope_blockage: '分层阻塞处理', scope_pause: '中断审核', task_reporter: '任务报告',
-  guidance_intake: '用户引导识别', guidance_router: '用户引导分派',
+  unit_router: '单元路由', baseline_audit: '基线审计', guidance_intake: '用户引导识别', guidance_router: '用户引导分派',
   progress_reporter: '阶段执行报告',
 }
 const leafStages = new Set(['EXECUTING', 'result_check', 'result_repair', 'result_work', 'compaction'])

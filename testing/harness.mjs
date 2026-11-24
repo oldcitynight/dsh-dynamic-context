@@ -20,9 +20,19 @@ export const HOST_POLICY = 'HOST_POLICY_KEEP: Follow the host constraints. Manag
 export const GLOBAL_PRIVATE = 'UNRELATED_GLOBAL_CONTEXT_MUST_NOT_LEAK'
 
 /** Real DSH services and the shipped pi-ai adapter; only the HTTP model endpoint is fake. */
-export async function createHarness({ projectRoot, directory, respond, config = {}, setup, taskGraph = true, imageInput = false, backend: externalBackend }) {
+export async function createHarness({ projectRoot, directory, respond, config = {}, setup, taskGraph = true, imageInput = false, contextWindow = 8192, providers = {}, retryPolicy = { mode: 'normal', maxRetries: 0 }, backend: externalBackend }) {
   const backend = externalBackend ?? await startFakeLlama({ respond }), ctx = new Context(), toolCalls = []
   let closed = false
+  async function close() {
+    if (closed) return
+    closed = true
+    try {
+      await ctx.get('dynamicContext')?.close()
+    } finally {
+      try { await ctx.fiber.dispose() }
+      finally { if (!externalBackend) await backend.close() }
+    }
+  }
   try {
     for (const plugin of [LlmRuntime, SessionStore, Projections, SystemPrompt, ToolRuntime, AgentRegistry, TokenMeter]) await ctx.plugin(plugin)
     await ctx.plugin(AgentLoop, { agents: [] })
@@ -30,12 +40,12 @@ export async function createHarness({ projectRoot, directory, respond, config = 
       resolve: async ref => ref === 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY' ? { value: 'fake-llama-only' } : undefined,
       listRecords: async () => [], readRecord: async () => undefined,
     })
-    await ctx.plugin(PiAi, { providers: { 'dynamic-context-fake': {
+    await ctx.plugin(PiAi, { providers: { ...providers, 'dynamic-context-fake': {
       displayName: 'Isolated fake llama backend', apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY',
       api: 'openai-completions', baseURL: backend.origin + '/v1',
-      defaultContextWindow: 8192, defaultMaxTokens: 512,
-      retryPolicy: { mode: 'normal', maxRetries: 0 },
-      models: [{ id: 'fake-llama', name: 'Fake llama; scripted responses', contextWindow: 8192, maxTokens: 512, input: imageInput ? ['text', 'image'] : ['text'] }],
+      defaultContextWindow: contextWindow, defaultMaxTokens: 512,
+      retryPolicy,
+      models: [{ id: 'fake-llama', name: 'Fake llama; scripted responses', contextWindow, maxTokens: 512, input: imageInput ? ['text', 'image'] : ['text'] }],
     } } })
     ctx.systemPrompt.section({ name: 'unrelated-global-policy', order: 10, text: GLOBAL_PRIVATE })
     ctx.systemPrompt.context({ name: 'unrelated-global-runtime', order: 10, required: true, text: GLOBAL_PRIVATE })
@@ -54,14 +64,17 @@ export async function createHarness({ projectRoot, directory, respond, config = 
       if (!ctx.get('sessionPersistence')) await ctx.plugin(Persistence, { root: directory + '/native-sessions' })
       await ctx.plugin(TaskGraph, { projectRoot })
     }
-    await ctx.plugin(DynamicContext, { projectRoot, directory, provider: 'dynamic-context-fake', model: 'fake-llama', transport: 'native-guarded',
+    await ctx.plugin(DynamicContext, { storageFormat: process.env.DSH_FIXTURE_STORAGE_FORMAT ?? 'files', projectRoot, directory, provider: 'dynamic-context-fake', model: 'fake-llama', transport: 'native-guarded',
       systemPrompt: HOST_POLICY, allowedTools: ['fixture_read_a', 'fixture_read_b'], supervisionContext: 'legacy',
       interaction: { mode: 'host' }, exposeControlTools: false, ...config,
       ...(config.transport === 'direct' ? { direct: { endpoint: backend.origin + '/v1/chat/completions',
         protocol: 'chat-completions', apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY', agentlessTools: ['fixture_read_a', 'fixture_read_b'], ...config.direct } } : {}),
     })
+    const installed = ctx.get('dynamicContext')
+    if (process.env.DSH_FIXTURE_REQUIRE_SQLITE && installed?.config.interaction.mode === 'host' && !installed.storage)
+      throw new Error('FAKE_REGRESSION_REQUIRES_SQLITE_STORAGE')
     return { ctx, backend, toolCalls, get runner() { return ctx.get('dynamicContext') },
-      async close() { if (closed) return; closed = true; await ctx.get('dynamicContext')?.close(); await ctx.fiber.dispose(); if (!externalBackend) await backend.close() },
+      close,
     }
-  } catch (error) { await ctx.fiber.dispose(); if (!externalBackend) await backend.close(); throw error }
+  } catch (error) { await close(); throw error }
 }

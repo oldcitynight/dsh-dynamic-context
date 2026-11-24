@@ -53,7 +53,7 @@ const complete = { outcome: 'COMPLETE', summary: 'Delivered the checked result.'
 const blocked = { outcome: 'BLOCKED', summary: 'The required input is unavailable.', artifacts: [] }
 const failed = { outcome: 'FAILED', summary: 'The recorded fixture check failed.', artifacts: [], failedCallId: 'call_fixture_fail' }
 
-export function dispositionExamples(reportScoped) {
+export function dispositionExamples(reportScoped, binary = false) {
   const tests = {
     pass: { id: 'fixture_check', criterion: 'Check the delivered result', status: 'PASS',
       expected: 'fixture check passed', observed: 'fixture check passed', callId: 'call_fixture_pass', quote: 'fixture check passed' },
@@ -84,8 +84,18 @@ export function dispositionExamples(reportScoped) {
   ] : [complete, blocked, failed]
   if (reportScoped) examples.push({ ...complete, executionReport: { ...examples[0].executionReport,
     directories: [{ path: 'deliverable', subdirectories: [], files: [{ path: artifact.ref, sha256: artifact.sha256 }] }] } })
+  if (binary && reportScoped) {
+    const measured = { id: 'measurement', criterion: 'The input mode must be active.', status: 'FAIL',
+      expected: 'mode=active', observed: 'mode=idle', callId: 'call_read_mode', quote: 'mode=idle' }
+    examples.unshift({ outcome: 'FAILED', summary: 'Read the current mode. It did not meet the acceptance criterion.', artifacts: [],
+      executionReport: { workHistory: ['Read the input once.'], results: [], directories: [], tests: [measured], limitations: ['Required mode not observed.'] } })
+  }
   return ['Choose the example that matches the observed outcome. Replace illustrative paths, hashes, call IDs and output quotes with recorded evidence.',
-    ...examples.map((example, index) => jsonExample(index === 3 ? 'COMPLETE with a legacy recursive manifest when the snapshot tool is unavailable' : example.outcome, example))].join('\n')
+    ...examples.flatMap(example => {
+      if (binary && example.outcome === 'BLOCKED') return []
+      const value = binary && example.outcome === 'COMPLETE' ? {...example, outcome:'PASS'} : example
+      return [jsonExample(reportScoped && example.executionReport?.directories?.some(row => row.files) ? value.outcome+' with a legacy recursive manifest when the snapshot tool is unavailable' : value.outcome, value)]
+    })].join('\n')
 }
 
 export const resultReviewExamples = [
@@ -110,6 +120,11 @@ const reviewExamples = scoped => ['Every REJECT or NEEDS_USER must include issue
 ].join('\n')
 export const revisionReviewExamples = reviewExamples(false)
 export const scopedRevisionReviewExamples = reviewExamples(true)
+
+export const blueprintDeletionGuidance = Object.freeze({
+  scope_update: '删除未启动的直属叶时提交 REVISE，nodes 和 contextGraph.bindings 都填写删除后的完整本层列表。只可省略从未执行、状态为 PENDING 或 INACTIVE 的叶，曾因返工回到 PENDING 的叶须保留。同步移除相连的 prerequisite 边，清理其他叶对它的 inheritReports 引用，并保留原有目标、有效的 terminal 和剩余节点到终点的路径。例：旧计划的废弃叶 old_check 指向 verify，且 old_check 的结果已无必要。在新提案中省略 old_check 节点、old_check~verify 边和 old_check 绑定，保留 verify。modifications 至少逐项说明 /taskGraph/nodes/old_check、/taskGraph/edges/old_check~verify、/contextGraph/bindings/old_check，另列所有连带变化。每项填具体 reason 与原始 evidence。既有子组用 retainSubtree 保留，涉及别的层级时走 ESCALATE。',
+  updater: '删除从未执行的叶时，从完整 taskGraph.nodes 和相关依赖边中省略该叶。联动模式同步省略其 contextGraph.bindings 并修正其他叶的 inheritReports。每个移除的叶在 retirements 中填写 task、实际承担原要求的 replacements 和 reason，coverage 继续覆盖全部固定要求。曾因返工恢复为 PENDING 的叶须保留。',
+})
 
 export function revisionProposalExamples(linked, withReport) {
   const proposal = jointProposalExample()

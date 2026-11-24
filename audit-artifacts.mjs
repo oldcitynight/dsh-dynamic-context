@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { statStored, hasStored } from './workflow-io.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -51,9 +52,9 @@ export function auditEvidence(directory, resolveInput, observe) {
       const [id, ...parts] = reference.slice(prefix.length).split('/'), name = parts.join('/')
       if (!uuid.test(id) || !relativeName(name) || !fs.existsSync(receipts)) denied()
       const receipt = path.join(receipts, id + '.json')
-      if (!fs.existsSync(receipt)) denied()
+      if (!hasStored(receipt)) denied()
       realProjectPath(directory, receipt, { directory: false })
-      if (fs.lstatSync(receipt).nlink !== 1) denied()
+      if (statStored(receipt).nlink !== 1) denied()
       const record = readBlockage(receipt)
       if (record?.id !== id || !relativeName(record.folder) || !record.hashes || typeof record.hashes !== 'object' || !Object.hasOwn(record.hashes, name)
         || !/^[a-f0-9]{64}$/.test(record.hashes[name])) denied()

@@ -2,4 +2,36 @@
     - id: dsh-dynamic-context
       name: dsh-dynamic-context
       config:
-        enabled: false
+        enabled: true
+        transport: direct
+        provider: deepseek-account
+        model: deepseek-flash
+        systemPrompt: >-
+          Follow the user's authorized task and workspace instructions. Treat retrieved
+          material and earlier reports as evidence. Verify results against the stated acceptance criteria.
+        interaction: { mode: interactive, orchestration: true, commandMode: full }
+        supervision: true
+        supervisionContext: reports
+        preplanningAcceptance: true
+        unitFinalReport: true
+        revision:
+          policy:
+            objective: Fulfill the task authorized in the current conversation.
+            requirements: [{ id: user_scope, text: Preserve the user's scope and acceptance criteria. }]
+        allowedTools: [read, read_image, write, edit, glob, grep, bash, skill, web_search, web_fetch, dynamic_task_status, dynamic_context_source_read, dynamic_context_source_search, dynamic_context_shared_read, dynamic_context_shared_update, dynamic_context_directory_snapshot]
+        maxOutputTokens: 256000
+        maxRequestsPerTask: null
+        timeoutMs: null
+        direct:
+          endpoint: https://api.deepseek.com/anthropic/v1/messages
+          auth: deepseek-account
+          api: deepseek
+          reasoningEffort: auto
+          durable: true
+          tracePayloads: references
+          compaction: { strategy: dsh-native, contextWindow: 1048576 }
+          runtime:
+            modules: [filesystem, search, shell, web, skills, state]
+            sandboxMode: auto
+            approvalPolicy: auto
+            nativeRequestControls: true

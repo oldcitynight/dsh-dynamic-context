@@ -21,3 +21,24 @@ export const supervisionSemantics = Object.freeze({
   history: 'Started tasks, their used context closures and execution receipts remain immutable. Corrections for future work use new bindings/nodes or new recovery tasks.',
   unknownEffects: 'Unknown model/tool effects retain the gate and require trusted reconciliation. Do not retry them as ordinary proposal defects.',
 })
+
+const unitSemantics = Object.freeze({
+  ...supervisionSemantics,
+  version: 'unit-runtime-v2',
+  dispositions: {
+    PASS: { createsReport: true, meaning: 'The unit met its acceptance criteria, supported by verified evidence.' },
+    FAILED: { createsReport: false, meaning: 'Known failure is supported by a failed tool receipt or by verified evidence of an unmet acceptance criterion.' },
+  },
+  admission: 'BLOCK is assigned by the prerequisite state machine when no rule can pass. Agents submit PASS or FAILED.',
+  completionKinds: {
+    report: 'A reviewed PASS publishes the unit report. Evidence must support the stated acceptance criteria.',
+    artifact: 'A reviewed PASS also requires verification of the declared artifact.',
+  },
+  relations: {
+    prerequisite: 'Declared all, any and not expressions evaluate predecessor PASS, FAILED or BLOCK.',
+    contexts: supervisionSemantics.relations.contexts,
+    inheritReports: 'Explicit report transfer requires a published PASS report.',
+  },
+})
+
+export const semanticsFor = plan => plan?.ruleVersion === 1 ? unitSemantics : supervisionSemantics

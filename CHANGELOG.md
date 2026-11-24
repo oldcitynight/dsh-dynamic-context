@@ -1,23 +1,39 @@
-# 0.1.1-rc.60
+# 0.1.2-rc.1
+
+- 单元工作流 v2，Linux 与 WSL，工作流兼容周期 1。全新版本基数从 rc.0 重新编号。
+- 本包与官方 Timeline 不兼容。包内新增离线 HTML 运行图谱、逐角色上下文、工具名单和联动指南。
+
+# 0.1.1-rc.62
 
 - Visual inspection: each role chooses up to 5 new images per turn. The model sees the most recent 10 image occurrences; references and original tool records remain available for a fresh read.
 
 - 更新预规划、执行和终审角色，支持工作区只读取证、用户中途引导、权限热更新及检查点恢复。
 
-# 0.1.1-rc.40
+# 0.1.1-rc.42
 
-- 配套任务图包更名为 `dsh-better-task-grapth@0.3.1-rc.40`。
+- Inherit main conversation permissions by default; hot-update native workers and preplanning, cancel only tools affected by tightening, and preserve partial-effect receipts and task/Plan boundaries.
+- Add native Settings controls for future workflow defaults, persist per-workflow preferences, and permit exact authorized old-default migration on explicit continuation.
+
+- Add scoped Skill role-prompt and tool-policy services, with explicit defaults for all 94 current native and plugin tool IDs and an offline coverage check.
+- Route human guidance through separate interpretation and dispatch roles at safe tool boundaries; support scoped mid-leaf blueprint suspension and read-only intermediate progress reports.
+- Generate structured role reports through checked draft tools, retain templates and local edits, and replay declaration receipts without repeating completed work.
+- Stream ZIP evidence beyond the previous 128 MiB limits while retaining read-only identity, member integrity and path checks.
+- Keep changes local to the DSH 0.2.1-rc.5 maintenance line. No live profile replacement or publication is implied.
+
+# Unreleased local changes — 2026-11-15
+
+- Directory snapshot receipts, synchronized report schemas and examples, scoped reviewer pointers, precise validation feedback, and selected report repair with exact paused-read replay.
+- Keep published version history below unchanged; this local work has not been published.
+
+# 0.1.1-rc.42
+
+- 配套任务图包更名为 `dsh-better-task-grapth@0.3.1-rc.42`。
 - 支持运行中直接修订共享上下文，并持久保存版本。
 
-# 0.1.1-rc.30 — DSH compatibility line
+# 0.1.1-rc.32 — DSH compatibility line
 
-- Pin this build to its listed DSH releases and pair it with the other plugin on RC slot 0.
+- Pin this build to its listed DSH releases and pair it with the other plugin on RC slot 2.
 - Use the native Session plugin record API.
-
-# 0.1.0-rc.26 — DSH 0.2.2-rc.3 compatibility (2026-11-14)
-
-- Use scoped native tool execution and per-step tool admission for direct tasks.
-- Mount the current account service, preserve file observation per worker, and verify root controller boundaries.
 
 # 0.1.0-rc.24 — task-graph prerequisite and graph provenance (2026-11-13)
 

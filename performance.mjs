@@ -23,7 +23,7 @@ export const performanceDefinition = {
 }
 const inert = { delta() {}, progress() {}, end() {} }
 export class RequestPerformance {
-  constructor(ctx) { this.ctx = ctx; this.toolCalls = new Map(); this.warned = false }
+  constructor(ctx) { this.ctx = ctx; this.toolCalls = new Map(); this.windows = new Map(); this.warned = false }
   safe(fn) {
     try { return fn() } catch { if (!this.warned) { this.warned = true; this.ctx.logger?.warn?.('REQUEST_PERFORMANCE_OBSERVATION_FAILED') } }
   }
@@ -56,6 +56,9 @@ export class RequestPerformance {
     publish()
     let ended = false
     return {
+      window: value => {
+        if (Number.isSafeInteger(value) && value > 0 && !sample.contextWindow) { sample.contextWindow = value; publish() }
+      },
       delta: delta => {
         if (!ended && sample.firstTokenAt === undefined && (delta.text || delta.reasoning || delta.tools?.length)) sample.firstTokenAt = Date.now()
       },
@@ -71,16 +74,36 @@ export class RequestPerformance {
       },
     }
   }
+  routeWindow(session, provider, model) {
+    if (!session || !provider || !model) return
+    for (const current of [session, ...this.ancestors(session)]) {
+      const route = current.requestContext?.() ?? current.snapshotEvents().findLast(row => row.type === 'request/context')?.data
+      if (route?.provider === provider && route.model === model && route.contextWindow > 0) return route.contextWindow
+    }
+  }
+  attachWindow(observation, provider, model) {
+    if (!observation || !this.ctx.llm?.resolveModelInfo || !provider || !model) return
+    const key = JSON.stringify([provider, model])
+    if (!this.windows.has(key)) {
+      if (this.windows.size >= 128) this.windows.delete(this.windows.keys().next().value)
+      const resolution = Promise.resolve().then(() => this.ctx.llm.resolveModelInfo(provider, model))
+        .then(info => info?.context?.contextWindow, () => undefined)
+      this.windows.set(key, resolution)
+    }
+    void this.windows.get(key).then(value => this.safe(() => observation.window?.(value)))
+  }
   direct(owner, id, { payload, inputMeasurement, config, ...meta }) {
     return this.safe(() => {
-    const route = owner?.session?.snapshotEvents().findLast(row => row.type === 'request/context')?.data
-    return this.begin(owner?.session, id, { ...meta,
+    const contextWindow = config.direct.compaction?.contextWindow ?? this.routeWindow(owner?.session, config.provider, config.model)
+    const observation = this.begin(owner?.session, id, { ...meta,
       inputTokens: inputMeasurement?.tokens ?? roleInputTokens(payload),
-      contextWindow: config.direct.compaction?.contextWindow ?? (route?.provider === config.provider && route?.model === config.model ? route.contextWindow : undefined),
+      contextWindow,
       breakdown: { systemTokens: roleInputTokens({ messages: payload.messages.filter(row => row.role === 'system') }),
         toolsTokens: roleInputTokens({ messages: [], tools: payload.tools }),
         messageTokens: roleInputTokens({ messages: payload.messages.filter(row => row.role !== 'system') }) },
     })
+    if (!contextWindow) this.attachWindow(observation, config.provider, config.model)
+    return observation
     }) ?? inert
   }
   tool(owner, prefix, type, data, time = Date.now()) {
@@ -103,6 +126,7 @@ export class RequestPerformance {
   install() {
     const monitor = this, ctx = this.ctx
     ctx.sessionProjections.register(performanceDefinition)
+    ctx.on('llm/adapters-updated', () => this.windows.clear())
     ctx.on('session/created', session => monitor.safe(() => monitor.recover(session)))
     for (const session of ctx.sessions.list()) monitor.safe(() => monitor.recover(session))
     // Main native requests already contribute to native projections. Auxiliary
@@ -115,8 +139,7 @@ export class RequestPerformance {
       const turn = session.snapshotEvents().findLast(row => row.type === 'turn/start')?.data.turn ?? 0
       const pressure = ctx.sessionProjections.snapshot(session).values.contextPressure
       const nativeLoop = isAgentLoopRequest(request)
-      const route = session.snapshotEvents().findLast(row => row.type === 'request/context')?.data
-      const contextWindow = nativeLoop ? pressure?.contextWindow : route?.provider === request.provider && route?.model === request.model ? route?.contextWindow : undefined
+      const contextWindow = (nativeLoop ? pressure?.contextWindow : undefined) ?? monitor.routeWindow(session, request.provider, request.model)
       const inputTokens = nativeLoop ? pressure?.projectedTokens ?? pressure?.pressureTokens : roleInputTokens({ messages: request.messages ?? [], tools: request.tools })
       const targets = nativeLoop ? parents : [session, ...parents]
       if (nativeLoop) monitor.publish([session], { id, revision: 1, kind: 'native-anchor', source: 'native', startedAt })
@@ -124,8 +147,10 @@ export class RequestPerformance {
         // begin normally traverses ancestry; use just this target to avoid
         // counting a grandchild twice in an ancestor.
         const local = Object.create(monitor); local.ancestors = () => []
-        return local.begin(target, id, { native: true, startedAt, sessionId: session.id, source: request.purpose ?? (nativeLoop ? 'subagent' : 'auxiliary'),
+        const observation = local.begin(target, id, { native: true, startedAt, sessionId: session.id, source: request.purpose ?? (nativeLoop ? 'subagent' : 'auxiliary'),
           group: session.id + ':' + turn, countsTurn: target !== session, contextWindow, inputTokens })
+        if (!contextWindow) monitor.attachWindow(observation, request.provider, request.model)
+        return observation
       })
       }) ?? []
       let usage, finish

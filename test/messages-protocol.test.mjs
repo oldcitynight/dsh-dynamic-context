@@ -189,7 +189,7 @@ test('all independent roles, JSON validation and role compaction use Messages wi
   } })
   t.after(async () => { await backend.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const runner = { controller: source('low'), ctx: { get: () => ({ resolve: async () => ({ value: 'fake-only' }) }) },
-    config: validateConfig({ projectRoot: root, directory: root, provider: 'fake', model: 'fake-llama', systemPrompt: 'Host', transport: 'direct',
+    config: validateConfig({ dynamicContextMaxBytes: 8388608, projectRoot: root, directory: root, provider: 'fake', model: 'fake-llama', systemPrompt: 'Host', transport: 'direct',
       revision: { policy: { objective: 'Check', requirements: [{ id: 'a', text: 'Check evidence' }] }, maxOutputTokens: 32768 },
       direct: { ...direct, endpoint: backend.origin + '/v1/messages', apiKeyEnv: 'FAKE_KEY', durable: true,
         compaction: { strategy: 'dsh-native', contextWindow: 262144 }, maxRequestBytes: null, maxResponseBytes: null } }) }

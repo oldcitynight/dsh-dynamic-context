@@ -14,7 +14,7 @@ export const revisionPolicySchema = z.object({ objective: text,
   requirements: z.array(z.object({ id: key, text }).strict()).min(1),
 }).strict().refine(value => new Set(value.requirements.map(row => row.id)).size === value.requirements.length)
 export const revisionProposalSchema = z.object({
-  disposition: z.enum(['REVISE', 'NO_CHANGE', 'NEEDS_USER']),
+  disposition: z.enum(['REVISE', 'NO_CHANGE', 'ESCALATE', 'NEEDS_USER']),
   trigger: z.enum(['COUNTEREXAMPLE', 'MISSING_DEPENDENCY', 'CONTEXT_GAP', 'STALE_REPORT', 'USER_CHANGE', 'NONE']),
   reason: text, evidenceIds: z.array(key),
   taskGraph: z.record(z.string(), z.unknown()).nullable(),
@@ -28,9 +28,9 @@ export const revisionVerdictSchema = revisionCheckSchema
 
 export function planDefinition(plan) {
   const keys = new Map(plan.nodes.map(node => [node.id, node.key]))
-  return { title: plan.title, ...(plan.hierarchy ? { hierarchy: copy(plan.hierarchy) } : {}), nodes: plan.nodes.map(({ key, kind, label, parent, switchCases, terminal, acceptance }) => ({ key, kind, label,
+  return { title: plan.title, ...(plan.ruleVersion ? {ruleVersion:plan.ruleVersion} : {}), ...(plan.hierarchy ? { hierarchy: copy(plan.hierarchy) } : {}), nodes: plan.nodes.map(({ key, kind, label, parent, switchCases, terminal, acceptance, rules }) => ({ key, kind, label, ...(rules ? {rules:copy(rules)} : {}),
     ...(parent === null ? {} : { parent: keys.get(parent) }), ...(terminal ? { terminal: keys.get(terminal), acceptance } : {}), ...(switchCases.length ? { switchCases } : {}) })),
-  edges: plan.edges.map(({ kind, from, to, outcome, case: selected }) => ({ kind, from: keys.get(from), to: keys.get(to),
+  edges: plan.edges.filter(edge=>edge.kind!=='rule').map(({ kind, from, to, outcome, case: selected }) => ({ kind, from: keys.get(from), to: keys.get(to),
     ...(outcome === undefined ? {} : { outcome }), ...(selected === undefined ? {} : { case: selected }) })) }
 }
 

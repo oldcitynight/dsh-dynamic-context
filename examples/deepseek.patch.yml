@@ -17,7 +17,6 @@
     allowedTools: [read, write, edit, glob, grep, skill, dynamic_task_status, dynamic_context_source_read, dynamic_context_shared_read, dynamic_context_shared_update]
     interaction: { mode: interactive }
     exposeControlTools: true
-    maxContextCharacters: 128000
     maxOutputTokens: 8192
     maxRequestsPerTask: 16
     timeoutMs: 600000
@@ -32,7 +31,6 @@
       thinking: { type: enabled }
       reasoningEffort: auto
       durable: true
-      maxJournalBytes: 134217728
       compaction:
         triggerCharacters: 50000
         retainRecentExchanges: 0

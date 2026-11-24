@@ -6,7 +6,7 @@ import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 const digest = value => createHash('sha256').update(value).digest('hex')
-export const presentationHashes = Object.freeze({"0.2.2-rc.4": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b", "0.2.2-rc.3": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b", "0.2.2-rc.2": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b"})
+export const presentationHashes = Object.freeze({"0.2.2-rc.5": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b", "0.2.2-rc.4": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b", "0.2.2-rc.3": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b", "0.2.2-rc.2": "6facb89754f0d21af91491a32646be87ff1b4a25891e44cce1732b02b0fe123b"})
 export const presentationHosts = Object.freeze(Object.keys(presentationHashes))
 const component = 'const Comp=entry.component;'
 const componentBridge = 'const Comp=host.presentation?.component(slotKey,entry)??entry.component;'

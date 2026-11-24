@@ -5,8 +5,23 @@ import { execFileSync } from 'node:child_process'
 import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { DISPLAY_EVENT, executionChatDefinition } from '../client.source.mjs'
 import { structuredLabel, structuredParts } from '../client-enhancements.mjs'
+import { dynamicToolNames } from '../tool-display-names.mjs'
+import defaults from '../policies/role-defaults.json' with { type: 'json' }
 const event = (row, text = '', extra = {}) => ({ seq: row.revision, type: DISPLAY_EVENT,
   data: { version: 1, workflowId: 'workflow', row, text, offset: 0, ...extra } })
+test('every dynamic-context tool has Chinese and English display names under its exact wire ID', () => {
+  const ids = new Set(defaults.catalog.filter(row => row.origin === 'dynamic-context').flatMap(row => row.tools))
+  assert.deepEqual(new Set(Object.keys(dynamicToolNames)), ids)
+  for (const id of ids) {
+    const [zh, en] = dynamicToolNames[id]
+    assert.match(zh, /\p{Script=Han}/u, id)
+    assert.match(en, /[a-z]/i, id)
+    assert.doesNotMatch(en, /\p{Script=Han}/u, id)
+    assert.notEqual(en, id)
+  }
+  assert.deepEqual(dynamicToolNames.dynamic_context_read_rules, ['读取前序规则', 'Read prerequisite rules'])
+  assert.ok(ids.has('dynamic_task_status'))
+})
 test('execution projection reuses native assistant, reasoning and tool nodes with append-only stream state', () => {
   const definition = executionChatDefinition(PartialArguments)
   assert.equal(definition.match({ type: 'assistant/message', data: {} }), null)

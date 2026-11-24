@@ -35,6 +35,7 @@ export async function startFakeLlama({ respond, maxRequests = 64, maxRequestByte
         }
       }
       const output = await respond({ payload, index, record })
+      if (output.disconnectBeforeResponse) { res.destroy(); return }
       if (output.hang) return
       if (output.status) { res.writeHead(output.status, output.headers); res.end(output.body ?? ''); return }
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })

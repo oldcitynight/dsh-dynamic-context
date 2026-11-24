@@ -3,11 +3,12 @@
 // owns Markdown, reasoning disclosures, tool cards, terminal output and settings.
 import { installNativePresentation, foldMetadata } from './client-enhancements.mjs'
 import { installPreferenceSettings } from './settings-client.mjs'
+import { dynamicToolNames } from './tool-display-names.mjs'
 export const DISPLAY_EVENT = 'plugin:dsh-dynamic-context/execution-display-v1'
 const stages = { PREPLANNING: '预规划', EXECUTING: '叶执行', result_check: '结果验收', result_repair: '报告补正', result_work: '成果返工',
   plan_check: '计划复查', updater: '图更新', reviewer: '修改审计', compaction: '上下文压缩',
-  blockage: '阻塞处理', blockage_audit: '中断审核', group_audit: '组级终审', scope_plan: '本层计划复查', scope_update: '本层蓝图更新',
-  scope_audit: '修改审计', scope_blockage: '分层阻塞处理', scope_pause: '中断审核', task_reporter: '任务报告', progress_reporter: '阶段执行报告', guidance_intake: '用户引导识别', guidance_router: '用户引导分派' }
+  blockage: '阻塞处理', blockage_audit: '中断审核', group_audit: '组级终审', unit_planner: '单元规划', unit_rebaseline: '单元重基线', unit_plan_audit: '规划审计', unit_audit: '单元终审', scope_plan: '本层计划复查', scope_update: '本层蓝图更新',
+  scope_audit: '修改审计', scope_blockage: '分层阻塞处理', scope_pause: '中断审核', task_reporter: '任务报告', progress_reporter: '阶段执行报告', unit_router: '单元路由', baseline_audit: '基线审计', guidance_intake: '用户引导识别', guidance_router: '用户引导分派' }
 const escapeMarkdown = text => String(text).replace(/[\\`*_{}\[\]()#+.!<>]/g, '\\$&')
 export function executionChatDefinition(PartialArguments) {
   const start = match => ({ row: match.event.data.row, text: match.event.data.text,
@@ -70,6 +71,9 @@ export function createExecutionClient(PartialArguments, React, primitives) {
     } }
   return { inject: ['uiConversation', 'slots'], apply(ctx) {
     ctx.uiConversation.events.register(chat); ctx.uiConversation.events.register(trajectory)
+    ctx.inject(['transactionGraphToolDisplay', 'locale'], scoped => {
+      scoped.transactionGraphToolDisplay.register(scoped, 'dynamicContext.tools', dynamicToolNames)
+    })
     if (React && primitives) installNativePresentation(ctx, React, primitives)
     if (React && primitives) installPreferenceSettings(ctx, React, primitives)
   } }

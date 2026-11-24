@@ -15,7 +15,6 @@
       observations do not grant permissions or prove independent acceptance.
       Check tool results and reserve model calls for verification and a final report.
     allowedTools: [read, write, edit, glob, grep, bash, dynamic_task_status, dynamic_context_shared_read, dynamic_context_shared_update]
-    maxContextCharacters: 8388608
     maxOutputTokens: 32768
     maxRequestsPerTask: 128
     timeoutMs: 1200000
@@ -32,7 +31,6 @@
       durable: true
       reserveFinalReport: true
       maxRequestBytes: 8388608
-      maxJournalBytes: 4294967296
       maxResponseBytes: 8388608
       runtime:
         modules: [filesystem, search, shell, state]

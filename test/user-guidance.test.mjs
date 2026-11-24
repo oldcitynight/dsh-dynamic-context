@@ -7,6 +7,7 @@ import UserQuestions from '@deepseek-ai/dsh-user-questions'
 import Commands from '@deepseek-ai/dsh-commands'
 import * as Persistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { rootTask, unitBackend, unitReport } from '../testing/unit-proposal.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { MODE_OPTIONS } from '../interaction.mjs'
 import { EXECUTION_OPTIONS } from '../orchestration.mjs'
@@ -22,9 +23,9 @@ const system = payload => payload.messages.find(row => row.role === 'system')?.c
 const isPlanner = payload => system(payload).includes('DYNAMIC_CONTEXT_PREPLANNER_V1')
 const isController = payload => names(payload).includes('dynamic_context_graph_status')
 const json = value => ({ text: JSON.stringify(value) })
-async function fixture(t, respond, config = {}) {
+async function fixture(t, respond, config = {}, plan) {
   const root = fs.mkdtempSync(path.join(os.homedir(), '.dsh-guidance-fake-')), projectRoot = path.join(root, 'project'); fs.mkdirSync(projectRoot)
-  const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), respond,
+  const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), respond: unitBackend(respond, { supervise: config.supervision, plan }),
     config: { interaction: { mode: 'interactive' }, storageRoot: root, exposeControlTools: true, preplanningAcceptance: false,
       ...config, direct: { durable: true, ...config.direct } }, setup: async ctx => {
       await ctx.plugin(UserQuestions); await ctx.plugin(Commands); await ctx.plugin(Persistence, { root: path.join(root, 'sessions') })
@@ -51,7 +52,7 @@ function guidanceReply(payload, action = 'dispatch') {
 test('guidance arriving during reasoning stops the old tool batch, runs both handlers, and resumes the exact leaf', { timeout: 20000 }, async t => {
   const entered = deferred(), release = deferred(), order = []; let workers = 0
   const f = await fixture(t, async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (isController(payload)) return { text: 'Recorded.' }
     if (system(payload).includes('DYNAMIC_CONTEXT_GUIDANCE_')) { order.push(system(payload).includes('INTAKE') ? 'intake' : 'router'); return guidanceReply(payload) }
     workers++; order.push('worker' + workers)
@@ -76,7 +77,7 @@ test('guidance arriving during reasoning stops the old tool batch, runs both han
 test('guidance during a real extension tool retains that result once and skips the following call', { timeout: 20000 }, async t => {
   const entered = deferred(), release = deferred(); let workers = 0, calls = 0
   const f = await fixture(t, ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['fixture_guided_work']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['fixture_guided_work']) })
     if (isController(payload)) return { text: 'Recorded.' }
     if (system(payload).includes('DYNAMIC_CONTEXT_GUIDANCE_')) return guidanceReply(payload)
     if (++workers === 1) return { tools: [{ name: 'fixture_guided_work', arguments: { item: 'first' } }, { name: 'fixture_guided_work', arguments: { item: 'second' } }] }
@@ -96,7 +97,7 @@ test('guidance during a real extension tool retains that result once and skips t
 
 test('executor prompt override and tool blacklist reach the actual native-backed direct request', { timeout: 20000 }, async t => {
   const f = await fixture(t, ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['read', 'write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['read', 'write']) })
     if (isController(payload)) return { text: 'Recorded.' }
     assert.match(JSON.stringify(payload.messages), /CUSTOM_EXECUTOR_SKILL/)
     assert.match(JSON.stringify(payload.messages), /Host role protocol v1/)
@@ -114,7 +115,7 @@ test('guidance after report tool success reopens the declaration before semantic
   let workers = 0, guided = false
   const f = await fixture(t, ({ payload }) => {
     if (isPlanner(payload)) {
-      const proposal = runtimeProposal([]); proposal.contextGraph.bindings[0].completion = { kind: 'report' }
+      const proposal = rootTask(); proposal.contextGraph.bindings[0].completion = { kind: 'report' }
       return tool('dynamic_context_submit', { proposal })
     }
     if (isController(payload)) return { text: 'Recorded.' }
@@ -122,7 +123,7 @@ test('guidance after report tool success reopens the declaration before semantic
     if (payload.response_format) return json(system(payload).includes('倒查') || system(payload).includes('当前规划')
       ? { verdict: 'CURRENT' } : { verdict: 'ACCEPT', reason: 'The updated declaration was checked.' })
     workers++
-    if (workers === 1) return tool('dynamic_context_generate_report', { report: { outcome: 'COMPLETE', summary: 'Initial declaration' } })
+    if (workers === 1) return tool('dynamic_context_generate_report', { report: unitReport('Initial declaration') })
     if (workers === 2) return tool('dynamic_context_rewrite_report', { expectedRevision: 1, edits: [{ op: 'set', path: '/summary', value: 'Updated declaration' }] })
     assert.match(payload.messages.at(-1).content, /"revision":2/)
     assert.doesNotMatch(payload.messages.at(-1).content, /REPORT_ALREADY_SUBMITTED/)
@@ -149,7 +150,7 @@ test('guidance after report tool success reopens the declaration before semantic
 test('interim report request runs a read-only reporter, repairs an invalid claim locally and resumes the leaf', { timeout: 20000 }, async t => {
   const entered = deferred(), release = deferred(); let workers = 0, reports = 0, f
   f = await fixture(t, async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (isController(payload)) return { text: 'Recorded.' }
     if (system(payload).includes('GUIDANCE_INTAKE')) return tool('dynamic_context_generate_report', { report: { level: 'information', intent: 'Report current progress', targets: [], conditions: [], changes: ['report'], needsClarification: false } })
     if (system(payload).includes('GUIDANCE_ROUTER')) return tool('dynamic_context_generate_report', { report: { action: 'dispatch', summary: 'Report the current state', jobs: [{ role: 'progress_reporter', instruction: 'Summarize intermediate work', when: 'now' }] } })
@@ -175,17 +176,13 @@ test('interim report request runs a read-only reporter, repairs an invalid claim
   assert.equal(guidanceRecords(f.agent.session)[0].jobs[0].status, 'DONE')
 })
 
-function guidedHierarchy() {
-  const p = runtimeProposal(['write'])
-  p.taskGraph.hierarchy = { version: 1, maxGroupDepth: 3 }
-  p.taskGraph.nodes[0].terminal = 'task'; p.taskGraph.nodes[0].acceptance = 'Produce the requested fixture.'
-  p.contextGraph.bindings[0].completion = { kind: 'report' }
-  return p
-}
 for (const revise of [false, true]) test('immediate blueprint review suspends unfinished work and ' + (revise ? 'audited changes start a new attempt with old evidence' : 'NO_CHANGE resumes its checkpoint'), { timeout: 20000 }, async t => {
   const entered = deferred(), release = deferred(); let workers = 0, oldAttempt, f
   f = await fixture(t, async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: guidedHierarchy() })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask() })
+    if (system(payload).includes('DYNAMIC_CONTEXT_UNIT_ROUTER_V1')) return json({action:'EXECUTE',reason:'The selected unit is ready.'})
+    if (system(payload).includes('DYNAMIC_CONTEXT_BASELINE_AUDIT_V1')) return json({verdict:'APPROVE',reason:'The corrected instruction matches the user request.',issues:[]})
+    if (system(payload).includes('RULE_BLUEPRINT_AUDIT_V1')) return json({verdict:'APPROVE',reason:'The terminal meets the declared fixture contract.'})
     if (isController(payload)) return { text: 'Recorded.' }
     const input = payload.response_format ? JSON.parse(payload.messages[1].content) : null
     if (system(payload).includes('GUIDANCE_INTAKE')) return json({ level: 'workflow', intent: 'Check the blueprint immediately', targets: [], conditions: [], changes: ['plan'], needsClarification: false })
@@ -196,13 +193,14 @@ for (const revise of [false, true]) test('immediate blueprint review suspends un
       assert.ok(input.unfinishedWork)
       if (!revise) return json({ action: 'NO_CHANGE', reason: 'The current contract already permits the requested correction.' })
       const blueprint = structuredClone(input.blueprint.value), contextGraph = blueprint.contextGraph
-      contextGraph.bindings[0].instruction = 'Follow the new user direction and inspect preserved partial work before redoing anything.'
+      contextGraph.bindings = contextGraph.bindings.filter(row => row.task !== blueprint.scope.key)
+      contextGraph.bindings.find(row => row.task === 'task').instruction = 'Follow the new user direction and inspect preserved partial work before redoing anything.'
       return tool('dynamic_context_generate_report', { report: { action: 'REVISE', terminal: blueprint.scope.terminal, nodes: blueprint.nodes, edges: blueprint.edges, contextGraph,
         modifications: [{ path: '/contextGraph/bindings/task', reason: 'The user explicitly changed the direction.', evidence: [{ source: input.guidanceEvidence.source, sha256: input.guidanceEvidence.sha256, path: '/content/0/text', quote: input.guidanceEvidence.value.content[0].text }] }] } })
     }
     if (payload.response_format) {
       if (system(payload).includes('SCOPE_AUDIT')) return tool('dynamic_context_generate_report', { report: { verdict: 'APPROVE', reason: 'Only the requested binding changed; existing work is retained.', issues: [] } })
-      if (system(payload).includes('GROUP_FINAL')) return json({ action: 'COMPLETE', summary: 'Terminal result checked.', limitations: [], children: input.reports.map(row => ({ nodeId: row.value.taskId, conclusion: 'SATISFIED', reason: 'The leaf contract is satisfied.', evidence: [{ source: row.source, sha256: row.sha256, path: '/result/summary', quote: row.value.result.summary }] })) })
+      if (system(payload).includes('GROUP_FINAL')) return json({ action: 'PASS', summary: 'Terminal result checked.', limitations: [], children: input.reports.map(row => ({ nodeId: row.value.taskId, conclusion: 'SATISFIED', reason: 'The leaf contract is satisfied.', evidence: [{ source: row.source, sha256: row.sha256, path: '/result/summary', quote: row.value.result.summary }] })) })
       if (system(payload).includes('TASK_REPORTER')) return json({ title: 'Final report', summary: 'Work completed.', achievements: ['Fixture'], limitations: [], verification: ['Reviewed'], nextSteps: [], evidence: [{ source: input.reports[0].source, sha256: input.reports[0].sha256, path: '/result/summary', quote: input.reports[0].value.result.summary }] })
       return json({ verdict: 'ACCEPT', reason: 'Current leaf request accepted.' })
     }
@@ -210,8 +208,8 @@ for (const revise of [false, true]) test('immediate blueprint review suspends un
     if (workers === 1) { oldAttempt = f.runner().graph.read().graph.state.active.attemptId; entered.resolve(); await release.promise; return tool('write', { file_path: 'old.txt', content: 'must not run' }) }
     if (revise) { assert.notEqual(f.runner().graph.read().graph.state.active.attemptId, oldAttempt); assert.match(JSON.stringify(payload.messages), /interruptedWork/); assert.match(JSON.stringify(payload.messages), /sourceRead/) }
     else assert.equal(f.runner().graph.read().graph.state.active.attemptId, oldAttempt)
-    return json({ outcome: 'COMPLETE', summary: 'Report-only fixture completed.' })
-  }, { supervision: true, revision: { policy: { objective: 'Produce a fixture report', requirements: [{ id: 'fixture', text: 'Retain evidence' }] } } })
+    return json(unitReport('Report-only fixture completed.'))
+  }, { supervision: true, revision: { policy: { objective: 'Produce a fixture report', requirements: [{ id: 'fixture', text: 'Retain evidence' }] } } }, { keys: ['task'], bindings: { task: { tools: ['write'] } } })
   await f.start(); await entered.promise; f.agent.steer(user('现在先停下，立即重新检查任务图，改图处理之后继续')); release.resolve(); await f.agent.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
   assert.equal(f.status().phase, 'COMPLETE', JSON.stringify(f.status()))
@@ -224,7 +222,7 @@ for (const revise of [false, true]) test('immediate blueprint review suspends un
 test('asking for an interim report from a normal pause preserves the pause and never resumes work', { timeout: 20000 }, async t => {
   const entered = deferred(), release = deferred(); let workers = 0, reports = 0
   const f = await fixture(t, async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (isController(payload)) return { text: 'Recorded.' }
     if (system(payload).includes('GUIDANCE_INTAKE')) return json({ level: 'information', intent: 'Current progress only', targets: [], conditions: ['Remain paused'], changes: ['report'], needsClarification: false })
     if (system(payload).includes('GUIDANCE_ROUTER')) return json({ action: 'dispatch', summary: 'Produce interim report', jobs: [{ role: 'progress_reporter', instruction: 'Report progress without resuming work', when: 'now' }] })
@@ -251,4 +249,38 @@ test('role routing excludes another leaf instructions and cancelled jobs while p
   const guidance = applicableGuidance(runner, 'executor', { taskId: 'a' })
   assert.equal(guidance[0].roleInstructions.length, 1); assert.equal(guidance[0].roleInstructions[0].instruction, 'A direction')
   assert.deepEqual(guidance[0].original, message.content)
+})
+
+test('unit v2 routes a real user correction to the exact scoped fact and persists the updated revision', async t => {
+  const started = deferred(), release = deferred()
+  let calls = 0
+  const content = '修订后事实 2026', f = await fixture(t, async ({ payload }) => {
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask() })
+    if (isController(payload)) return { text: 'Recorded.' }
+    if (system(payload).includes('DYNAMIC_CONTEXT_GUIDANCE_INTAKE_V1')) return json({
+      level: 'leaf', intent: 'Revise the current fact.', targets: [JSON.parse(payload.messages[1].content).graph.active.nodeId], conditions: [], changes: ['fact'], needsClarification: false,
+    })
+    if (system(payload).includes('DYNAMIC_CONTEXT_GUIDANCE_ROUTER_V1')) {
+      const input = JSON.parse(payload.messages[1].content), current = input.factIndex.find(row => row.key === 'shared')
+      return json({ action: 'update_fact', summary: 'Applied user correction.', jobs: [], fact: {
+        scopeId: current.scopeId, id: current.id, expectedRevision: current.revision, content,
+      } })
+    }
+    if (++calls === 1) { started.resolve(); await release.promise }
+    return { text: JSON.stringify(unitReport('Checked current unit.')) }
+  })
+  await f.start()
+  await Promise.race([started.promise, f.agent.whenIdle().then(() => assert.fail('Execution failed to start.'))])
+  f.agent.steer(user('把本单元共享事实 shared 改为「' + content + '」。'))
+  await new Promise(resolve => setImmediate(resolve))
+  release.resolve()
+  await f.agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  const records = guidanceRecords(f.agent.session)
+  assert.equal(records[0].phase, 'APPLIED', JSON.stringify(f.status()))
+  const changes = f.runner().graph.read().sharedContextHistory
+  assert.equal(changes.length, 1)
+  assert.equal(changes[0].content, content)
+  assert.equal(changes[0].revision, 2)
+  assert.equal(f.status().phase, 'COMPLETE')
 })

@@ -19,6 +19,7 @@ import { createAssistantMessage, createSystemMessage, createToolResultMessage } 
 import { appendPluginRecord, Session } from '@deepseek-ai/dsh-session'
 import { digest } from 'dsh-better-task-grapth/core'
 import { deepFreeze, textContent } from './request-policy.mjs'
+import { bytes, executionMaterial, materialBundle, materialView, materialLimit } from './context-budget.mjs'
 import { DynamicContextError, contextText, fail } from './core.mjs'
 import { authorityInputs, inputDigestMatches } from './authority.mjs'
 import { normalizeLegacyStepOrder, recoverNativeToolPairs } from './native-recovery.mjs'
@@ -33,9 +34,9 @@ import { effectivePermissions, permissionsTightened, PERMISSION_NOTICE } from '.
 export const TOOL_REQUEST_REJECTIONS = new Set(['DIRECT_RUNTIME_PLAN_READ_ONLY', 'DIRECT_RUNTIME_ESCALATION_NOT_ALLOWED',
   'DIRECT_RUNTIME_UNMANAGED_SHELL', 'DIRECT_RUNTIME_PRIVATE_PATH_DENIED', 'DIRECT_PRIVATE_PATH_INVALID_TARGET', 'DIRECT_RUNTIME_INVALID_PATH'])
 
-const names = () => z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/)).max(64).refine(rows => new Set(rows).size === rows.length)
-export const directRuntimeSchema = z.object({
-  modules: z.array(z.enum(['filesystem', 'search', 'shell', 'web', 'skills', 'state'])).max(6)
+const names = () => z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/)).refine(rows => new Set(rows).size === rows.length)
+const runtimeOptions = z.object({
+  modules: z.array(z.enum(['filesystem', 'search', 'shell', 'web', 'skills', 'state']))
     .refine(rows => new Set(rows).size === rows.length).default(['filesystem', 'search', 'state']),
   cwd: z.string().optional(),
   sandboxMode: z.enum(['auto', 'read-only', 'workspace-write', 'danger-full-access']).default('auto'),
@@ -43,23 +44,27 @@ export const directRuntimeSchema = z.object({
   plan: z.boolean().default(false),
   registeredTools: names().default([]),
   planReadTools: names().default([]),
-  skills: z.array(z.string().min(1).max(160)).max(32).default([]),
-  requiredSkills: z.array(z.string().min(1).max(160)).max(32).default([]),
+  skills: z.array(z.string().min(1)).default([]),
+  requiredSkills: z.array(z.string().min(1)).default([]),
   instructions: z.boolean().default(true),
   protectPrivatePaths: z.boolean().default(true),
-  privateReadRoots: z.array(z.string().refine(path.isAbsolute)).max(16).default([]),
+  privateReadRoots: z.array(z.string().refine(path.isAbsolute)).default([]),
   instructionHomes: z.object({ dshHome: z.string().refine(path.isAbsolute), agentsHome: z.string().refine(path.isAbsolute) }).strict().optional(),
-  instructionMaxBytes: z.number().int().min(256).max(128000).default(64000),
   timeZone: z.string().min(1).max(80).refine(value => { try { new Intl.DateTimeFormat('en-US', { timeZone: value }); return true } catch { return false } }).default('UTC'),
-  maxToolOutputCharacters: z.number().int().min(256).max(8388608).nullable().default(64000),
   nativeRequestControls: z.boolean().default(false),
-  toolContextSources: z.array(z.enum(['repeat-tool-reminder'])).max(1).default(['repeat-tool-reminder']),
+  toolContextSources: z.array(z.enum(['repeat-tool-reminder'])).default(['repeat-tool-reminder']),
 }).strict().superRefine((value, ctx) => {
   if (value.requiredSkills.some(name => !value.skills.includes(name))) ctx.addIssue({ code: 'custom', message: 'Required skills must be explicitly allowed' })
   if (value.skills.length && !value.modules.includes('skills')) ctx.addIssue({ code: 'custom', message: 'Skill configuration requires the skills module' })
   if (value.planReadTools.some(name => !value.registeredTools.includes(name) || Object.values(moduleTools).flat().includes(name)))
     ctx.addIssue({ code: 'custom', message: 'Additional Plan classifications apply only to explicitly registered external tools' })
 })
+
+export const directRuntimeSchema = z.preprocess(value => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const { instructionMaxBytes, maxToolOutputCharacters, ...options } = value
+  return options
+}, runtimeOptions)
 
 const moduleTools = {
   filesystem: ['read', 'read_image', 'write', 'edit'], search: ['glob', 'grep'], shell: ['bash'], web: ['web_search', 'web_fetch'],
@@ -103,10 +108,10 @@ const jsonTool = (name, description, parameters, execute) => defineTool({ name, 
     render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] }, execute })
 
 /** Real DSH execution identity, with no model loop or default prompt providers. */
-export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader, sharedContext, roleExtensions = [], reportTools = [], correctionSource = false, allowedTools = config.allowedTools }) {
+export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader, sharedContext, roleExtensions = [], reportTools = [], runtimeGuidance = text => text, correctionSource = false, allowedTools = config.allowedTools }) {
   const options = config.direct.runtime
   if (!options) return undefined
-  const nativeArchives = config.direct.compaction?.strategy === 'dsh-native' || Boolean(assembly.interruptedWork)
+  const nativeArchives = config.direct.compaction?.strategy === 'dsh-native' || Boolean(assembly.unitBaseline || assembly.interruptedWork || assembly.materialSummary)
   for (const service of ['sandboxPolicy', 'approval', 'workingDirectory', ...options.modules.flatMap(name => requiredServices[name])]) {
     if (!ctx.get(service)) fail('DIRECT_RUNTIME_MISSING_SERVICE', service)
   }
@@ -134,7 +139,9 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
   if (resumeState) {
     const compatible = { ...resumeState.owner, mode: owner.mode, approval: owner.approval, authorityDigest: owner.authorityDigest }
     if (digest(compatible) !== digest(owner) || resumeState.sourceAgentId !== (sourceAgent?.id ?? null)
-        || sourceAgent && !inputDigestMatches(sourceAgent.session, resumeState.owner.authorityDigest)) fail('DIRECT_RESUME_OWNER_CHANGED')
+        || sourceAgent && !inputDigestMatches(sourceAgent.session, resumeState.owner.authorityDigest)) {
+      fail('DIRECT_RESUME_OWNER_CHANGED')
+    }
   }
   const ownerGoal = owner.goal ? { id: owner.goal.id, revision: owner.goal.revision, phase: owner.goal.phase } : null
   if (!modes.includes(owner.mode) || !['ask', 'never'].includes(owner.approval)) fail('DIRECT_RUNTIME_UNKNOWN_HOST_POLICY')
@@ -156,17 +163,15 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
     if (!options.instructions) return []
     const files = await discoverBaselineInstructionFiles({ cwd: directory, projectRoot: root,
       ...instructionHomes, signal: control.signal })
-    const rows = []; let total = 0
+    const rows = []
     for (const file of files) {
       control.signal.throwIfAborted()
       const fd = fs.openSync(file.absolutePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
       try {
         const before = fs.fstatSync(fd)
-        if (!before.isFile() || before.size > options.instructionMaxBytes) fail('DIRECT_RUNTIME_INSTRUCTION_BUDGET')
+        if (!before.isFile()) fail('DIRECT_RUNTIME_INSTRUCTION_CHANGED')
         const bytes = fs.readFileSync(fd), after = fs.fstatSync(fd)
         if (before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) fail('DIRECT_RUNTIME_INSTRUCTION_CHANGED')
-        total += bytes.length
-        if (total > options.instructionMaxBytes) fail('DIRECT_RUNTIME_INSTRUCTION_BUDGET')
         const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
         rows.push({ path: file.absolutePath, displayPath: file.displayPath, sha256: sha(bytes), content })
       } finally { fs.closeSync(fd) }
@@ -252,7 +257,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       }
     }
     if (options.modules.includes('state') || correctionSource || nativeArchives) capabilityScope.ctx.tools.register(jsonTool('dynamic_context_source_read',
-      'Read an exact bounded excerpt from this attempt’s checkpoint archive. Use the archive ID and message index from sourceRead, with a zero-based offset and length from 1 through 8000. Archived observations are historical evidence.\n'
+      'Read an exact bounded excerpt from this attempt’s checkpoint archive. Use the archive ID and message index from sourceRead, with a zero-based offset and a positive length in UTF-16 characters. Archived observations are historical evidence.\n'
         + jsonExample('Read recorded tool output', { archive_id: 'archive_example', message_index: 0, offset: 0, length: 120, field: 'content' }),
       { archive_id: { type: 'string', required: true }, message_index: { type: 'integer', required: true },
         offset: { type: 'integer' }, length: { type: 'integer' }, field: { type: 'string', enum: ['content', 'tool_calls', 'reasoning_content'] } },
@@ -292,7 +297,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       if (!options.skills.includes(name)) fail('DIRECT_RUNTIME_SKILL_NOT_ALLOWED')
       const skill = await hostCalls.run(true, () => skills.get(name, { cwd, signal: control.signal, scope: handle.agent }))
       if (!skill || !skill.invocation?.modelInvocable) fail('DIRECT_RUNTIME_SKILL_UNAVAILABLE')
-      if (typeof skill.content !== 'string' || skill.content.length > options.instructionMaxBytes) fail('DIRECT_RUNTIME_SKILL_BUDGET')
+      if (typeof skill.content !== 'string') fail('DIRECT_RUNTIME_SKILL_UNAVAILABLE')
       const prior = loadedSkills.get(name)
       if (prior && prior.sha256 !== sha(skill.content)) {
         const error = new DynamicContextError('DIRECT_RUNTIME_SKILL_CHANGED'); control.abort(error); throw error
@@ -317,20 +322,18 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       agentOptions: { provider: config.provider, model: config.model, maxTokens: config.maxOutputTokens },
       setup: async (agentCtx, agent) => {
         bindScopeParent(agent, scopeKey)
-        await agentCtx.plugin(NativeExecutor)
-        if (options.modules.includes('filesystem')) installFileObservations(agentCtx, agent)
         for (const tool of [...roleExtensions, ...reportTools]) if (assembly.tools.includes(tool.name)) {
           if (ctx.tools.get(tool.name, scopeKey)) fail('ROLE_TOOL_SHADOW_FORBIDDEN')
           capabilityScope.ctx.tools.register(tool)
         }
+        await agentCtx.plugin(NativeExecutor)
+        if (options.modules.includes('filesystem')) installFileObservations(agentCtx, agent)
         agentCtx.tools.restrict({ allow: assembly.tools })
         setSandboxMode(agent.session, policy.sandboxMode)
         setApprovalPolicy(agent.session, policy.approvalPolicy)
         appendPluginRecord(agent.session, 'plugin:dynamic-context/execution-host-v1', { taskId: assembly.task.id, contextVersion: assembly.contextVersion, policy })
         // The identity is native, but only this private runner owns its loop.
-        // A rejected competing caller does not own the active direct turn.
-        Object.defineProperty(agent, 'send', { value: () => fail('DIRECT_RUNTIME_NATIVE_MESSAGE_DISABLED'), configurable: false, writable: false })
-        for (const method of ['followup', 'inject', 'steer']) Object.defineProperty(agent, method, {
+        for (const method of ['send', 'followup', 'inject', 'steer']) Object.defineProperty(agent, method, {
           value: () => stop('DIRECT_RUNTIME_NATIVE_MESSAGE_DISABLED'), configurable: false, writable: false,
         })
         agentCtx.on('agent/pre-step', () => { stop('DIRECT_RUNTIME_NATIVE_MODEL_DISABLED') })
@@ -390,7 +393,25 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
       'Plan mode permits only host-classified read/protocol tools. Permissions cannot be widened by tool arguments. Goal and task state have distinct meanings.',
       ...(privacy ? ['Plugin-private state and managed DSH credential files are protected by the host. Shell/search see private directories as empty and credential parents as read-only snapshots without credentials or temporary credential files. Missing private data is an access boundary, not evidence that host history was deleted. Do not probe alternate paths. Other host files and network access are not generally isolated by this protection.'] : []),
     ]
-    const systemPrompt = `${config.systemPrompt}\n\n${rules.join('\n')}\n\n<direct_host_facts>\n${JSON.stringify(facts)}\n</direct_host_facts>`
+    let hostMaterialSummary = resumeState?.hostMaterialSummary
+    let wireFacts = facts
+    if (assembly.unitBaseline) {
+      const limit = materialLimit(config)
+      const unitMaterials = assembly.materialSummary ?? Object.fromEntries(Object.entries(assembly).filter(([key]) => executionMaterial.has(key)))
+      const available = Math.max(0, limit - bytes(JSON.stringify(unitMaterials)))
+      const hostMaterials = materialBundle(facts, available, new Set(['skills', 'requiredSkills', 'instructions']))
+      if (hostMaterials) {
+        if (!assembly.tools.includes('dynamic_context_source_read') || !sourceReader) fail('EXECUTION_MATERIAL_READER_REQUIRED')
+        if (hostMaterialSummary && hostMaterialSummary.sha256 !== hostMaterials.sha256) fail('DIRECT_RESUME_RUNTIME_FACTS_CHANGED')
+        const reader = hostMaterialSummary?.reader ?? { tool: 'dynamic_context_source_read', arguments: {
+          archive_id: sourceReader.archive([{ role: 'user', content: hostMaterials.text }]).id,
+          message_index: 0, field: 'content', offset: 0, length: 1024,
+        } }
+        wireFacts = materialView(facts, hostMaterials, reader, available)
+        hostMaterialSummary = wireFacts.materialSummary
+      }
+    }
+    const systemPrompt = `${config.systemPrompt}\n\n${runtimeGuidance(rules.join('\n'))}\n\n<direct_host_facts>\n${JSON.stringify(wireFacts)}\n</direct_host_facts>`
     const currentPolicy = () => ({ sandboxMode: sandboxPolicy.resolve({ session: agent.session }).mode,
       approvalPolicy: approval.effectivePolicy(agent.session), plan: policy.plan, cwd: workingDirectory.get(agent.session) })
     const refreshPermissions = () => {
@@ -426,7 +447,7 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         try {
           fd = fs.openSync(row.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
           const info = fs.fstatSync(fd)
-          if (!info.isFile() || info.size > options.instructionMaxBytes || sha(fs.readFileSync(fd)) !== row.sha256) fail('DIRECT_RUNTIME_INSTRUCTION_CHANGED')
+          if (!info.isFile() || sha(fs.readFileSync(fd)) !== row.sha256) fail('DIRECT_RUNTIME_INSTRUCTION_CHANGED')
         } catch { fail('DIRECT_RUNTIME_INSTRUCTION_CHANGED') }
         finally { if (fd !== undefined) fs.closeSync(fd) }
       }
@@ -470,6 +491,9 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
     return {
       agent, systemPrompt, facts, close, check,
       beforeAuxiliaryRequest: verifySources,
+      resolveTools: () => hostCalls.run(true, () => ctx.tools.resolve({ agent, signal: control.signal,
+        modelSelection: Object.freeze({ provider: config.provider, model: config.model,
+          ...(config.direct.reasoningEffort ? { reasoningEffort: config.direct.reasoningEffort } : {}) }) })),
       permissionUpdate() { check(); return permissionUpdate },
       async runTool(fn) {
         check()
@@ -487,12 +511,9 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
           code: 'DIRECT_TOOL_PERMISSION_REVOKED', effects: 'POSSIBLE_PARTIAL_EFFECTS', policy, instruction: PERMISSION_NOTICE }) }] }
         return result
       },
-      resolveTools: () => hostCalls.run(true, () => ctx.tools.resolve({ agent, signal: control.signal,
-        modelSelection: Object.freeze({ provider: config.provider, model: config.model,
-          ...(config.direct.reasoningEffort ? { reasoningEffort: config.direct.reasoningEffort } : {}) }) })),
       async snapshot() {
         await verifySources()
-        return { facts, owner, permissionUpdate, sourceAgentId: sourceAgent?.id ?? null,
+        return { facts, owner, permissionUpdate, ...(hostMaterialSummary ? { hostMaterialSummary } : {}), sourceAgentId: sourceAgent?.id ?? null,
           instructionPins: [...instructionPins.values()], instructionDirectories: [...instructionDirectories], loadedSkills: [...loadedSkills.values()],
           native: { header: agent.session.header, events: agent.session.snapshotEvents(), inheritedEventCount: agent.session.inheritedEventCount } }
       },
@@ -539,7 +560,6 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         for (const row of added.values()) instructionPins.set(row.path, row)
         const text = JSON.stringify({ execution: 'DEFERRED_NOT_EXECUTED', affectedCallIds: calls.map(call => call.id),
           reason: 'New applicable workspace instructions; reconsider only the listed unexecuted calls', instructions: [...added.values()] })
-        if (options.maxToolOutputCharacters !== null && text.length > options.maxToolOutputCharacters) fail('DIRECT_RUNTIME_INSTRUCTION_BUDGET')
         record('policy/instructions-loaded', { instructions: [...added.values()] })
         return text
       },
@@ -597,7 +617,6 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         const projected = observations.length || shellResult ? JSON.stringify({ output, ...(shellResult ? { execution: shellResult } : {}),
           ...(observations.length ? { observations, authority: 'tool-observations-only' } : {}) }) : output
         const content = toolErrorContent(result, projected)
-        if (options.maxToolOutputCharacters !== null && content.length > options.maxToolOutputCharacters) fail('DIRECT_RUNTIME_TOOL_OUTPUT_BUDGET')
         return visual.images.length ? { content, images: visual.images } : content
       },
     }

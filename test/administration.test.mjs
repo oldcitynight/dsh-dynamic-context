@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { readStored, hasStored } from '../workflow-io.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
@@ -104,16 +105,16 @@ test('maintenance removes only the exact previewed orphan and preserves every co
   const result = await h.runner.runNext({ expectedRevision: 1 })
   const journal = DirectJournal.open(result.runDirectory, { attemptId: result.report.attemptId })
   const orphan = journal.archive([{ role: 'tool', content: 'Unreferenced interrupted-write fixture' }])
-  const reportProof = fs.readFileSync(result.report.evidence[0].ref)
+  const reportProof = readStored(result.report.evidence[0].ref)
   const head = journal.latest().checksum
   const preview = await h.runner.collectOrphans({ expectedRevision: 3 })
   assert.deepEqual(preview.files.map(row => row.ref), [orphan.ref])
   await assert.rejects(h.runner.collectOrphans({ expectedRevision: 3, planChecksum: '0'.repeat(64) }), /DIRECT_MAINTENANCE_PLAN_CHANGED/)
-  assert.equal(fs.existsSync(orphan.ref), true)
+  assert.equal(hasStored(orphan.ref), true)
   const cleaned = await h.runner.collectOrphans({ expectedRevision: 3, planChecksum: preview.planChecksum })
-  assert.equal(cleaned.removed, 1); assert.equal(fs.existsSync(orphan.ref), false)
+  assert.equal(cleaned.removed, 1); assert.equal(hasStored(orphan.ref), false)
   assert.equal(journal.latest().checksum, head)
-  assert.deepEqual(fs.readFileSync(result.report.evidence[0].ref), reportProof)
+  assert.deepEqual(readStored(result.report.evidence[0].ref), reportProof)
   assert.equal(journal.loadCheckpoint(journal.latest()).reportText, result.report.text)
 })
 
@@ -129,19 +130,18 @@ test('maintenance preserves a source archive explicitly committed as a reconcili
   const plan = await h.runner.collectOrphans({ expectedRevision: 3 })
   assert.deepEqual(plan.files, [])
   await h.runner.collectOrphans({ expectedRevision: 3, planChecksum: plan.planChecksum })
-  assert.equal(fs.existsSync(receipt.ref), true)
+  assert.equal(hasStored(receipt.ref), true)
 })
 
-test('a journal storage budget halts snapshot growth without replaying or completing the task', async t => {
-  const h = await fixture(t, { respond: () => ({ tools: [{ name: 'read', arguments: { file_path: 'long.txt' } }] }), setup: () => {},
-    config: { allowedTools: ['read', 'dynamic_context_source_read'], maxContextCharacters: 96000, maxRequestsPerTask: 16,
-      direct: { maxJournalBytes: 1048576, compaction: { triggerCharacters: 50000, maxCheckpointCharacters: 12000, maxCompactions: 8 } } } })
-  fs.writeFileSync(path.join(h.projectRoot, 'long.txt'), Array.from({ length: 400 }, (_, i) => `line-${i}: ${'x'.repeat(90)}`).join('\n'))
-  h.runner.submit(runtimeProposal(['read', 'dynamic_context_source_read']))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_JOURNAL_STORAGE_BUDGET/)
-  assert.ok(h.backend.requests.length < 16)
-  assert.ok(h.runner.checkpointStatus().storageBytes <= 1048576)
-  assert.ok(h.runner.graph.read().graph.state.active)
-  assert.equal(h.runner.graph.read().reports.length, 0)
-  await assert.rejects(h.runner.collectOrphans({ expectedRevision: 2 }), /DIRECT_MAINTENANCE_ACTIVE_ATTEMPT/)
+test('an old journal budget no longer truncates durable snapshots', async t => {
+  let calls = 0
+  const h = await fixture(t, { respond: () => ++calls <= 3
+    ? { tools: [{ name: 'read', arguments: { file_path: 'long.txt' } }] }
+    : { text: 'Checked the stored fixture.' }, setup: () => {},
+    config: { allowedTools: ['read'], maxRequestsPerTask: 8, direct: { maxJournalBytes: 1048576 } } })
+  fs.writeFileSync(path.join(h.projectRoot, 'long.txt'), Array.from({ length: 400 }, (_, i) => 'line-' + i + 'x'.repeat(90)).join('\n'))
+  h.runner.submit(runtimeProposal(['read']))
+  await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(h.runner.config.direct.maxJournalBytes, null)
+  assert.equal(h.runner.graph.read().reports.length, 1)
 })

@@ -129,7 +129,7 @@ test('role compaction shares the inherited policy and exact calls survive a paus
   const runner = { controller: owner('low'), ctx: { get: () => ({ resolve: async () => ({ value: 'fake-only' }) }) },
     workflowControl: { beforeRequest() { if (pause) throw Object.assign(new Error('WORKFLOW_PAUSE_REQUESTED'), { code: 'WORKFLOW_PAUSE_REQUESTED' }) } },
     config: validateConfig({ projectRoot: root, directory: root, provider: 'fake', model: 'fake-llama', systemPrompt: 'Host', transport: 'direct',
-      revision: { policy: { objective: 'Check', requirements: [{ id: 'a', text: 'Check evidence' }] }, maxOutputTokens: 32768 },
+      dynamicContextMaxBytes: 8388608, revision: { policy: { objective: 'Check', requirements: [{ id: 'a', text: 'Check evidence' }] }, maxOutputTokens: 32768 },
       direct: { api: 'deepseek', protocol: 'chat-completions', endpoint: backend.origin + '/v1/chat/completions', apiKeyEnv: 'FAKE_KEY', durable: true,
         compaction: { strategy: 'dsh-native', contextWindow: 262144 }, maxRequestBytes: null, maxResponseBytes: null } }) }
   const runId = `revision_result_check_${randomUUID()}`, request = { runId, role: 'result_check', signal: signal(),

@@ -100,7 +100,10 @@ test('crash after dispatching a saved response becomes UNKNOWN, never a replay',
   state.trace.assembly = state.assembly; state.trace.contract.hash = 'contract'
   const trace = structuredClone(state.trace)
   trace.events.push({ seq: 1, type: 'tool/call', data: { callId: 'pending', name: 'read' } })
-  const journal = { latestCheckpoint: () => ({ checksum: 'base' }), latest: () => ({ checksum: 'head' }), loadCheckpoint: () => structuredClone(state), readTrace: () => trace }
+  const journal = { inspectHead: () => ({ checkpoint: { checksum: 'base' }, head: { checksum: 'head' } }),
+    assertHeadUnchanged: head => assert.equal(head.checksum, 'head'),
+    loadResumeCheckpoint: async record => { assert.equal(record.checksum, 'base'); return structuredClone(state) },
+    readTrace: () => trace }
   const result = await recoverDirectCheckpoint({ journal, ctx: {} })
   assert.deepEqual(result.recovery.calls, [{ callId: 'pending', outcome: 'UNKNOWN' }])
   assert.equal(result.state.pendingResponse, undefined)

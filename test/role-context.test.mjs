@@ -1,4 +1,6 @@
 import test from 'node:test'
+import { apply as registerNativeRetry } from '@deepseek-ai/dsh-llm-retry'
+import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -15,13 +17,15 @@ import { ExecutionOutput } from '../execution-output.mjs'
 const text = 'ordinary evidence 0123456789, '.repeat(24000) + '\nTAIL_COUNTEREXAMPLE: required_field is missing.\n'
 const messages = () => [{ role: 'system', content: 'Independently check this evidence. Return a JSON verdict.' },
   { role: 'user', content: JSON.stringify({ contract: { objective: 'Check the entire source' }, task: { key: 'local' },
-    programValidation: { artifactContents: [{ source: { ref: 'evidence.txt', sha256: digest(text) }, text }] } }) }]
+    // Exercise native compaction for evidence outside the report projection.
+    programValidation: { additionalEvidence: [{ source: { ref: 'evidence.txt', sha256: digest(text) }, text }] } }) }]
 async function fixture(t, respond, options = {}) {
   const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'role-context-')))
   const backend = await startFakeLlama({ respond, maxRequestBytes: 16 * 1024 * 1024,
     contextWindow: 262144, countInputTokens: roleInputTokens })
   const accounting = [], runner = { output: new ExecutionOutput(directory), ctx: { get: name => name === 'credentials' ? { resolve: async () => ({ value: 'fake-only' }) } : undefined },
-    config: validateConfig({ projectRoot: directory, directory, provider: 'fake', model: 'fake-llama',
+    // Isolate native, model-driven compaction from the independent preassembly byte budget.
+    config: validateConfig({ dynamicContextMaxBytes: 8388608, projectRoot: directory, directory, provider: 'fake', model: 'fake-llama',
       systemPrompt: 'Host', transport: 'direct', revision: { policy: { objective: 'Inspect', requirements: [{ id: 'a', text: 'Verify' }] }, maxOutputTokens: 32768 },
       direct: { endpoint: backend.origin + '/v1/chat/completions', apiKeyEnv: 'FAKE_ROLE_KEY', durable: true,
         compaction: { strategy: 'dsh-native', contextWindow: 262144 }, maxRequestBytes: null, maxResponseBytes: null, streamIdleTimeoutMs: 5000 } }),
@@ -61,7 +65,7 @@ test('separate historical inputs compact before assembly; nested shared facts an
     }
     assert.match(JSON.parse(payload.messages.at(-1).content).text, /TAIL_COUNTEREXAMPLE/)
     return { text: '{"verdict":"RETURN"}' }
-  }, { messages: [{ role: 'system', content: 'Original executor instructions remain exact.' }, { role: 'user', content: JSON.stringify(input) }] })
+  }, { role: 'scope_blockage', messages: [{ role: 'system', content: 'Original executor instructions remain exact.' }, { role: 'user', content: JSON.stringify(input) }] })
   assert.equal((await h.run()).verdict, 'RETURN')
   const record = readRoleRecord(h.runner, h.runId)
   assert.ok(record.context.actions.length >= 2)
@@ -299,10 +303,14 @@ test('explicit interrupted role recovery retries the lost model reply and keeps 
     : isSummary(payload) ? summary : { text: '{"verdict":"CURRENT"}' })
   h.runner.revisionAccounting = null
   await assert.rejects(h.run())
+  const originalReceipt = readRoleRecord(h.runner, h.runId).calls[0]
   h.runner.workflowControl = { recoverModel: true, beforeRequest() {} }
   assert.equal((await h.run()).verdict, 'CURRENT')
   assert.deepEqual(h.backend.requests[0].payload, h.backend.requests[1].payload)
   const record = readRoleRecord(h.runner, h.runId)
+  assert.equal(record.phase, 'COMPLETE')
+  for (const key of ['error', 'validationFeedback', 'transportReceipt', 'providerError']) assert.equal(record[key], undefined)
+  assert.deepEqual(record.calls[0], originalReceipt)
   assert.equal(record.calls[0].phase, 'UNKNOWN_NO_REPLAY')
   assert.equal(record.calls[1].resumedFrom, 1)
   assert.equal(record.calls[1].financialStatus, 'UNCHANGED')
@@ -343,4 +351,171 @@ test('receipt selector survives native compression and a pause with exact immuta
   const before = summaries; pause = false
   assert.equal((await h.run()).outcome, 'COMPLETE'); assert.ok(before > 0); assert.equal(summaries, before)
   assert.equal(readRoleRecord(h.runner, h.runId).context.reportDraft.revision, 0)
+})
+
+function providerTransportPolicy(runner, policy) {
+  let definition
+  registerNativeRetry({ sessionProjections: { register(unit) { definition = unit } }, on() { return () => {} }, effect() {} })
+  const original = runner.ctx.get
+  runner.ctx.get = key => {
+    if (key === 'llm') return { listProviders: () => [{ id: 'fake' }], providerRetryPolicy: () => resolveRetryPolicy(policy, 'test provider') }
+    if (key === 'sessionProjections') return { stateOf: session => session.snapshotEvents().reduce(definition.apply, definition.init()) }
+    return original(key)
+  }
+}
+const shortReview = [{role:'system',content:'Inspect the submitted report.'},{role:'user',content:'{}'}]
+test('a role retries the same pre-header request with native policy and a separate physical receipt', async t => {
+  const h = await fixture(t, ({ index }) => index === 1 ? { disconnectBeforeResponse: true } : { text: '{"ok":true}' }, { messages: shortReview })
+  providerTransportPolicy(h.runner, { mode:'normal', maxRetries:1, backoff:{initialDelayMs:1, maxDelayMs:3, jitterRatio:0} })
+  assert.deepEqual(await h.run(), {ok:true})
+  const [failed, complete] = readRoleRecord(h.runner,h.runId).calls
+  assert.equal(failed.phase,'UNKNOWN_NO_REPLAY');assert.equal(failed.httpStatus,undefined)
+  assert.equal(failed.transportFailure.code,'UND_ERR_SOCKET');assert.equal(failed.transportFailure.phase,'NO_HTTP_RESPONSE')
+  assert.deepEqual(failed.retryEvents.map(e=>e.type),['llm/retry','llm/retry-started'])
+  assert.equal(failed.retryEvents[0].data.retry,1);assert.equal(failed.retryEvents[0].data.failure.code,'TRANSPORT')
+  assert.equal(complete.phase,'COMPLETE');assert.equal(complete.httpStatus,200);assert.equal(complete.retryOf,1)
+  assert.equal(complete.logicalStep,failed.logicalStep);assert.equal(complete.bodySha256,failed.bodySha256)
+  assert.deepEqual(h.accounting.map(([event,meta])=>[event,meta.sequence]),[['before',1],['failed',1],['before',2],['after',2]])
+})
+test('native retry exhaustion retains every uncertain send and never retries a received HTTP error', async t => {
+  for (const received of [false,true]) {
+    const h=await fixture(t,()=>received?{status:403,body:'rejected'}:{disconnectBeforeResponse:true},{messages:shortReview})
+    providerTransportPolicy(h.runner,{mode:'normal',maxRetries:2,backoff:{initialDelayMs:1,maxDelayMs:2,jitterRatio:0} })
+    await assert.rejects(h.run(),received?/403/:/fetch failed/)
+    const calls=readRoleRecord(h.runner,h.runId).calls
+    assert.equal(calls.length,received?1:3)
+    assert.equal(calls.at(-1).retryEvents,undefined)
+    if (received) {assert.equal(calls[0].httpStatus,403);assert.equal(calls[0].transportFailure,undefined)}
+    else {
+      assert.deepEqual(calls.map(c=>c.retryOf??null),[null,1,2])
+      assert.deepEqual(calls.slice(0,2).map(c=>c.retryEvents[0].data.retry),[1,2])
+      assert.equal(new Set(calls.map(c=>c.bodySha256)).size,1)
+    }
+  }
+})
+test('cancelling native always-mode backoff records the schedule without sending a second request', async t => {
+  const h=await fixture(t,()=>({disconnectBeforeResponse:true}),{messages:shortReview})
+  providerTransportPolicy(h.runner,{mode:'always',backoff:{initialDelayMs:2000,maxDelayMs:2000,jitterRatio:0} })
+  const controller=new AbortController();h.request.signal=controller.signal
+  const run=assert.rejects(h.run(),/cancelled in backoff/)
+  const until=Date.now()+4000
+  while (!readRoleRecord(h.runner,h.runId)?.calls[0]?.retryEvents?.length && Date.now()<until)
+    await new Promise(done=>setTimeout(done,10))
+  controller.abort(Error('cancelled in backoff'));await run
+  const calls=readRoleRecord(h.runner,h.runId).calls
+  assert.equal(calls.length,1);assert.equal(h.backend.requests.length,1)
+  assert.deepEqual(calls[0].retryEvents.map(e=>e.type),['llm/retry'])
+})
+
+test('thinking-only summary is settled and retried once with identical source and no reasoning in subsequent context', async t => {
+  let summaryCalls = 0
+  const h = await fixture(t, ({ payload }) => {
+    if (isSummary(payload)) return ++summaryCalls === 1 ? { reasoning: 'discarded-reasoning-1' } : summary
+    assert.ok(!JSON.stringify(payload).includes('discarded-reasoning-1'))
+    return { text: '{"accepted":true}' }
+  })
+  assert.deepEqual(await h.run(), { accepted: true })
+  const record = readRoleRecord(h.runner, h.runId), [first, second] = record.calls
+  assert.equal(first.response.text, '')
+  assert.ok(first.response.usage)
+  assert.equal(second.bodySha256, first.bodySha256)
+  assert.equal(second.sourceId, first.sourceId)
+  assert.deepEqual(second.summaryRetry, { reason: 'THINKING_ONLY', previousResponseId: first.response.responseId })
+  assert.deepEqual(h.accounting.slice(0, 4).map(([event, meta]) => [event, meta.sequence]),
+    [['before', 1], ['after', 1], ['before', 2], ['after', 2]])
+  assert.ok(record.context.actions.length > 0)
+})
+
+test('a second thinking-only summary stops at the same span and restart does not send a third', async t => {
+  const h = await fixture(t, () => ({ reasoning: 'uncitable thinking', text: '  ' }))
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(h.run(), { code: 'COMPACTION_THINKING_ONLY_RETRY_EXHAUSTED' })
+    const record = readRoleRecord(h.runner, h.runId)
+    assert.equal(record.phase, 'PAUSED')
+    assert.equal(record.context.actions.length, 0)
+    assert.equal(record.calls.length, 2)
+    assert.equal(h.backend.requests.length, 2)
+    assert.deepEqual(record.calls.map(row => row.phase), ['COMPLETE', 'COMPLETE'])
+  }
+})
+
+test('a pause before the thinking-only retry resumes the same compression operation', async t => {
+  let pause = false, count = 0
+  const h = await fixture(t, ({ payload }) => {
+    if (isSummary(payload) && ++count === 1) { pause = true; return { reasoning: 'historical thinking' } }
+    return isSummary(payload) ? summary : { text: '{"done":true}' }
+  })
+  h.runner.workflowControl = { beforeRequest() {
+    if (pause) throw Object.assign(Error('pause'), { code: 'WORKFLOW_PAUSE_REQUESTED' })
+  } }
+  await assert.rejects(h.run(), { code: 'WORKFLOW_PAUSE_REQUESTED' })
+  const [original] = readRoleRecord(h.runner, h.runId).calls
+  assert.equal(h.backend.requests.length, 1)
+  pause = false
+  assert.deepEqual(await h.run(), { done: true })
+  const [first, retry] = readRoleRecord(h.runner, h.runId).calls
+  assert.deepEqual(first, original); assert.equal(retry.bodySha256, first.bodySha256)
+  assert.equal(retry.summaryRetry.previousResponseId, first.response.responseId)
+})
+
+test('indexed graph audit fetches counterevidence, rejects the exact original field, and replays its receipt offline', async t => {
+  const value = { note: 'source evidence '.repeat(13000), outcome: { status: 'MISSING_ORIGINAL' } }
+  const data = { contract: { objective: 'Keep delivered work' }, changes: [{ path: '/taskGraph/nodes/demo', before: value,
+    after: { task: 'demo' } }], modificationReport: { changes: [{ path:'/taskGraph/nodes/demo', why:'changed', evidence:[] }] } }
+  const messages = [{ role:'system',content:'Audit each changed path.' },{ role:'user',content:JSON.stringify(data) }]
+  const issue = { path:'/changes/0/before/outcome/status', item:'demo', reason:'The original evidence is missing.' }
+  const h = await fixture(t, ({ payload, index }) => {
+    assert.equal(isSummary(payload),false)
+    if (index === 1) {
+      const row = JSON.parse(payload.messages[1].content).changes[0]
+      assert.equal(row.path, data.changes[0].path)
+      assert.ok(row.before._reportIndex)
+      assert.ok(!payload.tools.some(x => x.function.name === 'dynamic_context_blockage_trace'))
+      return { tools:[{ name:'dynamic_context_blockage_report',arguments:{source:row.before._reportIndex.source,path:'/outcome/status'} }] }
+    }
+    assert.equal(JSON.parse(payload.messages.at(-1).content).text, 'MISSING_ORIGINAL')
+    return { text: JSON.stringify({verdict:'REJECT',reason:issue.reason,violations:['demo'],issues:[issue]}) }
+  }, { role:'reviewer', messages })
+  const request={...h.request,validateOutput:true}
+  const result=await directRevisionRole(h.runner,request)
+  assert.equal(result.issues[0].path,issue.path)
+  const receipt=readRoleRecord(h.runner,h.runId)
+  assert.equal(receipt.inputIndex.mode,'index')
+  assert.equal(receipt.payload.messages[1].content, messages[1].content)
+  assert.equal(receipt.calls.filter(row=>row.purpose==='compaction').length,0)
+  assert.deepEqual(await directRevisionRole(h.runner,request),result)
+  assert.equal(h.backend.requests.length,2)
+})
+
+test('a paused updater replays a 32-unit rejection and revalidates a new submission at 64', async t => {
+  const { REPORT_GENERATE, REPORT_SUBMIT } = await import('../report-draft.mjs')
+  const h = await fixture(t, ({ index, payload }) => {
+    if (index === 1) return { tools: [{ name: REPORT_GENERATE, arguments: { report: { leaves: 50 } } }] }
+    assert.match(payload.messages[0].content, /Current linked-graph unit limit \(root included\): 64/)
+    assert.equal(JSON.parse(payload.messages.at(-1).content).error, 'UNIT_LIMIT')
+    return { tools: [{ name: REPORT_SUBMIT, arguments: { expectedRevision: 1 } }] }
+  }, { role: 'scope_update', messages: [{ role: 'system', content: 'Propose a linked graph update.' },
+    { role: 'user', content: '{}' }] })
+  let limit = 32
+  const request = { ...h.request, validateResult: value => {
+    if (value.leaves > limit) throw Object.assign(new Error('Leaf task limit'), { code: 'UNIT_LIMIT' })
+    return value
+  } }
+  h.runner.workflowControl = { beforeRequest() {
+    if (h.backend.requests.length) throw Object.assign(new Error('Paused'), { code: 'WORKFLOW_PAUSE_REQUESTED' })
+  } }
+  await assert.rejects(directRevisionRole(h.runner, request), { code: 'WORKFLOW_PAUSE_REQUESTED' })
+  const paused = readRoleRecord(h.runner, h.runId)
+  assert.equal(paused.calls.length, 1)
+  assert.equal(paused.calls[0].unitLimitNotice, undefined)
+  assert.equal(paused.context.reportDraft.receipts[0].result.error, 'UNIT_LIMIT')
+  limit = 64
+  h.runner.graph = { unitLimit: () => ({ maximum: limit, configured: limit, current: 32 }) }
+  delete h.runner.workflowControl
+  assert.deepEqual(await directRevisionRole(h.runner, request), { leaves: 50 })
+  const done = readRoleRecord(h.runner, h.runId)
+  assert.deepEqual(done.calls[0], paused.calls[0])
+  assert.deepEqual(done.context.reportDraft.receipts[0], paused.context.reportDraft.receipts[0])
+  assert.equal(done.calls.length, 2)
+  assert.equal(h.backend.requests.length, 2)
 })

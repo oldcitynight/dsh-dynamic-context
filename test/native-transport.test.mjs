@@ -10,11 +10,11 @@ import { bridge, composeHooks } from '../adapter-bridge.mjs'
 import { createHarness, GLOBAL_PRIVATE, HOST_POLICY } from '../testing/harness.mjs'
 import { proposal, scenarioResponse } from '../testing/scenario.mjs'
 
-async function fixture(t, { transport = 'native-guarded', respond = () => ({ text: 'Synthetic report' }), config = {} } = {}) {
+async function fixture(t, { transport = 'native-guarded', respond = () => ({ text: 'Synthetic report' }), config = {}, contextWindow } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-context-transport-')))
   let h
   t.after(async () => { if (h) await h.close(); fs.rmSync(root, { recursive: true, force: true }) })
-  h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'), respond, config: { transport, ...config } })
+  h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'), respond, contextWindow, config: { transport, ...config } })
   return h
 }
 const extraTool = h => h.ctx.systemPrompt.tools(() => ({ schemas: [{ name: 'probe_unlisted_schema',
@@ -110,14 +110,15 @@ for (const transport of ['native-guarded']) test(`${transport} refuses tool-defe
   assert.equal(JSON.stringify(h.backend.requests).includes('UNAPPROVED_DEFERRED_CONTEXT'), false)
 })
 
-for (const transport of ['native-guarded']) test(`${transport} input budget includes host policy and tool schemas`, async t => {
-  const h = await fixture(t, { transport, config: {
+for (const transport of ['native-guarded']) test(`${transport} accepts large host policy and tool schemas`, async t => {
+  const h = await fixture(t, { transport, contextWindow: 131072, config: {
     systemPrompt: 'HOST_POLICY_KEEP '.repeat(900), allowedTools: ['fixture_read_a', 'fixture_read_b', 'fixture_large'],
     ...(transport === 'direct' ? { direct: { agentlessTools: ['fixture_read_a', 'fixture_read_b', 'fixture_large'] } } : {}),
   } })
   h.ctx.tools.register(defineTool({ name: 'fixture_large', description: 'large schema description '.repeat(2400), parameters: {},
     output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] }, execute: async () => ({}) }))
   const p = proposal(); p.contextGraph.bindings[0].tools = ['fixture_large']; h.runner.submit(p)
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /REQUEST_INPUT_BUDGET_EXCEEDED/)
-  assertBlocked(h, 0)
+  assert.ok((await h.runner.runNext({ expectedRevision: 1 })).report.text)
+  assert.ok(h.backend.requests.length > 0)
+  assert.equal(h.runner.graph.read().reports.length, 1)
 })

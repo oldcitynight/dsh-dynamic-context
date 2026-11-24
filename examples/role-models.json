@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "modelBackends": {
+    "planning": {
+      "provider": "planning-api",
+      "model": "planning-model"
+    },
+    "worker": {
+      "provider": "worker-api",
+      "model": "worker-model",
+      "direct": { "endpoint": "http://127.0.0.1:8080/v1/chat/completions" }
+    },
+    "audit": {
+      "provider": "audit-api",
+      "model": "audit-model",
+      "direct": {
+        "endpoint": "http://127.0.0.1:8081/v1/messages",
+        "api": "deepseek",
+        "protocol": "messages",
+        "apiKeyEnv": "AUDIT_API_KEY"
+      }
+    }
+  },
+  "roleModels": {
+    "preplanning": "planning",
+    "executor": "worker",
+    "unit_router": "worker",
+    "baseline_audit": "audit",
+    "result_check": "audit",
+    "reviewer": "audit"
+  }
+}

@@ -4,7 +4,6 @@ import { REPORT_GENERATE, REPORT_SUBMIT } from './report-draft.mjs'
 import { parseModelJSON, diagnostic, located, schemaIssues } from 'dsh-better-task-grapth/validation'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash } from 'node:crypto'
-import { fetch } from 'undici'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { canonical, digest } from 'dsh-better-task-grapth/core'
@@ -12,8 +11,8 @@ import { deepFreeze, taskPrompt, textContent, wireTools, toolFingerprint } from 
 import { compactDirectHistory, checkDirectHistory, checkpointData, validationFeedbackData, VALIDATION_FEEDBACK_PROTOCOL } from './checkpoints.mjs'
 import { DynamicContextError, fail } from './core.mjs'
 import { apiParameters, measureInput, directProtocol } from './api-protocol.mjs'
-import { readCompletion } from './direct-http.mjs'
-import { compactNativeHistory } from './native-compaction.mjs'
+import { readCompletion, fetchDirectModel, modelTransportRetry } from './direct-http.mjs'
+import { compactNativeHistory, nativePressure, summarySendWithRetry } from './native-compaction.mjs'
 import { rolePressureTokens } from './role-context.mjs'
 import { directContextWindow } from './dsh-compaction-policy.mjs'
 import { TOOL_REQUEST_REJECTIONS } from './direct-runtime.mjs'
@@ -22,17 +21,12 @@ import { ToolErrorPolicy, roleToolOutcome, toolErrorBlock, toolErrorBlocked, too
 import { imageRecoveryByteLimit, pendingResponseData } from './recovery.mjs'
 import { guidanceData, GUIDANCE_MESSAGE_PROTOCOL, GUIDANCE_AUTHORITY } from './guidance-state.mjs'
 import { directAuthHeaders } from './direct-auth.mjs'
+import { readLocalSource } from './context-budget.mjs'
 import { prepareDirectRequest, directEndpoint, directProtocolHeaders } from './direct-wire.mjs'
 import { splitImageContent, finishImageInspection, excessImageCalls, imageBatchNotice, IMAGE_WINDOW } from './image-content.mjs'
 
-function noteTransportFailure(request, error) {
-  if (request.httpStatus !== undefined || error.message !== 'fetch failed') return
-  const code = error.cause?.code
-  request.transportFailure = { phase: 'NO_HTTP_RESPONSE', ...(typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? { code } : {}) }
-}
-
 /** Use the pinned execution identity (or explicit agentless mode) through native policy and guards. */
-function toolBridge(ctx, contract, control, record, execution, journal, errorPolicy) {
+function toolBridge(ctx, contract, control, record, execution, journal, errorPolicy, admits) {
   const agent = execution?.agent
   const owned = new AsyncLocalStorage(), disposers = []
   const reason = exec => {
@@ -47,13 +41,15 @@ function toolBridge(ctx, contract, control, record, execution, journal, errorPol
     if (exec.agent !== agent || exec.parent !== undefined || exec.callId !== call.id || exec.rootCallId !== call.id
         || exec.name !== call.function.name || canonical(exec.arguments) !== canonical(call.arguments)) return deny('Direct task tool execution identity changed')
     if (ctx.tools.get(exec.name, agent) !== contract.definitions.get(exec.name)) return deny('Direct task tool definition changed')
+    if (!admits(call.role, exec.name, exec.arguments)) return 'ROLE_TOOL_DENIED'
     try { execution?.authorize(exec.name, exec.arguments) } catch (error) { if (!TOOL_REQUEST_REJECTIONS.has(error.code)) control.abort(error); throw error }
     return undefined
   }
   disposers.push(ctx.tools.guard(reason))
   disposers.push(ctx.on('tools/execute', (exec, next) => {
     if (!owned.getStore()) return next()
-    if (reason(exec)) fail('DIRECT_TOOL_EXECUTION_CONTRACT_MISMATCH')
+    const denied = reason(exec)
+    if (denied) fail(denied === 'ROLE_TOOL_DENIED' ? denied : 'DIRECT_TOOL_EXECUTION_CONTRACT_MISMATCH')
     deepFreeze(exec.arguments)
     deepFreeze(exec.schema)
     // These fields are readonly in the public ToolExecution contract. Leave the
@@ -76,7 +72,7 @@ function toolBridge(ctx, contract, control, record, execution, journal, errorPol
   const stopChange = ctx.on('tools/change', () => {
     const tools = ctx.get('tools')
     for (const [name, pinned] of contract.definitions) {
-      if (tools?.get(name, agent) === pinned) continue
+      if (pinned.execute === readLocalSource || tools?.get(name, agent) === pinned) continue
       control.abort(new DynamicContextError('DIRECT_TOOL_REGISTRY_CHANGED', { toolId: name }))
       break
     }
@@ -86,13 +82,15 @@ function toolBridge(ctx, contract, control, record, execution, journal, errorPol
     takeRepairDeferral() { const value = repairDeferral; repairDeferral = undefined; return value },
     async execute(call, deferred, { role = 'executor', onBlockedResult } = {}) {
       control.signal.throwIfAborted()
-      if (ctx.tools.get(call.function.name, agent) !== contract.definitions.get(call.function.name)) fail('DIRECT_TOOL_DEFINITION_CHANGED')
+      const localRead = !execution && contract.definitions.get(call.function.name)?.execute === readLocalSource
+      if (!localRead && ctx.tools.get(call.function.name, agent) !== contract.definitions.get(call.function.name)) fail('DIRECT_TOOL_DEFINITION_CHANGED')
       journal?.append('TOOL_PENDING', { callId: call.id, tool: call.function.name, deferred: Boolean(deferred) })
-      const input = { ...call, arguments: JSON.parse(call.function.arguments) }
+      const input = { ...call, role, arguments: JSON.parse(call.function.arguments) }
       const reportContent = (content, outcome) => contract.assembly.reportProtocol === 'report-scoped-v1'
         ? '<host-receipt>' + JSON.stringify({ callId: call.id, tool: call.function.name, outcome }) + '</host-receipt>\n' + content : content
       record('tool/call', { callId: call.id, name: call.function.name, arguments: input.arguments })
       await execution?.toolCall(call)
+      if (!admits(role, call.function.name, input.arguments)) deferred ??= 'NOT_EXECUTED: ROLE_TOOL_DENIED before dispatch.'
       if (deferred) {
         const result = { content: [{ type: 'text', text: deferred }], isError: true }
         execution?.toolResult(call, result)
@@ -101,7 +99,7 @@ function toolBridge(ctx, contract, control, record, execution, journal, errorPol
       }
       const invoke = (signal = control.signal) => owned.run(input, () => ctx.tools.execute({ callId: ToolCallId(call.id),
         name: call.function.name, arguments: input.arguments, ...(agent ? { agent } : {}), signal }))
-      const result = await ctx.agents.withoutInitiator(() => execution?.runTool ? execution.runTool(invoke) : invoke())
+      const result = localRead ? readLocalSource(journal, contract.assembly, input.arguments) : await ctx.agents.withoutInitiator(() => execution?.runTool ? execution.runTool(invoke) : invoke())
       execution?.toolResult(call, result)
       record('tool/result', { callId: call.id, name: call.function.name, content: result.content,
         isError: result.isError, ...(result.error === undefined ? {} : { error: result.error }),
@@ -160,7 +158,7 @@ function toolBridge(ctx, contract, control, record, execution, journal, errorPol
 }
 
 /** Own the request history, serialization and HTTP send; no DSH model-message API is invoked. */
-export async function runDirect({ ctx, config, contract, trace, control, persist, execution, journal, continuation, configHash, shouldPause, meter, output, toolAdmission, compactionToolAdmission, beforeTool, userGuidance, reportDraft, executionRole = 'executor', toolErrorPolicy = new ToolErrorPolicy() }) {
+export async function runDirect({ ctx, config, contract, trace, control, persist, execution, journal, continuation, configHash, pluginVersions, workflowCompatibilityEpoch, shouldPause, meter, output, toolAdmission, compactionToolAdmission, beforeTool, userGuidance, reportDraft, executionRole = 'executor', toolErrorPolicy = new ToolErrorPolicy() }) {
   const direct = config.direct, history = deepFreeze([
     { role: 'system', content: config.systemPrompt }, { role: 'user', content: taskPrompt(contract.assembly) },
   ])
@@ -219,12 +217,13 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
   // in the trace so policy changes never rewrite the prior blocking decision.
   record('tool/error-policy', { previousChecksum: trace.toolErrorPolicy?.checksum ?? null, snapshot: errorPolicy })
   trace.toolErrorPolicy = errorPolicy; persist()
-  const bridge = toolBridge(ctx, contract, control, record, execution, journal, errorPolicy)
+  const bridge = toolBridge(ctx, contract, control, record, execution, journal, errorPolicy,
+    (role, name, args) => (role === 'compaction' ? compactionToolAdmission : toolAdmission)?.(name, args) !== false)
   const stopAccount = direct.auth === 'deepseek-account'
     ? ctx.on('deepseek-account/signed-out', () => control.abort(new DynamicContextError('DIRECT_ACCOUNT_SIGNED_OUT'))) : () => {}
   const snapshot = async (phase, reportText) => {
     if (!journal) return null
-    const state = { configHash, assembly: contract.assembly, contractHash: contract.hash,
+    const state = { configHash, pluginVersions, workflowCompatibilityEpoch, assembly: contract.assembly, contractHash: contract.hash,
       toolFingerprint: toolFingerprint(contract), trace: structuredClone(trace), history: messages,
       usedCallIds: [...usedCallIds], nextStep, compactions, approvedCheckpoints: contract.checkpoints,
       archives: [...journal.archives.values()], runtime: execution ? { ...await execution.snapshot(), requestBase: nextStep } : null,
@@ -247,9 +246,10 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
   let recoveryWireReason = trace.requests.findLast(row => row.purpose === 'task')?.httpStatus === 413 ? 'HTTP_413' : 'REPEATED_SOCKET_INTERRUPTION'
   const stagedPayload = payload => ({ ...direct.generation, ...apiParameters(direct), model: config.model,
     max_tokens: config.maxOutputTokens, stream: true, ...payload })
-  const pressureTokens = async payload => {
+  const pressureTokens = async (payload, pressure) => {
     const normalized = stagedPayload(payload)
-    return rolePressureTokens(normalized, await measureInput(meter, await prepareRequest(normalized), control.signal))
+    const measurement = meter ? await measureInput(meter, await prepareRequest(normalized), control.signal) : null
+    return rolePressureTokens(normalized, measurement, pressure?.anchoredUpperTokens)
   }
   const measureWire = async payload => Buffer.byteLength(JSON.stringify(await prepareRequest(stagedPayload(payload))))
   const checkRecoveryBytes = (body, purpose) => {
@@ -258,13 +258,16 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     if (bytes > recoveryByteLimit) fail('DIRECT_IMAGE_RECOVERY_BYTE_LIMIT', { purpose, bytes, maxBytes: recoveryByteLimit,
       reason: 'The shortened image-bearing request must fit the recovery byte budget before dispatch.' })
   }
-  const checkWindow = (payload, measurement) => {
-    if (windowTokens && rolePressureTokens(payload, measurement) + payload.max_tokens > windowTokens)
+  const checkWindow = (payload, measurement, taskReceipts) => {
+    if (!windowTokens) return
+    const anchor = taskReceipts && !measurement ? nativePressure(payload.messages, contract.schemas, taskReceipts) : null
+    const inputTokens = rolePressureTokens(payload, measurement, anchor?.anchoredUpperTokens)
+    if (inputTokens + payload.max_tokens > windowTokens)
       fail('DIRECT_CONTEXT_WINDOW_EXCEEDED_BEFORE_SEND', { contextWindow: windowTokens,
-        inputTokens: rolePressureTokens(payload, measurement), reservedOutputTokens: payload.max_tokens,
+        inputTokens, reservedOutputTokens: payload.max_tokens,
         reason: 'The complete request exceeds native capacity. Protected prompts and shared contexts cannot be shortened.' })
   }
-  const sendSummary = async payload => {
+  const sendSummary = async (payload, retry) => {
     requestBoundary()
     control.signal.throwIfAborted()
     const wirePayload = await prepareRequest(payload, 'compaction'), endpoint = directEndpoint(direct)
@@ -279,58 +282,63 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     }
     checkRecoveryBytes(body, 'compaction')
     if (direct.maxRequestBytes !== null && Buffer.byteLength(body) > direct.maxRequestBytes) fail('DIRECT_REQUEST_BYTE_LIMIT')
-    await execution?.beforeAuxiliaryRequest()
-    const inputMeasurement = await measureInput(meter, wirePayload, control.signal, config.maxInputTokens)
-    checkWindow(payload, inputMeasurement)
-    const authHeaders = await directAuthHeaders(ctx, { ...direct, endpoint }, control.signal)
-    requestBoundary()
-    const request = { ordinal: trace.requests.length + 1, purpose: 'compaction', beforeTaskOrdinal: nextStep + 1, payload: wirePayload, endpoint,
-      bodySha256, inputCharacters: body.length,
-      inputBytes: Buffer.byteLength(body), contractHash: contract.hash, validation: 'PASS', status: 'PREPARED',
-      finish: null, usage: null, inputMeasurement }
-    trace.requests.push(request); persist()
-    journal.append('MODEL_PENDING', { purpose: 'compaction', ordinal: request.ordinal, bodySha256: request.bodySha256 })
-    request.status = 'SENT'; persist()
-    const observed = output?.model({ ...displayMeta(), stage: 'compaction' }, `${displayKey}:model:${request.ordinal}`, { payload, inputMeasurement })
-    try {
-      const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: control.signal,
-        headers: { 'content-type': 'application/json', ...directProtocolHeaders(direct, 'compaction'), ...authHeaders }, body })
-      request.httpStatus = response.status
-      request.serverRequestId = response.headers.get('x-request-id')?.slice(0, 1024) ?? null
-      let completed = await readCompletion(response, { signal: control.signal, model: config.model, direct, maxResponseBytes: direct.maxResponseBytes,
-        onProgress: value => { observed?.progress?.(value); meter?.observe?.(value) }, onDelta: observed?.delta })
-      observed?.end('complete', completed.finish, completed.usage)
-      Object.assign(request, { responseId: completed.responseId, finish: completed.finish, usage: completed.usage,
-        responseBytes: completed.responseBytes, status: 'COMPLETE' })
-      record('compaction/response', { ...completed, requestHash: bodySha256, requestOrdinal: request.ordinal })
+    const retryTransport = modelTransportRetry(ctx, config.provider, control.signal, persist)
+    let retryOf
+    for (;;) {
+      requestBoundary()
       control.signal.throwIfAborted()
-      return completed
-    } catch (error) {
-      observed?.end('interrupted', error.code ?? error.name, error.directReceipt?.usage)
-      if (error.directReceipt) request.transportReceipt = structuredClone(error.directReceipt)
-      noteTransportFailure(request, error)
-      if (request.status !== 'COMPLETE') request.status = 'UNKNOWN_OR_FAILED'
-      request.errorCode = error.code ?? 'DIRECT_COMPACTION_TRANSPORT_FAILED'; persist(); throw error
+      await execution?.beforeAuxiliaryRequest()
+      const inputMeasurement = await measureInput(meter, wirePayload, control.signal, config.maxInputTokens)
+      checkWindow(payload, inputMeasurement)
+      const authHeaders = await directAuthHeaders(ctx, { ...direct, endpoint }, control.signal)
+      requestBoundary()
+      const request = { ordinal: trace.requests.length + 1, ...(retryOf ? { retryOf } : {}), ...retry, purpose: 'compaction', beforeTaskOrdinal: nextStep + 1, payload: wirePayload, endpoint,
+        bodySha256, inputCharacters: body.length,
+        inputBytes: Buffer.byteLength(body), contractHash: contract.hash, validation: 'PASS', status: 'PREPARED',
+        finish: null, usage: null, inputMeasurement }
+      trace.requests.push(request); persist()
+      journal.append('MODEL_PENDING', { purpose: 'compaction', ordinal: request.ordinal, bodySha256: request.bodySha256 })
+      request.status = 'SENT'; persist()
+      const observed = output?.model({ ...displayMeta(), stage: 'compaction' }, `${displayKey}:model:${request.ordinal}`, { payload, inputMeasurement })
+      try {
+        const response = await fetchDirectModel(request, { method: 'POST', redirect: 'error', signal: control.signal,
+          headers: { 'content-type': 'application/json', ...directProtocolHeaders(direct, 'compaction'), ...authHeaders }, body })
+        let completed = await readCompletion(response, { signal: control.signal, model: config.model, direct, maxResponseBytes: direct.maxResponseBytes,
+          onProgress: value => { observed?.progress?.(value); meter?.observe?.(value) }, onDelta: observed?.delta })
+        observed?.end('complete', completed.finish, completed.usage)
+        Object.assign(request, { responseId: completed.responseId, finish: completed.finish, usage: completed.usage,
+          responseBytes: completed.responseBytes, status: 'COMPLETE' })
+        record('compaction/response', { ...completed, requestHash: bodySha256, requestOrdinal: request.ordinal })
+        control.signal.throwIfAborted()
+        return completed
+      } catch (error) {
+        observed?.end('interrupted', error.code ?? error.name, error.directReceipt?.usage)
+        if (error.directReceipt) request.transportReceipt = structuredClone(error.directReceipt)
+        if (request.status !== 'COMPLETE') request.status = 'UNKNOWN_OR_FAILED'
+        request.errorCode = error.code ?? 'DIRECT_COMPACTION_TRANSPORT_FAILED'; persist()
+        if (await retryTransport(request, error)) { retryOf = request.ordinal; continue }
+        throw error
+      }
     }
   }
   const summarize = async payload => {
-    const first = await sendSummary(payload)
+    const send = summarySendWithRetry(sendSummary)
+    const first = await send(payload)
     if (!contract.assembly.imageTools) return first
-    return finishImageInspection(payload, first, sendSummary, async (tool, response) => {
+    return finishImageInspection(payload, first, send, async (tool, response) => {
       // Immutable read results are replayed with the matching summary response;
       // a resumed compaction must not inspect changed filesystem bytes instead.
       const key = digest([response.responseId, tool])
       const prior = trace.events.find(e => e.type === 'compaction/image-result' && e.data.key === key)
       if (prior) return structuredClone(prior.data.result)
       let rejected, parsed
-      if (compactionToolAdmission?.(tool.function.name) === false) rejected = { error: 'ROLE_TOOL_DENIED', role: 'compaction', tool: tool.function.name }
-      else {
-        try {
-          parsed = parseModelJSON(tool.function.arguments, { path: '/tool_calls/function/arguments' })
-          const issues = validateJsonSchemaValue(contract.schemas.find(schema => schema.name === tool.function.name).parameters, parsed.value, '')
-          if (issues.length) throw located('DIRECT_TOOL_ARGUMENT_SCHEMA_MISMATCH', { path: '/tool_calls/function/arguments', issues, reason: 'Tool arguments violate the declared schema.' })
-        } catch (error) { rejected = { error: error.code, diagnostic: diagnostic(error, { stage: 'compaction' }), executed: false } }
-      }
+      try {
+        parsed = parseModelJSON(tool.function.arguments, { path: '/tool_calls/function/arguments' })
+        const issues = validateJsonSchemaValue(contract.schemas.find(schema => schema.name === tool.function.name).parameters, parsed.value, '')
+        if (issues.length) throw located('DIRECT_TOOL_ARGUMENT_SCHEMA_MISMATCH', { path: '/tool_calls/function/arguments', issues, reason: 'Tool arguments violate the declared schema.' })
+        if (compactionToolAdmission?.(tool.function.name, parsed.value) === false)
+          rejected = { error: 'ROLE_TOOL_DENIED', role: 'compaction', tool: tool.function.name, executed: false }
+      } catch (error) { rejected = { error: error.code, diagnostic: diagnostic(error, { stage: 'compaction' }), executed: false } }
       const result = rejected ? { role: 'tool', tool_call_id: tool.id, isError: true, content: JSON.stringify(rejected) }
         : await bridge.execute({ ...tool, function: { ...tool.function, arguments: parsed.normalized } }, undefined,
           { role: 'compaction', onBlockedResult: result => record('compaction/image-result', { key, result }) })
@@ -353,11 +361,12 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     if (calls.length > 1 && calls.some(call => [REPORT_GENERATE, REPORT_SUBMIT].includes(call.function.name))) throw located('DIRECT_TOOL_ARGUMENT_SCHEMA_MISMATCH', { path: '/tool_calls', reason: 'Generate/submit a report alone, after the work tool results have returned.' })
     for (const [index, call] of calls.entries()) {
       const field = `/tool_calls/${index}`
-      if (toolAdmission && !toolAdmission(call.function.name)) throw located('ROLE_TOOL_DENIED', { path: field + '/function/name', item: call.function.name, reason: 'The active role tool policy denies this tool; no call in this batch was executed.' })
-      if (!contract.assembly.tools.includes(call.function.name) || !execution && !direct.agentlessTools.includes(call.function.name)) throw located('DIRECT_MODEL_TOOL_OUTSIDE_CONTRACT', { path: field + '/function/name', item: call.function.name, reason: 'This tool is not granted by the active leaf contract.', allowed: contract.assembly.tools })
+      if (toolAdmission && !toolAdmission(call.function.name)) throw located('ROLE_TOOL_DENIED', { path: field + '/function/name', item: call.function.name, reason: 'The role policy denies this tool.' })
+      if (!contract.assembly.tools.includes(call.function.name) || !execution && contract.definitions.get(call.function.name)?.execute !== readLocalSource && !direct.agentlessTools.includes(call.function.name)) throw located('DIRECT_MODEL_TOOL_OUTSIDE_CONTRACT', { path: field + '/function/name', item: call.function.name, reason: 'This tool is not granted by the active leaf contract.', allowed: contract.assembly.tools })
       if (usedCallIds.has(call.id)) fail('DIRECT_TOOL_CALL_ID_REUSED', { path: field + '/id', item: call.id, reason: 'Call IDs cannot be reused. No tools in this response were dispatched.' })
       const parsed = parseModelJSON(call.function.arguments, { path: field + '/function/arguments' }), args = parsed.value
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw located('DIRECT_TOOL_ARGUMENT_OBJECT_REQUIRED', { path: field + '/function/arguments', reason: 'Tool arguments must be a JSON object.' })
+      if (toolAdmission && !toolAdmission(call.function.name, args)) throw located('ROLE_TOOL_DENIED', { path: field + '/function/arguments', item: call.function.name, reason: 'The active role tool policy denies this tool; no call in this batch was executed.' })
       if (parsed.repairs.length) {
         record('tool/arguments-normalized', { callId: call.id, repairs: parsed.repairs, original: call.function.arguments })
         call.function.arguments = parsed.normalized
@@ -397,7 +406,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     execution?.assistant(completed)
     messages = deepFreeze([...messages, completed.message])
     if (!calls.length) {
-      if (!completed.text.trim() || config.maxReportCharacters !== null && completed.text.length > (config.maxReportCharacters ?? 16000)) fail('DIRECT_REPORT_EMPTY_OR_OVER_BUDGET')
+      if (!completed.text.trim()) fail('DIRECT_REPORT_EMPTY')
       record('task/response-received', { semanticAcceptance: 'NOT_EVALUATED' })
       execution?.endStep()
       nextStep = step + 1
@@ -412,7 +421,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
         if (error.code !== 'WORKFLOW_GUIDANCE_REQUESTED') throw error
         deferred = 'NOT_EXECUTED: new user guidance arrived. This call and the remaining calls were withheld before execution. The host will interpret and route the guidance before continuing. Preserve earlier completed effects; do not replay them.'
       }
-      if (toolAdmission && !toolAdmission(calls[index].function.name)) deferred ||= 'NOT_EXECUTED: the host role tool policy revoked this tool before dispatch. Reconsider only unexecuted calls with permitted tools and fresh IDs.'
+      if (toolAdmission && !toolAdmission(calls[index].function.name, JSON.parse(calls[index].function.arguments))) deferred ||= 'NOT_EXECUTED: the host role tool policy revoked this tool before dispatch. Reconsider only unexecuted calls with permitted tools and fresh IDs.'
       // Earlier effects may create instruction files or change target
       // directories. Revalidate the still-unexecuted suffix, not just pins
       // that existed before the first call in this model response.
@@ -459,7 +468,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       const report = await processCompleted(completed, request, nextStep, direct.reserveFinalReport && nextStep + 1 === config.maxRequestsPerTask)
       if (report !== undefined) return report
     }
-    for (let step = nextStep; config.maxRequestsPerTask === null || step < config.maxRequestsPerTask; step++) {
+    taskSteps: for (let step = nextStep; config.maxRequestsPerTask === null || step < config.maxRequestsPerTask; step++) {
       control.signal.throwIfAborted()
       if (shouldPause?.(step)) {
         return await pause()
@@ -476,8 +485,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
           execution?.checkpoint({ strategy: 'dsh-native', actions: result.actions, pressure: result.measurement.tokens })
           await snapshot('READY')
         }
-      } else if (compact && messages.length > 2 && (JSON.stringify(messages.slice(newHistoryStart)).length > compact.triggerCharacters
-          || JSON.stringify({ messages, tools: wireTools(contract.schemas) }).length > config.maxContextCharacters)) {
+      } else if (compact && messages.length > 2 && (JSON.stringify(messages.slice(newHistoryStart)).length > compact.triggerCharacters)) {
         if (compactions >= compact.maxCompactions) fail('DIRECT_COMPACTION_LIMIT')
         const result = compactDirectHistory({ history: messages, contract, journal, execution,
           approved: contract.checkpoints, count: compactions })
@@ -502,56 +510,62 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       checkRecoveryBytes(body, 'task')
       if (direct.maxRequestBytes !== null && Buffer.byteLength(body) > direct.maxRequestBytes) fail('DIRECT_REQUEST_BYTE_LIMIT')
       const inputMeasurement = await measureInput(meter, wirePayload, control.signal, config.maxInputTokens)
-      checkWindow(payload, inputMeasurement)
-      if (overflowRetries) await execution?.beforeAuxiliaryRequest()
-      else await execution?.beforeRequest(step + 1)
-      const authHeaders = await directAuthHeaders(ctx, { ...direct, endpoint }, control.signal)
-      requestBoundary()
-      const request = { ordinal: trace.requests.length + 1, taskOrdinal: step + 1, purpose: 'task', payload: deepFreeze(JSON.parse(body)), bodySha256: createHash('sha256').update(body).digest('hex'),
-        endpoint, ...(wirePayload === payload ? {} : { normalizedHistory: { imageWindow: IMAGE_WINDOW, protocol: directProtocol(direct), length: messages.length, sha256: digest(messages), toolsSha256: digest(payload.tools ?? []) } }),
-        inputCharacters: body.length, inputBytes: Buffer.byteLength(body), contractHash: contract.hash,
-        validation: 'PASS', status: 'PREPARED', finish: null, usage: null, inputMeasurement }
-      trace.requests.push(request); persist()
-      journal?.append('MODEL_PENDING', { ordinal: request.ordinal, taskOrdinal: step + 1, bodySha256: request.bodySha256 })
-      request.status = 'SENT'; persist()
-      const observed = output?.model(displayMeta(), `${displayKey}:model:${request.ordinal}`, { payload, inputMeasurement })
-      try {
-        const response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: control.signal,
-          headers: { 'content-type': 'application/json', ...directProtocolHeaders(direct), ...authHeaders }, body })
-        request.httpStatus = response.status
-        request.serverRequestId = response.headers.get('x-request-id')?.slice(0, 1024) ?? null
-        let completed = await readCompletion(response, { signal: control.signal, model: config.model, direct, maxResponseBytes: direct.maxResponseBytes,
-          onProgress: value => { observed?.progress?.(value); meter?.observe?.(value) }, onDelta: observed?.delta })
-        observed?.end('complete', completed.finish, completed.usage)
-        overflowRetries = 0
-        recoveryByteLimit = null
-        request.responseId = completed.responseId
-        request.responseMessageSha256 = digest(completed.message)
-        request.finish = completed.finish; request.usage = completed.usage; request.responseBytes = completed.responseBytes
-        request.status = 'COMPLETE'
-        record('assistant/response', completed)
-        const report = await processCompleted(completed, request, step, reportOnly)
-        if (report !== undefined) return report
-      } catch (error) {
-        if (request.status !== 'COMPLETE') observed?.end('interrupted', error.code ?? error.name, error.directReceipt?.usage)
-        if (request.httpStatus === 413 && error.code !== 'DIRECT_CONTEXT_LENGTH_EXCEEDED' && error.directReceipt?.responseRejected
-            && direct.compaction?.strategy === 'dsh-native' && overflowRetries < 1 && messages.some(row => row.images?.length)) {
-          request.status = 'REJECTED_IMAGE_PAYLOAD'; request.errorCode = error.code
-          request.transportReceipt = structuredClone(error.directReceipt)
-          recoveryByteLimit = Math.min(Math.floor(request.inputBytes * 0.8), direct.maxRequestBytes ?? Infinity)
-          recoveryWireReason = 'HTTP_413'
-          record('compaction/image-size-recovery', { bodySha256: request.bodySha256, maxBytes: recoveryByteLimit, retry: ++overflowRetries })
-          step--; continue
+      checkWindow(payload, inputMeasurement, trace.requests)
+      const retryTransport = modelTransportRetry(ctx, config.provider, control.signal, persist)
+      let retryOf
+      for (;;) {
+        requestBoundary()
+        control.signal.throwIfAborted()
+        if (retryOf || overflowRetries) await execution?.beforeAuxiliaryRequest()
+        else await execution?.beforeRequest(step + 1)
+        const authHeaders = await directAuthHeaders(ctx, { ...direct, endpoint }, control.signal)
+        requestBoundary()
+        const request = { ordinal: trace.requests.length + 1, ...(retryOf ? { retryOf } : {}), taskOrdinal: step + 1, purpose: 'task', payload: deepFreeze(JSON.parse(body)), bodySha256: createHash('sha256').update(body).digest('hex'),
+          endpoint, ...(wirePayload === payload ? {} : { normalizedHistory: { imageWindow: IMAGE_WINDOW, protocol: directProtocol(direct), length: messages.length, sha256: digest(messages), toolsSha256: digest(payload.tools ?? []) } }),
+          inputCharacters: body.length, inputBytes: Buffer.byteLength(body), contractHash: contract.hash,
+          validation: 'PASS', status: 'PREPARED', finish: null, usage: null, inputMeasurement }
+        trace.requests.push(request); persist()
+        journal?.append('MODEL_PENDING', { ordinal: request.ordinal, taskOrdinal: step + 1, bodySha256: request.bodySha256 })
+        request.status = 'SENT'; persist()
+        const observed = output?.model(displayMeta(), `${displayKey}:model:${request.ordinal}`, { payload, inputMeasurement })
+        try {
+          const response = await fetchDirectModel(request, { method: 'POST', redirect: 'error', signal: control.signal,
+            headers: { 'content-type': 'application/json', ...directProtocolHeaders(direct), ...authHeaders }, body })
+          let completed = await readCompletion(response, { signal: control.signal, model: config.model, direct, maxResponseBytes: direct.maxResponseBytes,
+            onProgress: value => { observed?.progress?.(value); meter?.observe?.(value) }, onDelta: observed?.delta })
+          observed?.end('complete', completed.finish, completed.usage)
+          overflowRetries = 0
+          recoveryByteLimit = null
+          request.responseId = completed.responseId
+          request.responseMessageSha256 = digest(completed.message)
+          request.finish = completed.finish; request.usage = completed.usage; request.responseBytes = completed.responseBytes
+          request.status = 'COMPLETE'
+          record('assistant/response', completed)
+          const report = await processCompleted(completed, request, step, reportOnly)
+          if (report !== undefined) return report
+          break
+        } catch (error) {
+          if (request.status !== 'COMPLETE') observed?.end('interrupted', error.code ?? error.name, error.directReceipt?.usage)
+          if (request.httpStatus === 413 && error.code !== 'DIRECT_CONTEXT_LENGTH_EXCEEDED' && error.directReceipt?.responseRejected
+              && direct.compaction?.strategy === 'dsh-native' && overflowRetries < 1 && messages.some(row => row.images?.length)) {
+            request.status = 'REJECTED_IMAGE_PAYLOAD'; request.errorCode = error.code
+            request.transportReceipt = structuredClone(error.directReceipt)
+            recoveryByteLimit = Math.min(Math.floor(request.inputBytes * 0.8), direct.maxRequestBytes ?? Infinity)
+            recoveryWireReason = 'HTTP_413'
+            record('compaction/image-size-recovery', { bodySha256: request.bodySha256, maxBytes: recoveryByteLimit, retry: ++overflowRetries })
+            step--; continue taskSteps
+          }
+          if (error.code === 'DIRECT_CONTEXT_LENGTH_EXCEEDED' && direct.compaction?.strategy === 'dsh-native' && overflowRetries < 1) {
+            request.status = 'REJECTED_CONTEXT_OVERFLOW'; request.errorCode = error.code
+            record('compaction/overflow-recovery', { bodySha256: request.bodySha256, retry: ++overflowRetries })
+            forceCompaction = true; step--; continue taskSteps
+          }
+          if (error.directReceipt) request.transportReceipt = structuredClone(error.directReceipt)
+          if (request.status !== 'COMPLETE') request.status = 'UNKNOWN_OR_FAILED'
+          request.errorCode = error.code ?? 'DIRECT_TRANSPORT_OR_EXECUTION_FAILED'; persist()
+          if (await retryTransport(request, error)) { retryOf = request.ordinal; continue }
+          throw error
         }
-        if (error.code === 'DIRECT_CONTEXT_LENGTH_EXCEEDED' && direct.compaction?.strategy === 'dsh-native' && overflowRetries < 1) {
-          request.status = 'REJECTED_CONTEXT_OVERFLOW'; request.errorCode = error.code
-          record('compaction/overflow-recovery', { bodySha256: request.bodySha256, retry: ++overflowRetries })
-          forceCompaction = true; step--; continue
-        }
-        if (error.directReceipt) request.transportReceipt = structuredClone(error.directReceipt)
-        noteTransportFailure(request, error)
-        if (request.status !== 'COMPLETE') request.status = 'UNKNOWN_OR_FAILED'
-        request.errorCode = error.code ?? 'DIRECT_TRANSPORT_OR_EXECUTION_FAILED'; persist(); throw error
       }
     }
     fail('TASK_REQUEST_LIMIT')

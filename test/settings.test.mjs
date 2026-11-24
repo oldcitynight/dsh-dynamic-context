@@ -4,7 +4,7 @@ import { Config, validateConfig } from '../index.mjs'
 import { withPreferences, readPreferences } from '../settings.mjs'
 import { directRuntimeSchema } from '../direct-runtime.mjs'
 import { permissionModes, effectivePermissions } from '../permissions.mjs'
-const base = { projectRoot: '/workspace', directory: '/state', provider: 'fake', model: 'fake-llama', transport: 'direct', systemPrompt: 'Fixed host rules',
+const base = { projectRoot: process.cwd(), directory: process.cwd() + '/.test-settings-state', provider: 'fake', model: 'fake-llama', transport: 'direct', systemPrompt: 'Fixed host rules',
   direct: { endpoint: 'http://127.0.0.1:1/chat/completions', durable: true, runtime: {}, compaction: { strategy: 'dsh-native', contextWindow: 131072 } } }
 
 test('native Settings exports editable preferences without dropping ordinary plugin configuration', () => {
@@ -35,22 +35,37 @@ test('settings validate the complete effective config before accepting edits', (
     maxRequestsPerTask: 0, timeoutMs: 0, maxContextCharacters: 0, maxReportCharacters: 0, maxToolOutputCharacters: 0, reasoningEffort: 'auto' }
   const parsed = Config['~standard'].validate({ ...base, preferences: prefs })
   assert.equal(parsed.issues, undefined)
-  const applied = validateConfig(withPreferences(base, readPreferences(parsed.value.preferences)))
+  const applied = validateConfig(withPreferences({ ...base, workflowLimits: { maxDepth: 35 } }, readPreferences(parsed.value.preferences)))
   assert.equal(applied.maxRequestsPerTask, null); assert.equal(applied.timeoutMs, null)
   assert.equal(applied.direct.compaction.contextWindow, 524288); assert.equal(applied.direct.contextWindow, 524288)
-  assert.equal(applied.direct.runtime.maxToolOutputCharacters, null)
-  assert.equal(applied.hierarchy.maxGroupDepth, 5)
+  assert.equal(Object.hasOwn(applied.direct.runtime, 'maxToolOutputCharacters'), false)
+  assert.equal(applied.workflowLimits.maxDepth, 35)
 })
 
-test('native staged settings map only preference paths and preserve revision conflict protection', async () => {
-  const { preferenceScope, preferenceFields } = await import('../settings-client.mjs')
-  const { preferenceSchema } = await import('../settings.mjs')
-  assert.deepEqual(preferenceFields.map(row => row.key).sort(), Object.keys(preferenceSchema.dict).sort())
-  let write
-  const scope = preferenceScope({ getSnapshot: () => ({ status: 'ready', writable: true, revision: 7,
-    value: { preferences: { maxGroupDepth: 3 } }, base: { preferences: { maxGroupDepth: 0 } }, user: { preferences: { maxGroupDepth: 3 } } }),
-    subscribe: () => () => {}, mutate: (...args) => { write = args; return true } })
-  assert.equal(scope.getSnapshot().value.maxGroupDepth, 3)
-  await scope.mutate([{ op: 'set', path: ['maxGroupDepth'], value: 5 }], 7)
-  assert.deepEqual(write, [[{ op: 'set', path: ['preferences', 'maxGroupDepth'], value: 5 }], 7])
+test('the settings form covers both deployment and preference paths and preserves nested siblings and revisions', async () => {
+  const { configGroups } = await import('../settings-client.mjs')
+  const { configFormScope, fieldSpec } = await import('dsh-better-task-grapth/settings-form')
+  const fields = configGroups.flatMap(group => group.fields)
+  const byKey = new Map(fields.map(field => [field.key, field]))
+  assert.equal(byKey.size, fields.length)
+  assert.deepEqual([...new Set([...byKey.keys()].map(key => key.split('.')[0]))].sort(), Object.keys(Config.dict).sort())
+  for (const key of ['rolePolicy.modelBackends', 'rolePolicy.roleModels', 'rolePolicy.skills', 'rolePolicy.roleTools',
+    'rolePolicy.toolErrors.rules', 'direct.runtime.approvalPolicy', 'direct.apiKeyEnv', 'workflowLimits.maxDepth', 'preferences.timeoutMs'])
+    assert.ok(byKey.has(key), key)
+  let written
+  const scope = configFormScope({ getSnapshot: () => ({ value: { direct: { api: 'deepseek' }, workflowLimits: { maxUnits: 512 } },
+    user: { direct: { api: 'deepseek' } }, revision: 7 }), mutate: (...args) => { written = args } }, fields)
+  assert.equal(scope.getSnapshot().value['workflowLimits.maxUnits'], 512)
+  assert.ok(!Object.hasOwn(scope.getSnapshot().user, 'workflowLimits.maxUnits'))
+  await scope.mutate([{ op: 'set', path: ['workflowLimits.maxUnits'], value: 513 },
+    { op: 'unset', path: ['direct.api'] }], 7)
+  assert.deepEqual(written, [[{ op: 'set', path: ['workflowLimits','maxUnits'], value: 513 }, { op: 'unset', path: ['direct','api'] }], 7])
+  await scope.mutate([{ op: 'set', path: ['direct.api'], value: 'deepseek' }, { op: 'set', path: ['direct'], value: {} }], 8)
+  assert.deepEqual(written[0].map(op => op.path), [['direct'], ['direct','api']])
+  const cleared = configFormScope({ getSnapshot: () => ({ value: { direct: {} }, user: { direct: { compaction: null } } }) }, fields)
+  assert.equal(cleared.getSnapshot().value['direct.compaction'], null)
+  assert.equal(fieldSpec(byKey.get('rolePolicy.modelBackends')).parse('{'), undefined)
+  assert.equal(fieldSpec(byKey.get('workflowLimits.maxUnits')).parse('0'), undefined)
+  assert.deepEqual(fieldSpec(byKey.get('timeoutMs')).parse('null'), { kind: 'set', value: null })
+  assert.equal(fieldSpec(byKey.get('direct.compaction')).parse('null').value, null)
 })

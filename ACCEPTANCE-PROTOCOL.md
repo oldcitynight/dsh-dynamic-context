@@ -69,3 +69,5 @@
 消费者目录必须与开发交付目录分开；所有交付成员字节与消费者输入核对。程序不创建或运行消费者检查，不授予审计者执行权限。执行者完成实际测试，验收者结合终端回执核对是否真的使用交付入口、有无未声明的开发环境依赖。复制字节相同本身不能证明运行成功。非安装型任务可不提供 consumerCheck，但应在报告中说明相应验证范围。
 
 组报告向上传递本层证据概要、限制以及终点提交的交付清单，避免把早期已被修改的产物当作最终版本。最终报告者仍只总结已审结果；主会话同时附上程序核验过的交付路径。
+
+An approved root criteria amendment can update the public reports inherited by an unopened leaf. Its binding may include `reportSources` with `base` (digest of the stored list), `previous` (digest of the currently effective list), and `sources` (the ordered public predecessor IDs). Task assembly and blueprint inspection use the approved list. An instruction-only revision preserves the active report selection. The running attempt retains its original context version and journal.

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "mode": "blacklist",
+  "rules": [{
+    "pluginId": "dsh-dynamic-context/native",
+    "ruleId": "bash-sandbox-runner-failed",
+    "toolId": "bash",
+    "nativeModule": "shell",
+    "when": { "/value/kind": "foreground", "/value/sandbox/runnerFailed": true },
+    "reason": "The native shell sandbox runner failed. Inspect the execution environment before explicitly continuing the task."
+  }]
+}

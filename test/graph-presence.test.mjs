@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DynamicContextGraph } from '../core.mjs'
+import { FileGraphStore } from 'dsh-better-task-grapth/store'
 import { runtimeProposal } from '../testing/runtime-harness.mjs'
 
 function fixture(t) {
@@ -76,4 +77,45 @@ test('valid older graph and newer witness are a conflict, never a fresh graph', 
   fs.writeFileSync(graph.store.file, JSON.stringify(old))
   assert.equal(graph.store.presence().state, 'GRAPH_WITNESS_CONFLICT')
   assert.throws(() => graph.read(), /GRAPH_RECOVERY_REQUIRED/)
+})
+
+test('only identical persisted bytes reuse graph validation and each caller gets its own snapshot', t => {
+  const { graph } = fixture(t)
+  graph.submit(runtimeProposal([]))
+  const raw = graph.store.raw, validator = raw.validator
+  let validations = 0
+  raw.validator = value => { validations++; validator(value) }
+  const first = graph.read()
+  first.graph.events.length = 0
+  assert.equal(graph.read().graph.events.length, 1)
+  assert.equal(validations, 1)
+
+  const before = fs.readFileSync(raw.file, 'utf8'), stat = fs.statSync(raw.file)
+  const checksum = JSON.parse(before).checksum
+  const changed = before.replace(checksum, (checksum[0] === '0' ? '1' : '0') + checksum.slice(1))
+  assert.equal(changed.length, before.length)
+  fs.writeFileSync(raw.file, changed)
+  fs.utimesSync(raw.file, stat.atime, stat.mtime)
+  assert.equal(graph.store.presence().state, 'INVALID_AFTER_COMMIT')
+  assert.equal(validations, 2)
+  assert.throws(() => graph.read(), /GRAPH_RECOVERY_REQUIRED/)
+})
+
+test('store preparation runs under the lock after validation and cannot change the published value', t => {
+  const { options } = fixture(t)
+  const store = new FileGraphStore({ ...options, fileName: 'prepared-test.json',
+    validator: next => assert.equal(next.revision, 1), updateValidator: (_previous, next) => {
+      if (next.data !== 'valid') throw Error('candidate rejected')
+    } })
+  const prepare = () => assert.fail('an invalid candidate must not prepare an external commit')
+  assert.throws(() => store.compareAndSwapPrepared(0, () => ({ revision: 1, data: 'invalid' }), prepare), /candidate rejected/)
+  assert.throws(() => store.compareAndSwapPrepared(0, () => ({ revision: 1, data: 'valid' }), () => { throw Error('prepare failed') }), /prepare failed/)
+  assert.equal(store.read(), null)
+  const next = store.compareAndSwapPrepared(0, () => ({ revision: 1, data: 'valid' }), (previous, candidate) => {
+    assert.equal(previous, null)
+    assert.ok(fs.existsSync(store.lock))
+    candidate.data = 'modified copy'
+  })
+  assert.equal(next.data, 'valid')
+  assert.deepEqual(store.read(), next)
 })

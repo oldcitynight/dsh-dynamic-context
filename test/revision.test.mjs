@@ -6,12 +6,37 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { canonical } from 'dsh-better-task-grapth/core'
 import { nativeRevisionRole } from '../revision-host.mjs'
-import { DynamicContextGraph, validateState } from '../core.mjs'
+import { validateState } from '../core.mjs'
+import { namesStored, readStored } from '../workflow-io.mjs'
 import { createHarness } from '../testing/harness.mjs'
 import { runtimeProposal } from '../testing/runtime-harness.mjs'
+import { revisionRecoveryState } from '../revision-runtime.mjs'
+import { watchValidation } from '../testing/validation-probe.mjs'
 
 const policy = { objective: 'Implement lazy configuration evaluation', requirements: [{ id: 'lazy', text: 'Preserve forward references and lazy evaluation' }] }
 const verdict = { verdict: 'APPROVE', reason: 'The new evidence justifies the change and preserves requirements.', violations: [] }
+test('unchanged role recovery checks reuse metadata and notice replacement, corruption and deletion', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-role-recovery-hotpath-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const directory = path.join(root, 'revisions', 'review-fixture')
+  fs.mkdirSync(directory, { recursive: true })
+  const file = path.join(directory, 'role.json')
+  const runner = { config: { directory: root, revision: {} } }
+  fs.writeFileSync(file, JSON.stringify({ phase: 'COMPLETE' }))
+  assert.deepEqual(revisionRecoveryState(runner), [])
+  const reads = watchValidation(t, fs, 'readFileSync', { label: 'warm role recovery record', maxCalls: 0, matches: value => value === file })
+  assert.deepEqual(revisionRecoveryState(runner), [])
+  assert.deepEqual(revisionRecoveryState(runner), [])
+  reads()
+  const replacement = file + '.tmp'
+  fs.writeFileSync(replacement, JSON.stringify({ phase: 'MODEL_PENDING', runId: 'pending-fixture' }))
+  fs.renameSync(replacement, file)
+  assert.equal(revisionRecoveryState(runner)[0]?.runId, 'pending-fixture')
+  fs.writeFileSync(file, '{')
+  assert.throws(() => revisionRecoveryState(runner), SyntaxError)
+  fs.unlinkSync(file)
+  assert.deepEqual(revisionRecoveryState(runner), [])
+})
 test('standalone native role calls use fresh supplied messages without default prompt assembly or tool execution', async t => {
   const h = await fixture(t, ({ payload }) => {
     assert.equal(payload.messages.length, 2)
@@ -40,6 +65,34 @@ async function fixture(t, respond, initial = runtimeProposal([])) {
   return { ...h, root, evidence: [{ kind: 'artifact', ref: file, sha256: createHash('sha256').update(text).digest('hex') }] }
 }
 
+test('a linked blueprint appends B in the audited plan and displays A, B, C through restart', async t => {
+  const initial = runtimeProposal([])
+  const unit = key => ({ key, label: key, kind: 'leaf', parent: 'root' })
+  const edge = (from, to) => ({ from, to, kind: 'prerequisite' })
+  const binding = initial.contextGraph.bindings[0]
+  initial.taskGraph.nodes = [initial.taskGraph.nodes[0], unit('a'), unit('c')]
+  initial.taskGraph.edges = [edge('a', 'c')]
+  initial.contextGraph.bindings = ['a', 'c'].map(task => ({ ...binding, task }))
+  const h = await fixture(t, ({ payload, index }) => {
+    if (index === 2) return { text: JSON.stringify(verdict) }
+    const next = proposal(JSON.parse(payload.messages[1].content))
+    next.taskGraph.nodes.push(unit('b'))
+    next.taskGraph.edges = [edge('a', 'b'), edge('b', 'c')]
+    next.contextGraph.bindings.push({ ...binding, task: 'b' })
+    next.coverage[0].tasks = ['a', 'b', 'c']
+    return { text: JSON.stringify(next) }
+  }, initial)
+  const result = await h.runner.revise({ expectedRevision: 1, evidence: h.evidence, reason: 'Insert the new check between A and C.' })
+  assert.equal(result.status, 'COMMITTED')
+  assert.deepEqual(h.runner.graph.read().graph.state.plan.nodes.map(node => node.key), ['root', 'a', 'c', 'b'])
+  assert.deepEqual(h.runner.graph.status().nodes.map(node => node.key), ['root', 'a', 'b', 'c'])
+  await h.runner.close()
+  const reopened = await createHarness({ projectRoot: h.root, directory: h.runner.config.directory, config: h.runner.config, backend: h.backend })
+  try {
+    assert.deepEqual(reopened.runner.graph.status().nodes.map(node => node.key), ['root', 'a', 'b', 'c'])
+  } finally { await reopened.close() }
+})
+
 test('fake HTTP roles are isolated; joint revision survives restart and runs the new binding', async t => {
   let updater
   const h = await fixture(t, ({ payload, index }) => {
@@ -63,11 +116,14 @@ test('fake HTTP roles are isolated; joint revision survives restart and runs the
   assert.notEqual(state.contexts.version, before.contexts.version)
   assert.deepEqual(state.contextHistory[0], { graph: before.graph, contexts: before.contexts })
   assert.deepEqual(state.graph.events.slice(0, -1), before.graph.events)
-  h.runner.graph = new DynamicContextGraph(h.runner.config)
-  assert.deepEqual(h.runner.graph.read(), state)
-  const worked = await h.runner.runNext({ expectedRevision: 2 })
-  assert.match(worked.report.text, /corrected lazy/)
-  validateState(h.runner.graph.read())
+  await h.runner.close()
+  const restarted = await createHarness({ projectRoot: h.root, directory: h.runner.config.directory, config: h.runner.config, backend: h.backend })
+  try {
+    assert.deepEqual(restarted.runner.graph.read(), state)
+    const worked = await restarted.runner.runNext({ expectedRevision: 2 })
+    assert.match(worked.report.text, /corrected lazy/)
+    validateState(restarted.runner.graph.read())
+  } finally { await restarted.close() }
 })
 
 test('completed reports keep their original context version; invalidation propagates through report dependencies', async t => {
@@ -205,7 +261,7 @@ async function unknownRevision(t, respond = () => ({ disconnect: true })) {
   const pending = h.runner.revisionRecovery()
   assert.equal(pending.length, 1)
   const recordFile = path.join(h.runner.config.directory, 'revisions', pending[0].runId, 'role.json')
-  return { ...h, pending: pending[0], recordFile, originalRecord: fs.readFileSync(recordFile), before: h.runner.graph.read() }
+  return { ...h, pending: pending[0], recordFile, originalRecord: readStored(recordFile), before: h.runner.graph.read() }
 }
 const recoveryRequest = h => ({ expectedRevision: 1, runId: h.pending.runId, requestHash: h.pending.requestHash })
 const recoveryAttestation = h => ({ confirmedQuiescent: true, abandonRevisionRole: true,
@@ -226,7 +282,7 @@ test('unknown revision recovery requires a trusted, role-specific attestation an
   await assert.rejects(h.runner.abandonRevisionRole({ ...recoveryRequest(h), expectedRevision: 0 }), error => error.code === 'REVISION_STALE_BASE')
   await assert.rejects(h.runner.abandonRevisionRole({ ...recoveryRequest(h), requestHash: '0'.repeat(64) }), error => error.code === 'REVISION_RECOVERY_RECORD_CHANGED')
   await assert.rejects(h.runner.abandonRevisionRole({ ...recoveryRequest(h), runId: '../escape' }), error => error.code === 'REVISION_RECOVERY_SCOPE_REQUIRED')
-  assert.ok(fs.readFileSync(h.recordFile).equals(h.originalRecord))
+  assert.ok(readStored(h.recordFile).equals(h.originalRecord))
   assert.deepEqual(h.runner.graph.read(), h.before)
   assert.equal(h.backend.requests.length, 1)
   remove()
@@ -252,17 +308,17 @@ test('trusted abandonment archives the exact unknown call, preserves the graph a
   assert.deepEqual(result, { status: 'ABANDONED_UNVERIFIED', runId: h.pending.runId, revision: 1,
     graphChanged: false, financialReservationReleased: false, originalOutcome: 'UNVERIFIED', goalReached: false })
   assert.deepEqual(h.runner.graph.read(), h.before)
-  const record = JSON.parse(fs.readFileSync(h.recordFile))
+  const record = JSON.parse(readStored(h.recordFile))
   assert.equal(record.phase, 'ABANDONED_UNVERIFIED')
   assert.equal(record.reconciliation.financialStatus, 'RESERVATION_RETAINED')
   assert.equal(record.reconciliation.financialReservationReleased, false)
-  assert.ok(fs.readFileSync(record.reconciliation.originalRecord.ref).equals(h.originalRecord))
+  assert.ok(readStored(record.reconciliation.originalRecord.ref).equals(h.originalRecord))
   assert.equal(record.reconciliation.originalRecord.sha256, createHash('sha256').update(h.originalRecord).digest('hex'))
   assert.deepEqual(h.runner.revisionRecovery(), [])
   await assert.rejects(h.runner.abandonRevisionRole(recoveryRequest(h)), error => error.code === 'REVISION_RECOVERY_RECORD_CHANGED')
   const revised = await h.runner.revise({ expectedRevision: 1, evidence: h.evidence, reason: 'Start a fresh attempt after operator reconciliation.' })
   assert.equal(revised.status, 'COMMITTED')
-  const roleIds = fs.readdirSync(path.dirname(path.dirname(h.recordFile))).filter(name => name.startsWith('revision_'))
+  const roleIds = namesStored(path.dirname(path.dirname(h.recordFile))).filter(name => name.startsWith('revision_'))
   assert.equal(roleIds.length, 3)
   assert.equal(new Set(roleIds).size, 3)
   assert.equal(h.backend.requests.length, 3)
@@ -277,7 +333,7 @@ for (const defect of ['changed-evidence', 'cancelled', 'changed-graph']) test(`t
     return recoveryAttestation(h)
   } })
   await assert.rejects(h.runner.abandonRevisionRole({ ...recoveryRequest(h), signal: control.signal }))
-  assert.ok(fs.readFileSync(h.recordFile).equals(h.originalRecord))
+  assert.ok(readStored(h.recordFile).equals(h.originalRecord))
   assert.equal(h.runner.revisionRecovery().length, 1)
   if (defect !== 'changed-graph') assert.deepEqual(h.runner.graph.read(), h.before)
   assert.equal(h.runner.busy, false)

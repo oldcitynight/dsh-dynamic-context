@@ -38,7 +38,7 @@ export function imageWindowPayload(payload) {
 export function nativeLeafImageAvailable(ctx, config) {
   return config.transport === 'direct' && config.direct?.runtime?.modules.includes('filesystem') && Boolean(ctx.get('attachments'))
 }
-export function leafAllowedTools(ctx, config) {
+export function unitAllowedTools(ctx, config) {
   return nativeLeafImageAvailable(ctx, config) && !config.allowedTools.includes(IMAGE_TOOL)
     ? [...config.allowedTools, IMAGE_TOOL]
     : config.allowedTools

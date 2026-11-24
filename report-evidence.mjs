@@ -51,9 +51,9 @@ const receiptText = content => typeof content === 'string' ? content : Array.isA
   ? content.map(block => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n') : JSON.stringify(content)
 const unique = values => new Set(values).size === values.length
 
-export function inspectExecutionReport(runner, result, facts, signal) {
+export function inspectExecutionReport(runner, result, facts, signal, validatedState) {
   const report = validationBoundary({ path: '/executionReport' }, () => executionReportSchema.parse(result.executionReport))
-  if (result.outcome === 'COMPLETE' && !report.results.length) reportFailure('SUPERVISION_RESULT_COVERAGE_REQUIRED', { path: '/executionReport/results', reason: 'COMPLETE requires at least one concrete result tied to a leaf criterion.' })
+  if (['PASS','COMPLETE'].includes(result.outcome) && !report.results.length) reportFailure('SUPERVISION_RESULT_COVERAGE_REQUIRED', { path: '/executionReport/results', reason: 'COMPLETE requires at least one concrete result tied to a leaf criterion.' })
   if (!unique(report.tests.map(test => test.id))) reportFailure('SUPERVISION_DUPLICATE_TEST_ID', { path: '/executionReport/tests', reason: 'Test IDs must be unique.', duplicates: report.tests.map(t => t.id).filter((id, i, ids) => ids.indexOf(id) !== i) })
   const { projectRoot, directory, direct } = runner.config
   const forbidden = [directory, ...(direct.runtime?.privateReadRoots ?? [])]
@@ -153,9 +153,9 @@ export function inspectExecutionReport(runner, result, facts, signal) {
       keyOutput: test.quote, sourceSha256: digest(content), start: binding?.start ?? start, end: binding?.end ?? start + test.quote.length,
       qualification: 'Exact excerpt from a recorded receipt, not proof that omitted output has no counterexample.' }
   })
-  const state = runner.graph?.read?.(), enabled = acceptanceEnabled(state)
+  const state = validatedState ?? runner.graph?.read?.(), enabled = acceptanceEnabled(state)
   const verification = enabled ? requireCoverage(report.verification ?? [], acceptancePlan(state), report.tests) : null
-  if (enabled && result.outcome === 'COMPLETE') {
+  if (enabled && ['PASS','COMPLETE'].includes(result.outcome)) {
     let terminal = state.graph.state.plan.nodes.find(node => node.parent === null)
     while (terminal?.kind === 'container') terminal = state.graph.state.plan.nodes.find(node => node.id === terminal.terminal)
     if (terminal?.id === state.supervision.pending?.report.taskId) {

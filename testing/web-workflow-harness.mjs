@@ -18,7 +18,9 @@ export async function until(read, accept, label, timeout = 15000) {
   while (Date.now() < deadline) { value = await read(); if (accept(value)) return value; await delay(40) }
   throw new Error(label + ': ' + JSON.stringify(value)?.slice(0, 1500))
 }
-export async function startWorkflowWeb({ respond, root: suppliedRoot, beforeStart } = {}) {
+import { reviewRoot } from './unit-proposal.mjs'
+
+export async function startWorkflowWeb({ respond, root: suppliedRoot, beforeStart, bundleDefaults = false } = {}) {
   const root = suppliedRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-web-'))
   const home = path.join(root, 'home'), profile = path.join(home, 'profiles/web'), workspace = path.join(root, 'project')
   for (const directory of [profile, workspace]) fs.mkdirSync(directory, { recursive: true })
@@ -32,7 +34,7 @@ export async function startWorkflowWeb({ respond, root: suppliedRoot, beforeStar
     'dsh-dynamic-context': 'file:' + dynamic, 'dsh-better-task-grapth': 'file:' + graph,
   } }))
   fs.writeFileSync(path.join(profile, 'cordis.yml'), '[]\n')
-  const backend = await startFakeLlama({ respond })
+  const backend = await startFakeLlama({ respond: request => reviewRoot(request.payload) ?? respond(request) })
   const config = [
     { insert: [{ id: 'workflow-fixture-answers', name: fileURLToPath(new URL('web-test-driver.mjs', import.meta.url)) }] },
     { id: 'workspace-controller', config: { documentsDirectory: path.join(root, 'Documents') } },
@@ -46,11 +48,12 @@ export async function startWorkflowWeb({ respond, root: suppliedRoot, beforeStar
     { id: 'dsh-dynamic-context', name: 'dsh-dynamic-context', config: { enabled: true, projectRoot: workspace, storageRoot: root,
       directory: path.join(root, 'state'), transport: 'direct', provider: 'fixture', model: 'fake-llama',
       systemPrompt: 'Follow the authorized task; return the scoped result.', interaction: { mode: 'interactive', orchestration: true },
-      allowedTools: ['read', 'write'], maxOutputTokens: 2048, timeoutMs: null,
+      preplanningAcceptance: false, allowedTools: ['read', 'write'], maxOutputTokens: 2048, timeoutMs: null,
       direct: { endpoint: backend.origin + '/v1/chat/completions', apiKeyEnv: 'DSH_WORKFLOW_FIXTURE_KEY', durable: true,
         runtime: { modules: ['filesystem'], sandboxMode: 'workspace-write', approvalPolicy: 'never', instructionHomes: { dshHome: home, agentsHome: path.join(root, 'agents') } } } } },
   ]
-  fs.writeFileSync(path.join(profile, 'cordis.patch.yml'), JSON.stringify(config, null, 2))
+  const patches = bundleDefaults ? config.filter(row => !['dsh-dynamic-context', 'dsh-better-task-grapth'].includes(row.id)) : config
+  fs.writeFileSync(path.join(profile, 'cordis.patch.yml'), JSON.stringify(patches, null, 2))
   const env = Object.fromEntries(['PATH', 'HOME', 'LANG'].filter(key => process.env[key]).map(key => [key, process.env[key]]))
   Object.assign(env, { DSH_HOME: home, DSH_AGENTS_HOME: path.join(root, 'agents'), DSH_WORKFLOW_FIXTURE_KEY: 'fake-only',
     XDG_CONFIG_HOME: path.join(root, 'config'), XDG_CACHE_HOME: path.join(root, 'cache'), XDG_STATE_HOME: path.join(root, 'system-state'),
@@ -95,7 +98,7 @@ export async function startWorkflowWeb({ respond, root: suppliedRoot, beforeStar
     const rpc = async (endpoint, request = {}) => {
       const response = await fetch(`${origin}/api/${endpoint}`, { method: 'POST', headers: { 'content-type': 'application/json', cookie, origin },
         body: JSON.stringify({ type: 'client-request', rpcId: randomUUID(), method: endpoint,
-          payload: { args: endpoint === 'commands/execute' ? request : endpoint === 'transactionGraphView/status' ? { sessionId: request.sessionId }
+          payload: { args: endpoint === 'commands/execute' || endpoint.startsWith('settings/') ? request : endpoint === 'transactionGraphView/status' ? { sessionId: request.sessionId }
             : endpoint.startsWith('transactionGraphView/') ? { sessionId: request.sessionId, request }
             : { [endpoint === 'session/list' ? '_request' : 'request']: request } } }) })
       const body = await response.json()

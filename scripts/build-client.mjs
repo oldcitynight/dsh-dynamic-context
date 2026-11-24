@@ -2,7 +2,8 @@
 import fs from 'node:fs'
 const root = new URL('../', import.meta.url)
 const values = '' // This native UI consumes argsRaw; PartialArguments was introduced later.
-const sources = [values, ...['performance-common.mjs', 'client-enhancements.mjs', 'settings-client.mjs', 'client.source.mjs']
+const settingsForm = fs.readFileSync(new URL(import.meta.resolve('dsh-better-task-grapth/settings-form')), 'utf8')
+const sources = [values, settingsForm, ...['performance-common.mjs', 'client-enhancements.mjs', 'settings-client.mjs', 'tool-display-names.mjs', 'client.source.mjs']
   .map(file => fs.readFileSync(new URL(file, root), 'utf8').replace(/^import .+ from '.+'\n/gm, ''))]
 const output = `// SPDX-License-Identifier: GPL-3.0-only
 // Generated from client.source.mjs for the native argsRaw tool interface.

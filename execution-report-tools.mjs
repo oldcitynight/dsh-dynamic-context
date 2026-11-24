@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { createReportDraft, REPORT_GENERATE, REPORT_READ, REPORT_EDIT, REPORT_SUBMIT } from './report-draft.mjs'
+import { binaryInstruction, checkOutcome } from './rule-protocol.mjs'
 import { dispositionSchema } from './supervision-state.mjs'
 import { inspectExecutionReport, EXECUTION_REPORT_INSTRUCTION, LEGACY_DISPOSITION_INSTRUCTION } from './report-evidence.mjs'
 import { digest } from 'dsh-better-task-grapth/core'
@@ -14,7 +15,8 @@ export function executionReportDraft(runner, trace, signal, persist, preceding =
       outcome: type === 'tool/deferred' ? 'NOT_RUN' : data.isError ? 'FAILED' : 'RETURNED',
     }))]
     if (trace.assembly.reportProtocol === 'report-scoped-v1') inspectExecutionReport(runner, result, { tools }, signal)
-    if (result.outcome === 'FAILED' && !tools.some(row => row.callId === result.failedCallId && row.outcome === 'FAILED'))
+    checkOutcome(trace.assembly.ruleVersion,result,tools)
+    if (!trace.assembly.ruleVersion && result.outcome === 'FAILED' && !tools.some(row => row.callId === result.failedCallId && row.outcome === 'FAILED'))
       throw located('SUPERVISION_FAILED_RECEIPT_REQUIRED', { path: '/failedCallId', reason: 'Cite a real failed tool call from this attempt.' })
     return result
   } })
@@ -35,7 +37,7 @@ export function executionReportDraft(runner, trace, signal, persist, preceding =
   if (nextReopen !== reopens.length) changedReopen()
   if (old && digest(draft.snapshot()) !== digest(old)) throw located('DIRECT_REPORT_DRAFT_CHANGED', { path: '/reportDraft', reason: 'Saved report tool receipts do not reconstruct the stored draft.' })
   const definitions = draft.tools.map(({ function: spec }) => ({ ...JSON.parse(JSON.stringify(spec)),
-    description: spec.description + (spec.name === REPORT_GENERATE ? '\nThis execution role uses the following exact report template (wrap the object in report):\n' + (trace.assembly.reportProtocol === 'report-scoped-v1' ? EXECUTION_REPORT_INSTRUCTION : LEGACY_DISPOSITION_INSTRUCTION) : ''),
+    description: spec.description + (spec.name === REPORT_GENERATE ? '\nThis execution role uses the following exact report template (wrap the object in report):\n' + (trace.assembly.ruleVersion ? binaryInstruction(trace.assembly.reportProtocol === 'report-scoped-v1' ? EXECUTION_REPORT_INSTRUCTION : LEGACY_DISPOSITION_INSTRUCTION) : trace.assembly.reportProtocol === 'report-scoped-v1' ? EXECUTION_REPORT_INSTRUCTION : LEGACY_DISPOSITION_INSTRUCTION) : ''),
     output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute(args) { const value = draft.execute(spec.name, JSON.stringify(args)); trace.reportDraft = draft.snapshot(); persist(); return value },
   }))

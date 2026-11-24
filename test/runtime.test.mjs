@@ -205,12 +205,15 @@ test('instruction edits during a request stop tool execution', async t => {
   assert.equal(fs.existsSync(path.join(h.projectRoot, 'blocked.txt')), false)
 })
 
-test('oversize mandatory instructions fail before HTTP instead of silently omitting rules', async t => {
-  const h = await fixture(t, { respond: () => ({ text: 'must not run' }), config: { direct: { runtime: { instructionMaxBytes: 256 } } } })
-  fs.writeFileSync(path.join(h.projectRoot, 'AGENTS.md'), 'x'.repeat(512))
+test('retired instruction quota does not reject a host-supplied project file', async t => {
+  const content = 'recorded project rule '.repeat(3200)
+  const h = await fixture(t, { respond: ({ payload }) => {
+    assert.ok(payload.messages[0].content.includes(content))
+    return { text: 'Project rules received.' }
+  }, config: { direct: { runtime: { instructionMaxBytes: 256 } } } })
+  fs.writeFileSync(path.join(h.projectRoot, 'AGENTS.md'), content)
   h.runner.submit(runtimeProposal([]))
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_RUNTIME_INSTRUCTION_BUDGET/)
-  unresolved(h, 0)
+  assert.equal((await h.runner.runNext({ expectedRevision: 1 })).report.text, 'Project rules received.')
 })
 
 test('native owner session restrictions cannot be widened by runtime configuration', async t => {
@@ -717,7 +720,7 @@ test('no-compression tasks omit unavailable archive instructions and retain hone
 })
 
 test('an explicitly enlarged character budget can carry a long contract with exact task boundaries', async t => {
-  const h = await fixture(t, { config: { maxContextCharacters: 1048576 }, respond: () => ({ text: 'Long task data reviewed; no acceptance inferred.' }) })
+  const h = await fixture(t, { config: { maxContextCharacters: 1048576, dynamicContextMaxBytes: 1048576 }, respond: () => ({ text: 'Long task data reviewed; no acceptance inferred.' }) })
   const proposal = runtimeProposal([])
   proposal.contextGraph.nodes = Array.from({ length: 4 }, (_, i) => ({ key: 'block_' + i, content: `contract block ${i}: ` + 'x'.repeat(80000), parents: [] }))
   proposal.contextGraph.bindings[0].contexts = proposal.contextGraph.nodes.map(n => n.key)

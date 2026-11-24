@@ -1,4 +1,6 @@
+import { currentPlanningRecord, criteriaInstruction } from './acceptance-protocol.mjs'
 import { permissionAuthorityVariants, permissionConfigVariants } from './permissions.mjs'
+import { readStored } from './workflow-io.mjs'
 import { isToolReportTrace } from './execution-report-tools.mjs'
 import { acceptanceEnabled, acceptancePlan, acceptanceSnapshot, ACCEPTANCE_REVIEW } from './acceptance-protocol.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
@@ -10,6 +12,7 @@ import { feedbackText, validationBoundary, located } from 'dsh-better-task-grapt
 import { resultCheckSchema, reviewFeedback, REVIEW_FEEDBACK_INSTRUCTION } from './review-feedback.mjs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { z } from 'zod'
 import { digest } from 'dsh-better-task-grapth/core'
 import { artifactProof } from './artifacts.mjs'
@@ -17,9 +20,10 @@ import { artifactFacts, revisionAuthority } from './revision-host.mjs'
 import { acquireDirectLease } from './durable-store.mjs'
 import { fail } from './core.mjs'
 import { dispositionSchema } from './supervision-state.mjs'
-import { supervisionSemantics } from './supervision-semantics.mjs'
+import { semanticsFor } from './supervision-semantics.mjs'
+import { checkOutcome, binaryInstruction } from './rule-protocol.mjs'
 import { inspectExecutionReport, executionReportHistory, EXECUTION_REPORT_INSTRUCTION, LEGACY_DISPOSITION_INSTRUCTION, resultReviewInstruction, planReviewInstruction, parseExecutionDisposition } from './report-evidence.mjs'
-import { directRevisionRole, readRoleRecord, roleRecordValue, revisionRecoveryState, revisionSnapshot, runJointRevision } from './revision-runtime.mjs'
+import { directRevisionRole, readRoleRecord, roleRecordValue, revisionRecoveryState, revisionSnapshot, runJointRevision, warmRevisionRecovery } from './revision-runtime.mjs'
 
 import { planReviewExamples, legacyResultReviewExamples } from './format-examples.mjs'
 import { matchesHistoricalAuthority } from './authority.mjs'
@@ -51,23 +55,41 @@ const summary = (runner, state, status, details = {}) => ({ status, revision: st
 function proof(runner, ref, signal) {
   return artifactProof(runner.graph.storageRoot, ref, signal, runner.graph.artifactOptions)
 }
-export function executionFacts(runner, report, signal, seen = new Set()) {
+export function executionFacts(runner, report, signal, state = runner.graph.read()) {
+  return collectExecutionFacts(runner, report, signal, acceptanceEnabled(state), new Set())
+}
+
+function collectExecutionFacts(runner, report, signal, scopedReceipts, seen) {
   const [ref] = report.evidence
   if (seen.has(ref.sha256)) fail('SUPERVISION_TRACE_CHAIN_CYCLE')
   seen.add(ref.sha256)
   const source = proof(runner, ref, signal)
-  const trace = JSON.parse(fs.readFileSync(source.path, 'utf8'))
+  const trace = JSON.parse(readStored(source.path, 'utf8'))
   proof(runner, ref, signal)
   const last = trace.requests.at(-1)
+  // A repaired declaration has its own signed result. The original trace still proves execution.
+  let workerText = report.text
+  if (report.repairRunId) {
+    const repair = readRoleRecord(runner, report.repairRunId)
+    if (repair?.role !== 'result_repair' || repair.phase !== 'COMPLETE') fail('SUPERVISION_REPAIR_RECEIPT_INVALID')
+    const raw = roleRecordValue(repair), declared = digest(dispositionSchema.parse(raw))
+    if (declared !== digest(JSON.parse(report.text)) || (declared !== repair.resultHash && digest(raw) !== repair.resultHash))
+      fail('SUPERVISION_REPAIR_RECEIPT_INVALID')
+    const input = JSON.parse(repair.payload.messages[1].content)
+    if (input.attemptId !== report.attemptId || input.contextVersion !== report.contextVersion
+        || input.execution?.trace?.sha256 !== ref.sha256) fail('SUPERVISION_REPAIR_RECEIPT_INVALID')
+    workerText = trace.structuredSubmission?.reportText
+  }
   if (trace.assembly.task.id !== report.taskId || trace.assembly.task.attemptId !== report.attemptId
       || trace.assembly.contextVersion !== report.contextVersion || report.sessionId !== undefined && trace.sessionId !== report.sessionId
-      || trace.status !== 'RESPONSE_RECEIVED' || last?.finish !== 'stop' && !isToolReportTrace(trace, report.text) || last?.status !== 'COMPLETE')
+      || trace.status !== 'RESPONSE_RECEIVED' || last?.finish !== 'stop' && !isToolReportTrace(trace, workerText) || last?.status !== 'COMPLETE')
     fail('SUPERVISION_TERMINAL_TRACE_REQUIRED')
   const results = trace.events.filter(event => ['tool/result', 'tool/deferred'].includes(event.type))
-  if (trace.events.some(event => event.type === 'tool/call' && !results.some(row => row.data.callId === event.data.callId)))
+  const resultIds = new Set(results.map(row => row.data.callId))
+  if (trace.events.some(event => event.type === 'tool/call' && !resultIds.has(event.data.callId)))
     fail('SUPERVISION_TOOL_OUTCOME_UNKNOWN')
   const calls = new Map(trace.events.filter(event => event.type === 'tool/call').map(event => [event.data.callId, event.data]))
-  const previous = trace.previousReport ? executionFacts(runner, trace.previousReport, signal, seen) : null
+  const previous = trace.previousReport ? collectExecutionFacts(runner, trace.previousReport, signal, scopedReceipts, seen) : null
   if (previous && (trace.previousReport.taskId !== report.taskId || trace.previousReport.attemptId !== report.attemptId || trace.previousReport.contextVersion !== report.contextVersion)) fail('SUPERVISION_TRACE_CHAIN_SCOPE')
   return { ...(previous ? { precedingSegments: [...previous.precedingSegments ?? [], { trace: previous.trace, responseId: previous.responseId, localContext: previous.localContext }] } : {}), responseId: last.responseId, finish: last.finish, trace: ref,
     localContext: { contexts: trace.assembly.contexts, inheritedReports: trace.assembly.inheritedReports },
@@ -75,7 +97,7 @@ export function executionFacts(runner, report, signal, seen = new Set()) {
       arguments: calls.get(data.callId)?.arguments, content: data.content,
       outcome: type === 'tool/deferred' ? 'NOT_RUN' : data.isError ? 'FAILED' : 'RETURNED',
       ...(data.error?.info?.code ? { code: data.error.info.code } : {}),
-      ...(acceptanceEnabled(runner.graph.read()) ? { receiptScope: ref.sha256 } : {}),
+      ...(scopedReceipts ? { receiptScope: ref.sha256 } : {}),
     }))],
   }
 }
@@ -83,8 +105,9 @@ function leafRequest(runner, state, facts) {
   const { report } = state.supervision.pending
   const node = state.graph.state.plan.nodes.find(row => row.id === report.taskId)
   const binding = state.contexts.bindings.find(row => row.taskId === report.taskId)
-  return { contract: runner.config.revision.policy, runtimeSemantics: supervisionSemantics,
-    task: { key: node.key, label: node.label, instruction: binding.instruction, completion: binding.completion, tools: binding.tools },
+  return { contract: runner.config.revision.policy, runtimeSemantics: semanticsFor(state.graph.state.plan),
+    ...(binding.baseline ? { unitBaseline: binding.baseline, rootUnit: node.parent === null } : {}),
+    task: { key: node.key, label: node.label, instruction: criteriaInstruction(state, binding), completion: binding.completion, tools: binding.tools },
     ...(acceptanceEnabled(state) ? { verificationPlan: acceptancePlan(state), acceptanceContext: acceptanceSnapshot(state, report, facts) } : {}),
     attemptId: report.attemptId, contextVersion: report.contextVersion, execution: facts }
 }
@@ -95,14 +118,15 @@ function inspectResult(runner, state, facts, signal) {
   const binding = state.contexts.bindings.find(row => row.taskId === report.taskId)
   const { projectRoot, directory, direct } = runner.config
   const privateRoots = [directory, ...(direct.runtime?.privateReadRoots ?? [])]
-  const inspected = runner.config.supervisionContext === 'reports' ? validationBoundary({ stage: 'result-program-check', path: '' }, () => inspectExecutionReport(runner, result, facts, signal)) : null
+  const inspected = runner.config.supervisionContext === 'reports' ? validationBoundary({ stage: 'result-program-check', path: '' }, () => inspectExecutionReport(runner, result, facts, signal, state)) : null
   if (inspected && parsed.envelope) inspected.programValidation.reportEnvelope = parsed.envelope
   const attached = !inspected && result.artifacts.length ? artifactFacts(projectRoot, result.artifacts, signal, privateRoots) : []
   const artifacts = inspected ? inspected.submission.artifacts : attached.map(fact => fact.source)
   if (new Set(artifacts.map(ref => ref.ref)).size !== artifacts.length) fail('SUPERVISION_DUPLICATE_ARTIFACT', { path: '/artifacts', reason: 'Each artifact file must be declared exactly once.', observed: artifacts.map(ref => ref.ref) })
-  if (result.outcome === 'COMPLETE' && binding.completion.kind === 'artifact'
+  checkOutcome(state.graph.state.plan.ruleVersion,result,facts)
+  if (['PASS','COMPLETE'].includes(result.outcome) && binding.completion.kind === 'artifact'
       && !artifacts.some(ref => ref.ref === path.resolve(projectRoot, binding.completion.path))) fail('SUPERVISION_REQUIRED_ARTIFACT_MISSING', { path: '/artifacts', item: binding.completion.path, reason: 'COMPLETE requires the completion artifact fixed by this leaf.', expected: path.resolve(projectRoot, binding.completion.path), observed: artifacts.map(ref => ref.ref) })
-  if (result.outcome === 'FAILED' && !facts.tools.some(row => row.callId === result.failedCallId && row.outcome === 'FAILED'))
+  if (!state.graph.state.plan.ruleVersion && result.outcome === 'FAILED' && !facts.tools.some(row => row.callId === result.failedCallId && row.outcome === 'FAILED'))
     fail('SUPERVISION_FAILED_RECEIPT_REQUIRED', { path: '/failedCallId', item: result.failedCallId, reason: 'FAILED must cite an actual failed tool receipt from this attempt.', allowed: facts.tools.filter(row => row.outcome === 'FAILED').map(row => row.callId) })
   if (result.outcome !== 'FAILED' && result.failedCallId !== undefined) fail('SUPERVISION_UNEXPECTED_FAILURE_RECEIPT', { path: '/failedCallId', reason: 'failedCallId is only valid for the FAILED outcome.', observed: result.outcome })
   return inspected ?? { submission: { ...result, artifacts }, artifactContents: attached.map(({ source, text }) => ({ source, text })) }
@@ -127,11 +151,15 @@ async function supervisedRole(runner, state, role, instruction, input, schema, s
       && roleInputsMatch(previous, messages)) messages = previous.payload.messages
   const knownStale = previous && ['COMPLETE', 'PAUSED'].includes(previous.phase) && !roleMessagesMatch(previous, messages)
   if (!control.roleRunId || knownStale || ['ABANDONED_UNVERIFIED', 'INVALID_RESPONSE'].includes(previous?.phase)) {
+    await yieldToLoop()
+    signal.throwIfAborted()
     state = runner.graph.updateSupervision(state, { ...control, roleRunId: 'revision_' + role + '_' + randomUUID() })
+    await yieldToLoop()
+    signal.throwIfAborted()
   }
   const runId = state.supervision.roleRunId
   const value = await directRevisionRole(runner, { runId, role, messages, signal, validateOutput: true, validateResult: value => schema.parse(value),
-    ...(role === 'result_repair' && runner.config.supervisionContext === 'reports' ? { validateToolResult: value => inspectExecutionReport(runner, value, input.execution, signal) } : {}) })
+    ...(role === 'result_repair' && runner.config.supervisionContext === 'reports' ? { validateToolResult: value => { checkOutcome(state.graph.state.plan.ruleVersion, value, input.execution); return inspectExecutionReport(runner, value, input.execution, signal) } } : {}) })
   signal.throwIfAborted()
   if (runner.graph.read().checksum !== state.checksum) fail('SUPERVISION_STALE_BASE')
   const parsed = schema.safeParse(value)
@@ -143,10 +171,10 @@ async function supervisedRole(runner, state, role, instruction, input, schema, s
   return { state, value: parsed.data, record: readRoleRecord(runner, runId) }
 }
 
-async function checkResult(runner, state, sourceAgent, signal) {
+async function checkResult(runner, state, sourceAgent, signal, admittedFacts) {
   const { report, authorityHash } = state.supervision.pending
   assertAuthority(runner, authorityHash, sourceAgent, signal)
-  const facts = executionFacts(runner, report, signal)
+  const facts = admittedFacts ?? executionFacts(runner, report, signal, state)
   const snapshot = acceptanceEnabled(state) ? acceptanceSnapshot(state, report, facts) : null
   let inspected
   try { inspected = inspectResult(runner, state, facts, signal) }
@@ -157,7 +185,8 @@ async function checkResult(runner, state, sourceAgent, signal) {
   const result = inspected.submission
   const { execution, ...local } = leafRequest(runner, state, facts)
   const scoped = runner.config.supervisionContext === 'reports'
-  const checked = await supervisedRole(runner, state, 'result_check', (scoped ? resultReviewInstruction : resultInstruction) + '\n' + REVIEW_FEEDBACK_INSTRUCTION + (snapshot ? '\n' + ACCEPTANCE_REVIEW : ''),
+  const checkPrompt = (scoped ? resultReviewInstruction : resultInstruction) + '\n' + REVIEW_FEEDBACK_INSTRUCTION + (snapshot ? '\n' + ACCEPTANCE_REVIEW : '')
+  const checked = await supervisedRole(runner, state, 'result_check', state.graph.state.plan.ruleVersion ? binaryInstruction(checkPrompt,'result_check') : checkPrompt,
     scoped ? { ...local, acceptanceContext: snapshot ?? facts.localContext, submission: result,
       programValidation: inspected.programValidation, acceptanceEvidence: inspected.acceptanceEvidence } : { ...local, execution, submission: result,
       programValidation: { verifiedArtifacts: result.artifacts, artifactContents: inspected.artifactContents,
@@ -166,7 +195,7 @@ async function checkResult(runner, state, sourceAgent, signal) {
   if (checked.value.verdict === 'RETURN') return returned(runner, checked.state, reviewFeedback(checked.value, 'result_check'),
     checked.value.issues.some(row => row.correction === 'PLAN') ? 'PLAN' : checked.value.issues.some(row => row.correction === 'WORK') ? 'WORK' : 'REPORT')
   let verified
-  try { verified = inspectResult(runner, checked.state, executionFacts(runner, report, signal), signal) }
+  try { verified = inspectResult(runner, checked.state, executionFacts(runner, report, signal, checked.state), signal) }
   catch (error) { if (!snapshot) throw error; signal.throwIfAborted(); return returned(runner, checked.state, feedbackText(error, { stage: 'result-before-commit' })) }
   if (digest(verified) !== digest(inspected) || snapshot && acceptanceSnapshot(runner.graph.read(), report, facts).snapshotHash !== snapshot.snapshotHash) {
     if (!snapshot) fail('SUPERVISION_RESULT_EVIDENCE_CHANGED')
@@ -194,7 +223,7 @@ function acceptedFact(runner, state, signal) {
   const task = state.graph.state.plan.nodes.find(node => node.id === outcome.taskId).key
   const { projectRoot, directory, direct } = runner.config
   const privateRoots = [directory, ...(direct.runtime?.privateReadRoots ?? [])]
-  const execution = outcome.check ? executionFacts(runner, outcome, signal) : 'TRUSTED_RECONCILIATION'
+  const execution = outcome.check ? executionFacts(runner, outcome, signal, state) : 'TRUSTED_RECONCILIATION'
   // The full snapshot already contains this version's context nodes and reports.
   if (outcome.check) delete execution.localContext
   const attached = outcome.result.artifacts.map(ref => {
@@ -275,7 +304,7 @@ async function reviseFromSignal(runner, state, sourceAgent, signal) {
     reason: '独立核对当前双图是否仍适用。复核信号不提供理由或修改方向，以已提交执行事实和固定合同判断。',
     facts: [{ id: 'fact_0', text: JSON.stringify(latest) }, ...(runner.config.supervisionContext === 'reports'
       ? [...executionReportHistory(state).slice(0, -1).map((report, index) => ({ id: `report_${index}`, text: JSON.stringify(report) })),
-        { id: 'planning', text: JSON.stringify(state.planningRecord) }, { id: 'contract', text: JSON.stringify(runner.config.revision.policy) }] : [])],
+        { id: 'planning', text: JSON.stringify(currentPlanningRecord(state)) }, { id: 'contract', text: JSON.stringify(runner.config.revision.policy) }] : [])],
     verifyFacts: () => {
       assertAuthority(runner, entry.authorityHash, sourceAgent, signal)
       if (runner.graph.read().checksum !== state.checksum) fail('SUPERVISION_STALE_BASE')
@@ -292,32 +321,34 @@ async function reviseFromSignal(runner, state, sourceAgent, signal) {
         updaterHash: digest(readRoleRecord(runner, updaterRunId)),
         ...(reviewerRunId ? { reviewerRunId, reviewerHash: digest(readRoleRecord(runner, reviewerRunId)) } : { programError: result.error }),
       } })
-  } else if (result.status !== 'COMMITTED') next = runner.graph.updateSupervision(next, ready(next.supervision))
+  } else if (result.status !== 'COMMITTED') next = runner.graph.updateSupervision(next, { ...ready(next.supervision),
+    ...(result.status === 'ESCALATE' ? { rootReferral: { runId: result.roles.find(row => row.role === 'updater').runId, reason: result.proposal.reason } } : {}) })
   runner.publish('plan-checked')
   return summary(runner, next, 'RESULT_COMMITTED', { outcome: entry.result.outcome, plan: result.status })
 }
 
-async function advance(runner, sourceAgent, signal) {
+async function advance(runner, sourceAgent, signal, { initialState, admitted } = {}) {
   if (revisionRecoveryState(runner).length && !runner.workflowControl?.recoverModel) fail('REVISION_UNKNOWN_ROLE_REQUIRES_RECONCILIATION')
-  let state = runner.graph.read()
+  let state = initialState ?? runner.graph.read()
   if (state.supervision.phase === 'REWORK_RESULT') return summary(runner, state, 'RESULT_WORK_REQUIRED')
   if (state.supervision.phase === 'REPAIR_RESULT') {
     const { report, authorityHash } = state.supervision.pending
     assertAuthority(runner, authorityHash, sourceAgent, signal)
-    const repaired = await supervisedRole(runner, state, 'result_repair', repairInstruction + '\n\n' + (runner.config.supervisionContext === 'reports' ? EXECUTION_REPORT_INSTRUCTION : LEGACY_DISPOSITION_INSTRUCTION),
-      { ...leafRequest(runner, state, executionFacts(runner, report, signal)), previousSubmission: report.text, feedback: state.supervision.feedback },
+    const repairPrompt = repairInstruction + '\n\n' + (runner.config.supervisionContext === 'reports' ? EXECUTION_REPORT_INSTRUCTION : LEGACY_DISPOSITION_INSTRUCTION)
+    const repaired = await supervisedRole(runner, state, 'result_repair', state.graph.state.plan.ruleVersion ? binaryInstruction(repairPrompt) : repairPrompt,
+      { ...leafRequest(runner, state, executionFacts(runner, report, signal, state)), previousSubmission: report.text, feedback: state.supervision.feedback },
       dispositionSchema, signal)
     assertAuthority(runner, authorityHash, sourceAgent, signal)
     state = runner.graph.updateSupervision(repaired.state, { phase: 'CHECK_RESULT', outcomes: state.supervision.outcomes,
-      pending: { authorityHash, report: { ...report, text: JSON.stringify(repaired.value) } } })
+      pending: { authorityHash, report: { ...report, text: JSON.stringify(repaired.value), repairRunId: repaired.record.runId } } })
   }
   if (state.supervision.phase === 'CHECK_RESULT') {
-    const result = await checkResult(runner, state, sourceAgent, signal)
+    const result = await checkResult(runner, state, sourceAgent, signal, admitted?.checksum === state.checksum ? admitted.facts : undefined)
     if (result) return result
     state = runner.graph.read()
   }
   if (state.supervision.phase === 'HIERARCHY') {
-    const authority = state.supervision.outcomes.at(-1)?.authorityHash
+    const authority = state.supervision.hierarchy?.routeAuthority ?? state.supervision.outcomes.at(-1)?.authorityHash
     return advanceHierarchy(runner, signal, () => { if (authority) assertAuthority(runner, authority, sourceAgent, signal) })
   }
   if (state.supervision.phase === 'CHECK_PLAN') {
@@ -332,19 +363,19 @@ async function advance(runner, sourceAgent, signal) {
 /** The active worker is closed and its terminal trace is durable before queuing a result. */
 export async function superviseResult(runner, { report, authorityHash, sourceAgent, signal }) {
   const state = runner.graph.read()
-  executionFacts(runner, report, signal)
-  runner.graph.updateSupervision(state, { phase: 'CHECK_RESULT', outcomes: state.supervision.outcomes,
+  const facts = executionFacts(runner, report, signal, state)
+  const queued = runner.graph.updateSupervision(state, { phase: 'CHECK_RESULT', outcomes: state.supervision.outcomes,
     pending: { report, authorityHash } })
   runner.publish('result-submitted')
-  return advance(runner, sourceAgent, signal)
+  return advance(runner, sourceAgent, signal, { admitted: { checksum: queued.checksum, facts } })
 }
 
-export async function continueSupervision(runner, { expectedRevision, checkpointChecksum, sourceAgent, signal = new AbortController().signal } = {}) {
+export async function continueSupervision(runner, { expectedRevision, checkpointChecksum, sourceAgent, signal = new AbortController().signal } = {}, initialState) {
   if (!runner.config.supervision || runner.closed || runner.busy) fail('SUPERVISION_UNAVAILABLE_OR_BUSY')
-  const before = runner.graph.read()
+  const before = initialState === undefined ? runner.graph.read() : initialState
   if (before?.supervision.phase === 'REWORK_RESULT') {
     if (before.revision !== expectedRevision || before.checksum !== checkpointChecksum) fail('SUPERVISION_STALE_BASE')
-    const continuation = runner.checkpointStatus()
+    const continuation = runner.checkpointStatus(before)
     if (continuation?.phase === 'UNAVAILABLE' && fs.existsSync(runner.activeRunDirectory(before))) fail('DIRECT_CORRECTION_CHECKPOINT_UNAVAILABLE')
     if (continuation?.phase !== 'UNAVAILABLE' && continuation?.phase !== 'NO_CHECKPOINT' && !continuation.resumablePhase && !runner.workflowControl?.recoverModel) fail('DIRECT_CORRECTION_REQUIRES_RECOVERY')
     return runner.execute({ expectedRevision, sourceAgent, signal, correction: true,
@@ -360,9 +391,10 @@ export async function continueSupervision(runner, { expectedRevision, checkpoint
   runner.current = { sourceAgent, dispose: async () => control.abort(new Error('DYNAMIC_CONTEXT_RUNNER_CLOSED')) }
   try {
     lease = await acquireDirectLease(runner.config.directory)
+    await warmRevisionRecovery(runner, control.signal)
     const state = runner.graph.read()
     if (!state || state.revision !== expectedRevision || state.checksum !== checkpointChecksum) fail('SUPERVISION_STALE_BASE')
-    return await advance(runner, sourceAgent, control.signal)
+    return await advance(runner, sourceAgent, control.signal, { initialState: state })
   } finally {
     signal.removeEventListener('abort', abort)
     await lease?.release()

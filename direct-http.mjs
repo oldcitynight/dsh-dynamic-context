@@ -2,7 +2,72 @@
 import { fail } from './core.mjs'
 import { checkUsage, directProtocol } from './api-protocol.mjs'
 import { readMessages } from './messages-stream.mjs'
-import { isContextWindowExceededError } from '@deepseek-ai/dsh-llm'
+import { isContextWindowExceededError, LlmError } from '@deepseek-ai/dsh-llm'
+import { Session } from '@deepseek-ai/dsh-session'
+import { randomUUID } from 'node:crypto'
+import { fetch } from 'undici'
+
+/** A rejection before fetch returns has no HTTP receipt. Keep its financial outcome unknown. */
+export async function fetchDirectModel(request, options) {
+  try {
+    const response = await fetch(request.endpoint, options)
+    request.httpStatus = response.status
+    request.serverRequestId = response.headers.get('x-request-id')?.slice(0, 1024) ?? null
+    return response
+  } catch (error) {
+    if (options.signal?.aborted || !(error instanceof TypeError) || error.message !== 'fetch failed') throw error
+    const causes = [error.cause], seen = new Set(), codes = new Set()
+    while (causes.length) {
+      const cause = causes.pop()
+      if (!cause || typeof cause !== 'object' || seen.has(cause)) continue
+      seen.add(cause)
+      if (typeof cause.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(cause.code)) codes.add(cause.code)
+      if (cause.cause) causes.push(cause.cause)
+      if (cause instanceof AggregateError) causes.push(...cause.errors)
+    }
+    const [code] = codes
+    request.transportFailure = { phase: 'NO_HTTP_RESPONSE', ...(code && { code }), ...(codes.size > 1 && { codes: [...codes] }) }
+    throw new LlmError(code ? 'fetch failed (' + [...codes].join(', ') + ')' : 'fetch failed', 'TRANSPORT', { cause: error })
+  }
+}
+
+/** Drive DSH's retry plugin with a private event stream for this logical Direct request.
+ * Parent and sibling steps have independent retry budgets. Persist the native schedule
+ * before its wait and the start event before attempting another physical request. */
+export function modelTransportRetry(ctx, provider, signal, persist) {
+  let session
+  return async (receipt, error) => {
+    if (receipt.transportFailure?.phase !== 'NO_HTTP_RESPONSE' || error.code !== 'TRANSPORT' || signal.aborted) return false
+    const llm = ctx.get?.('llm'), projections = ctx.get?.('sessionProjections')
+    if (!projections || !llm?.listProviders?.().some(route => route.id === provider)) return false
+    session ??= Session.create(randomUUID())
+    if (projections.stateOf(session, 'llmRetry') === undefined) return false
+    const policy = llm.providerRetryPolicy(provider)
+    const { apply } = await import('@deepseek-ai/dsh-llm-retry')
+    let recover, dispose
+    // Use the installed scheduler, including its cancellable timer, jitter and own
+    // projection. Only its two request-retry events are written to this receipt.
+    apply({
+      logger: ctx.logger,
+      sessionProjections: { register() {}, stateOf: (_session, key) => projections.stateOf(session, key) },
+      on: (_event, listener) => { recover = listener; return () => {} },
+      effect: cleanup => { dispose = cleanup },
+    })
+    const agent = { session: { append(type, data) {
+      const event = session.append(type, data)
+      receipt.retryEvents ??= []
+      receipt.retryEvents.push(event)
+      persist()
+      return event
+    } } }
+    try {
+      const decision = await recover({ agent, turn: 1, step: receipt.logicalStep ?? receipt.taskOrdinal ?? receipt.beforeTaskOrdinal ?? 1,
+        provider, failure: error.failure, retryPolicy: policy, signal }, async () => undefined)
+      signal.throwIfAborted()
+      return decision?.kind === 'retry'
+    } finally { await dispose() }
+  }
+}
 
 /** Parse bounded OpenAI/llama SSE. A partial stream is never a successful answer. */
 export async function readCompletion(response, { signal, model, direct, maxResponseBytes, onProgress, onDelta }) {

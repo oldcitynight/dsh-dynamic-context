@@ -5,8 +5,9 @@ import { WORKFLOW_CONTRACT } from 'dsh-better-task-grapth/interop'
 import { EXTENSION_CONTRACT } from 'dsh-better-task-grapth/extensions'
 import { digest } from 'dsh-better-task-grapth/core'
 import { proposalSchema } from './core.mjs'
+import { ruleSummary } from './rule-editor.mjs'
+import { prepareRuleSubmission } from './rule-audit.mjs'
 import { interactiveProposalSchema } from './control-tools.mjs'
-import { GRAPH_COMMIT_RECORD } from './graph-presence.mjs'
 
 export function requireTaskGraph(ctx, expected) {
   const service = ctx.get('transactionGraph')
@@ -35,11 +36,9 @@ const requests = {
   maintenance: z.object({ expectedRevision: revision, planChecksum: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict(),
 }
 
-function linkedGraphView(runner) {
-  const { state, presence } = runner.graph.store.inspect({ reconcilePrepared: false })
-  if (presence.state === 'NEVER_CREATED' && !runner.taskGraph.sessionRecords.read(runner.controller.session).some(({ event }) =>
-    event.type === GRAPH_COMMIT_RECORD && event.ignorable && event.data.workflowId === runner.workflowId)) return null
-  if (presence.state !== 'READY') throw new Error('GRAPH_RECOVERY_REQUIRED')
+function linkedGraphView(runner, { state, graphPresence }) {
+  if (graphPresence.recoveryRequired) throw new Error('GRAPH_RECOVERY_REQUIRED')
+  if (!state) return null
   const display = runner.graph.status(state)
   return { display: { ...display, skipChoices: [] }, plan: state.graph.state.plan }
 }
@@ -47,6 +46,13 @@ function linkedGraphView(runner) {
 /** Bind one joint ledger to the task-graph plugin; never mirror its transitions. */
 export function workflowAdapter(runner) {
   const durable = runner.config.transport === 'direct' && runner.config.direct.durable
+  const readGraph = readScope => {
+    const shared = readScope?.get(runner)
+    if (shared) return shared
+    const snapshot = runner.graphSnapshot({ reconcilePrepared: false })
+    readScope?.set(runner, snapshot)
+    return snapshot
+  }
   return {
     contract: WORKFLOW_CONTRACT, version: 1, kind: 'dynamic-context',
     workflowId: runner.config.interop.workflowId ?? `workflow_${digest(runner.config.directory).slice(0, 40)}`,
@@ -56,8 +62,12 @@ export function workflowAdapter(runner) {
       ...(durable ? ['pause', 'resume', 'reconcile', 'maintenance'] : [])],
     authorize: agent => !runner.closed && agent !== runner.current?.agent
       && (runner.config.interaction.mode === 'host' || runner.controller === agent),
-    ...(runner.config.interaction.mode === 'interactive' ? { readGraphView: () => linkedGraphView(runner),
-      readExecutionView: () => runner.interaction?.orchestrator?.executionView(runner.controller) ?? null,
+    ...(runner.config.interaction.mode === 'interactive' ? { readGraphView: readScope => linkedGraphView(runner, readGraph(readScope)),
+      readExecutionView: readScope => {
+        const { orchestrator, lifecycle } = runner.interaction ?? {}
+        const active = orchestrator ?? (lifecycle?.record(runner.controller)?.toolErrorBlock ? lifecycle : null)
+        return active?.executionView(runner.controller, () => readGraph(readScope)) ?? null
+      },
       readExecutionOutput: async request => {
         await runner.output.importHistory(runner)
         if (request.itemId) return runner.output.body(request)
@@ -67,18 +77,17 @@ export function workflowAdapter(runner) {
         try { labels = new Map((runner.graph.read()?.graph.state.plan.nodes ?? []).map(node => [node.id, node.label])) } catch {}
         return { ...page, items: page.items.map(row => ({ ...row, taskLabel: labels.get(row.taskId) ?? null })) }
       },
-      controlExecution: (action, { agent, signal }) => runner.interaction.orchestrator.fromView(agent, action, signal),
+      controlExecution: (action, { agent, signal }) => (runner.interaction.orchestrator ?? runner.interaction.lifecycle).fromView(agent, action, signal),
     } : {}),
     subscribe: callback => runner.subscribe(callback),
     read() {
-      const graphPresence = runner.graphPresence()
+      const { graphPresence, state } = runner.graphSnapshot()
       if (graphPresence.recoveryRequired) return { graph: null, graphPresence, recoveryRequired: true, execution: { busy: runner.busy, legalNext: [] }, semanticAcceptance: 'NOT_EVALUATED' }
-      const state = runner.graph.read()
       return { revision: state?.revision ?? 0, graph: state?.graph ?? null, contextVersion: state?.contexts.version ?? null,
         reports: (state?.reports ?? []).map(({ taskId, attemptId, sessionId, acceptance, evidence, contextVersion }) => ({ taskId, attemptId, sessionId, acceptance, evidence, contextVersion,
           validity: state.invalidatedReports?.includes(taskId) ? 'INVALIDATED' : 'UNVERIFIED' })),
         invalidatedReports: state?.invalidatedReports ?? [],
-        execution: { busy: runner.busy, closed: runner.closed, continuation: durable ? runner.checkpointStatus() : null,
+        execution: { busy: runner.busy, closed: runner.closed, continuation: durable ? runner.checkpointStatus(state) : null,
           revisionRecovery: runner.revisionRecovery(),
           ...(runner.config.supervision ? { supervision: runner.supervisionStatus(state), legalNext: runner.graph.status(state)?.legalNext ?? [] } : {}),
         },
@@ -88,16 +97,16 @@ export function workflowAdapter(runner) {
       runner.assertController(agent)
       if (operation === 'submit' && runner.interaction) {
         const args = z.object({ proposal: interactiveProposalSchema }).strict().parse(request)
-        return runner.interaction.submit(runner, args.proposal, { agent, signal })
+        return runner.interaction.submit(runner, await prepareRuleSubmission(runner, args.proposal, agent, signal), { agent, signal })
       }
       const args = requests[operation].parse(request)
       if (operation === 'status') return runner.status()
       if (operation === 'revise') return runner.revise({ ...args, sourceAgent: agent, signal })
       if (operation === 'continue_supervision') return runner.continueSupervision({ ...args, sourceAgent: agent, signal })
       if (operation === 'submit') {
-        const result = runner.submit(args.proposal, { sourceAgent: agent })
+        const result = runner.submit(await prepareRuleSubmission(runner, args.proposal, agent, signal), { sourceAgent: agent })
         if (!await runner.ctx.sessions.flush(agent.session)) throw new Error('DYNAMIC_CONTEXT_GRAPH_RECEIPT_NOT_DURABLE')
-        return { revision: result.revision, contextVersion: result.contexts.version }
+        return { revision: result.revision, contextVersion: result.contexts.version, ...ruleSummary(result.graph.state.plan) }
       }
       if (operation === 'pause') return runner.pauseActive(args)
       if (operation === 'reconcile') return runner.reconcileActive({ ...args, sourceAgent: agent, signal })

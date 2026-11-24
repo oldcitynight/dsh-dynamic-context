@@ -19,12 +19,12 @@ import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harnes
 import { startFakeLlama } from '../testing/fake-llama.mjs'
 
 const signal = () => new AbortController().signal
-function fixture(t) {
+function fixture(t, { retainedForHarness = false } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'directory-identity-')))
   const projectRoot = path.join(root, 'workspace'), directory = path.join(root, 'state'), folder = path.join(projectRoot, 'deliverable')
   fs.mkdirSync(path.join(folder, 'empty'), { recursive: true }); fs.mkdirSync(directory)
   fs.writeFileSync(path.join(folder, 'result.txt'), 'verified bytes')
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  if (!retainedForHarness) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   return { root, folder, config: { projectRoot, directory, direct: {} } }
 }
 const report = row => ({ outcome: 'COMPLETE', summary: 'Delivered the requested result', artifacts: [], executionReport: {
@@ -121,9 +121,13 @@ test('repair snapshot tool only inspects declared directories and rewrites one r
 })
 
 test('fake worker uses its bound snapshot tool; acceptance receives static proof without being granted hash tools', async t => {
-  const { config, root } = fixture(t)
-  let descriptor
-  const h = await createRuntimeHarness({ projectRoot: config.projectRoot, directory: config.directory,
+  const { config, root } = fixture(t, { retainedForHarness: true })
+  let descriptor, h
+  t.after(async () => {
+    try { await h?.close() }
+    finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+  h = await createRuntimeHarness({ projectRoot: config.projectRoot, directory: config.directory,
     config: { storageRoot: root, allowedTools: [DIRECTORY_SNAPSHOT_TOOL], supervision: true, supervisionContext: 'reports',
       revision: { policy: { objective: 'Deliver the result', requirements: [{ id: 'delivery', text: 'Deliver the result file' }] } }, direct: { durable: true } },
     respond: ({ index, payload }) => {
@@ -142,7 +146,6 @@ test('fake worker uses its bound snapshot tool; acceptance receives static proof
       }
       return { text: '{"verdict":"CURRENT"}' }
     } })
-  t.after(() => h.close())
   const p = runtimeProposal([DIRECTORY_SNAPSHOT_TOOL]); p.contextGraph.bindings[0].completion = { kind: 'artifact', path: 'deliverable/result.txt' }
   p.planningReport = { understanding: 'Deliver the result', assumptions: [], design: 'One leaf', acceptanceStrategy: 'Inspect the directory proof' }
   h.runner.submit(p)

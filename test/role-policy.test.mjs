@@ -89,6 +89,26 @@ test('durable registered tools replay completed receipts and never repeat an unc
   await assert.rejects(next.execute(pending), /ROLE_TOOL_OUTCOME_UNKNOWN/); assert.equal(effects, 2)
 })
 
+test('a durable tool can reuse only an explicitly registered historical parameter schema', async () => {
+  const { function: saved } = extension().schema
+  const revised = extension({ execute: (args, { toolSchema }) => ({ args, description: toolSchema.function.description }) })
+  delete revised.schema.function.parameters.properties.id
+  revised.schema.function.parameters.required = []
+  revised.schema.function.description = 'New schema'
+  const registry = new RoleToolRegistry()
+  registry.registerTool({ ...revised, previousParameters: [saved.parameters] })
+  const savedToolSchemas = new Map([['group_audit', new Map([[saved.name, saved]])]])
+  const resume = registry.tools('group_audit', null, {}, { savedToolSchemas })
+  assert.deepEqual(resume.tools[0].function, saved)
+  assert.deepEqual(await resume.execute(call({ id: 'old-shape' })), { args: { id: 'old-shape' }, description: saved.description })
+  const fresh = registry.tools('group_audit', null)
+  assert.deepEqual(fresh.tools[0].function, revised.schema.function)
+  await assert.rejects(fresh.execute(call({ id: 'old-shape' })), /ROLE_TOOL_ARGUMENT_INVALID/)
+  saved.parameters.properties.unknown = { type: 'string' }
+  const unrelated = registry.tools('group_audit', null, {}, { savedToolSchemas })
+  assert.deepEqual(unrelated.tools[0].function, revised.schema.function)
+})
+
 test('report tool retains the host format when the work prompt is replaced', async () => {
   const { createReportDraft, standardReportTemplate } = await import('../report-draft.mjs')
   const source = 'Perform an independent review.\n标准模板：{"verdict":"APPROVE","reason":"证据说明","issues":[]}。'

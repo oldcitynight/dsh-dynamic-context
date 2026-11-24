@@ -24,9 +24,11 @@ async function fixture(t) {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [fileURLToPath(new URL('../scripts/cli.mjs', import.meta.url)), command, '--config', configFile, ...options],
         { env: { ...process.env, DYNAMIC_CONTEXT_CLI_FIXTURE_KEY: 'FAKE_SECRET_MUST_NOT_APPEAR' }, stdio: ['ignore', 'pipe', 'pipe'] })
-      let output = ''
-      child.stdout.on('data', data => { output += data.toString() }); child.stderr.on('data', data => { output += data.toString() })
-      child.once('error', reject); child.once('exit', code => resolve({ code, output }))
+      let stdout = '', stderr = ''
+      child.stdout.setEncoding('utf8').on('data', text => { stdout += text })
+      child.stderr.setEncoding('utf8').on('data', text => { stderr += text })
+      child.once('error', reject)
+      child.once('close', code => resolve({ code, stdout, output: stdout + stderr }))
     })
   }, proposalFile }
 }
@@ -34,7 +36,7 @@ async function fixture(t) {
 test('API preflight does not request a model, create a workflow or expose a credential', async t => {
   const h = await fixture(t), result = await h.invoke('check')
   assert.equal(result.code, 0, result.output)
-  assert.equal(JSON.parse(result.output).networkCalled, false)
+  assert.equal(JSON.parse(result.stdout).networkCalled, false)
   assert.equal(h.backend.requests.length, 0); assert.equal(fs.existsSync(path.join(h.root, 'state')), false)
   assert.doesNotMatch(result.output, /FAKE_SECRET_MUST_NOT_APPEAR/)
 })

@@ -7,7 +7,7 @@ import { deepFreeze, wireTools, activeTaskBinding } from './request-policy.mjs'
 import { checkDirectHistory, checkpointData } from './checkpoints.mjs'
 import { apiParameters } from './api-protocol.mjs'
 import { fail } from './core.mjs'
-import { imageTokens, IMAGE_READ_INSTRUCTION } from './image-content.mjs'
+import { imageTokens, imageWindowPayload, IMAGE_TOOL, IMAGE_WINDOW, IMAGE_READ_INSTRUCTION } from './image-content.mjs'
 import { COMPACTION_INSTRUCTION, CHECKPOINT_PREAMBLE, SUMMARY_OPEN_TAG, SUMMARY_CLOSE_TAG,
   NATIVE_CHECKPOINT_PROTOCOL, NATIVE_REMINDER_PROTOCOL, PROVENANCE_TAG, nativeCompactSpec, SUMMARY_MAX_TOKENS } from './dsh-compaction-policy.mjs'
 
@@ -19,16 +19,43 @@ export function nativeMessageEstimate(message) {
   return estimateMessage({ role: message.role, content }) + imageTokens(message)
 }
 
+// Keep the billed prefix at its observed cost. Only the new suffix is still
+// unpriced. Images entering the window can also add text markers inside the
+// old prefix. Charge for those markers without subtracting displaced images.
+function anchoredUpperTokens(history, visible, prefixLength, promptTokens) {
+  if (prefixLength === history.length) return promptTokens
+  const suffix = visible.slice(prefixLength)
+  let extra = Buffer.byteLength(JSON.stringify(suffix)) + suffix.reduce((sum, row) => sum + imageTokens(row), 0)
+  if (history.slice(prefixLength).some(row => row.images?.length) && visible !== history) {
+    const previous = imageWindowPayload({ messages: history.slice(0, prefixLength) }).messages
+    for (let i = 0; i < prefixLength; i++) {
+      if (history[i].images?.length && previous[i].content !== visible[i].content)
+        extra += Buffer.byteLength(JSON.stringify(visible[i].content.slice((history[i].content ?? '').length)))
+    }
+  }
+  return promptTokens + extra
+}
+
 /** Reuse provider usage only while the whole priced prefix and tools are intact. */
 export function nativePressure(history, schemas, requests = []) {
-  const nodes = history.map(nativeMessageEstimate)
+  const visible = imageWindowPayload({ messages: history }).messages
+  const nodes = visible.map(nativeMessageEstimate)
   const heuristic = nodes.reduce((a, b) => a + b, 0) + estimateToolsTokens({ tools: schemas })
+  const currentToolsHash = digest(wireTools(schemas))
+  let checkedTaskReceipt = false
   for (const request of [...requests].reverse()) {
-    if (request.purpose === 'compaction' || request.status !== 'COMPLETE' || !request.payload || !Number.isSafeInteger(request.usage?.prompt_tokens)) continue
-    const prefixLength = request.normalizedHistory?.length ?? request.payload.messages.length
+    if (request.purpose === 'compaction' || request.status !== 'COMPLETE' || !Number.isSafeInteger(request.usage?.prompt_tokens) || request.usage.prompt_tokens < 0) continue
+    // The latest task may already be on disk after auxiliary summaries. Older
+    // disk-only receipts need no prefix rehash on every step of a long task.
+    if (checkedTaskReceipt && !request.payload) continue
+    checkedTaskReceipt = true
+    const normalized = request.normalizedHistory
+    if (!request.payload && !(request.savedPayload && Number.isSafeInteger(normalized?.length)
+        && typeof normalized.sha256 === 'string' && typeof normalized.toolsSha256 === 'string')) continue
+    const prefixLength = normalized?.length ?? request.payload.messages.length
     const prefixHash = request.normalizedHistory?.sha256 ?? digest(request.payload.messages)
     const toolsHash = request.normalizedHistory?.toolsSha256 ?? digest(request.payload.tools ?? [])
-    if (prefixLength > history.length || toolsHash !== digest(wireTools(schemas))) continue
+    if (!Number.isSafeInteger(prefixLength) || prefixLength < 2 || prefixLength > history.length || toolsHash !== currentToolsHash) continue
     if (digest(history.slice(0, prefixLength)) !== prefixHash) continue
     const assistant = history[prefixLength]
     const hasAssistant = request.responseMessageSha256 && assistant?.role === 'assistant' && digest(assistant) === request.responseMessageSha256
@@ -37,7 +64,12 @@ export function nativePressure(history, schemas, requests = []) {
     const base = nodes.slice(0, end).reduce((a, b) => a + b, 0) + estimateToolsTokens({ tools: schemas })
     return { tokens: Math.max(heuristic, usageTokens + nodes.slice(end).reduce((a, b) => a + b, 0)),
       heuristicTokens: heuristic, nodes, method: 'dsh-heuristic-with-usage-anchor', anchorBodySha256: request.bodySha256,
-      anchorApplied: usageTokens >= base }
+      anchorApplied: usageTokens >= base,
+      // The projection also changes the read_image tool description even
+      // when the priced prefix itself contains no image.
+      ...(normalized?.imageWindow === IMAGE_WINDOW || (!schemas.some(tool => tool.name === IMAGE_TOOL)
+        && !history.slice(0, prefixLength).some(row => row.images?.length))
+        ? { anchoredUpperTokens: anchoredUpperTokens(history, visible, prefixLength, request.usage.prompt_tokens) } : {}) }
   }
   return { tokens: heuristic, heuristicTokens: heuristic, nodes, method: 'dsh-heuristic', anchorApplied: false }
 }
@@ -73,10 +105,24 @@ export function nativePrefixEnd(history, nodes, retainTokens) {
   return end > 2 ? end : null
 }
 
-export function nativeSummaryPayload(config, schemas, prefix, instruction = COMPACTION_INSTRUCTION, imageTools = false, allowImageTools = true) {
+// A checkpoint or reminder alone contains no new work to summarize. If the
+// retention target leaves only these or protected shared exchanges, consume
+// complete work exchanges while retaining the most recent one when possible.
+function workPrefixEnd(history, preferred, previousEnd = 2) {
+  const shared = sharedHistory(history)
+  const starts = []
+  for (let i = previousEnd; i < history.length; i++) {
+    if (history[i].role === 'assistant' && !shared.has(history[i])) starts.push(i)
+  }
+  if (!starts.length) return null
+  if (starts[0] < preferred) return preferred
+  return starts.length > 1 ? starts.at(-1) : history.length
+}
+
+export function nativeSummaryPayload(config, schemas, prefix, instruction = COMPACTION_INSTRUCTION, imageTools = false, allowImageTools = true, imageInstruction = IMAGE_READ_INSTRUCTION) {
   const summarySchemas = imageTools ? schemas.filter(t => allowImageTools && t.name === 'read_image') : schemas
   return deepFreeze({ ...config.direct.generation, ...apiParameters(config.direct), model: config.model,
-    messages: [...prefix, { role: 'user', content: instruction + (imageTools && summarySchemas.length ? '\n' + IMAGE_READ_INSTRUCTION : '') }],
+    messages: [...prefix, { role: 'user', content: instruction + (imageTools && summarySchemas.length ? '\n' + imageInstruction : '') }],
     ...(summarySchemas.length ? { tools: wireTools(summarySchemas) } : {}), max_tokens: SUMMARY_MAX_TOKENS,
     stream: true, stream_options: { include_usage: true } })
 }
@@ -94,6 +140,31 @@ export function reanchorNativeTask(history, contract, source, generation) {
   return result
 }
 
+/** A thinking-only stop has a billable response but no summary. Retry the identical
+ * send once per source span, including a follow-up after a completed image read. */
+export function summarySendWithRetry(send) {
+  let retried = false
+  return async payload => {
+    let result = await send(payload)
+    while (result.finish === 'stop' && !result.message?.tool_calls?.length && !result.text?.trim()
+        && (result.reasoning ?? result.message?.reasoning_content)?.trim()) {
+      if (retried) fail('COMPACTION_THINKING_ONLY_RETRY_EXHAUSTED', { path: '/response/content',
+        reason: 'The compression returned thinking without summary text on both attempts. Both responses and their usage are preserved.' })
+      retried = true
+      result = await send(payload, { summaryRetry: { reason: 'THINKING_ONLY', previousResponseId: result.responseId ?? null } })
+    }
+    return result
+  }
+}
+
+// A summary may quote the tokens that delimit earlier checkpoints. Keep the
+// quotation as text while only the host can write checkpoint markup.
+function escapeSummaryFraming(text) {
+  const tags = [SUMMARY_OPEN_TAG, SUMMARY_CLOSE_TAG]
+  for (const tag of tags) text = text.replaceAll(tag, tag.replace('<', '&lt;').replace('>', '&gt;'))
+  return text
+}
+
 /** No tool execution occurs in this auxiliary path. Every call goes through the host ledger. */
 export async function compactNativeHistory({ history, contract, journal, execution, count, requests = [], summarize, onEvent = () => {}, force = false, measureTokens, recoveryWire }) {
   if (!journal) fail('DIRECT_NATIVE_COMPACTION_REQUIRES_DURABILITY')
@@ -101,14 +172,15 @@ export async function compactNativeHistory({ history, contract, journal, executi
   // Direct requests always carry this explicit cap. Never allow a separate
   // reservation override to contradict the actual request envelope.
   const spec = nativeCompactSpec(contract.config.direct.compaction.contextWindow, contract.config.maxOutputTokens)
-  let measurement = nativePressure(history, contract.schemas, requests)
   const pressure = async value => {
     const result = nativePressure(value, contract.schemas, requests)
-    if (measureTokens) result.tokens = Math.max(result.tokens, await measureTokens({
-      messages: value, tools: wireTools(contract.schemas), model: contract.config.model }))
+    if (measureTokens) {
+      result.capacityEstimateTokens = await measureTokens({ messages: value, tools: wireTools(contract.schemas), model: contract.config.model }, result)
+      result.tokens = Math.max(result.tokens, result.capacityEstimateTokens)
+    }
     return result
   }
-  measurement = await pressure(history)
+  let measurement = await pressure(history)
   const actions = [], beforeCharacters = JSON.stringify(history).length
   const wireBytes = recoveryWire ? await recoveryWire.measure({ messages: history, tools: wireTools(contract.schemas) }) : null
   const wirePressure = wireBytes !== null && wireBytes > recoveryWire.maxBytes
@@ -125,14 +197,22 @@ export async function compactNativeHistory({ history, contract, journal, executi
     onEvent('compaction/pruned', actions.at(-1))
     measurement = await pressure(history)
   }
-  for (let attempt = 0; (force || measurement.tokens >= spec.thresholdTokens) && attempt < (force ? 1 : spec.attempts); attempt++) {
-    const end = nativePrefixEnd(history, measurement.nodes, force ? 0 : spec.retainTokens)
-      ?? (history.length > 2 ? history.length : null)
-    if (end === null) fail('DIRECT_NATIVE_COMPACTION_NO_COMPLETE_PREFIX')
+  const attempts = force ? 1 : spec.attempts
+  let previousEnd = 2
+  let recompressedPrior = false
+  for (let attempt = 0; (force || measurement.tokens >= spec.thresholdTokens) && attempt < attempts; attempt++) {
+    if (history.length <= 2) fail('DIRECT_NATIVE_COMPACTION_NO_COMPLETE_PREFIX')
+    const preferred = nativePrefixEnd(history, measurement.nodes, force ? 0 : spec.retainTokens) ?? history.length
+    // A single checkpoint larger than the whole retention budget can itself
+    // relieve genuine pressure, without paging or removing recent exchanges.
+    const oversizedPrior = !recompressedPrior && previousEnd === 2 && preferred === 3
+      && checkpointData(history[2])?.protocol === NATIVE_CHECKPOINT_PROTOCOL && measurement.nodes[2] >= spec.retainTokens
+    const end = oversizedPrior ? preferred : workPrefixEnd(history, preferred, previousEnd)
+    if (end === null) fail('DIRECT_NATIVE_COMPACTION_FIXED_INPUT_EXCEEDS_WINDOW', {
+      reason: 'No fresh, unprotected work exchange is available to compress.', inputTokens: measurement.tokens, thresholdTokens: spec.thresholdTokens })
+    if (oversizedPrior) recompressedPrior = true
     const prefix = history.slice(0, end), removed = history.slice(2, end)
     const protectedShared = [...sharedHistory(removed)]
-    if (protectedShared.length === removed.length) fail('DIRECT_NATIVE_COMPACTION_FIXED_INPUT_EXCEEDS_WINDOW', {
-      reason: 'Only protected shared-context exchanges remain. Their original values cannot be summarized.' })
     checkDirectHistory(prefix, contract.checkpoints)
     const archive = journal.archive(removed), prior = checkpointData(removed[0] ?? {})
     // Map large history into independently admitted, complete conversation
@@ -144,7 +224,7 @@ export async function compactNativeHistory({ history, contract, journal, executi
     for (let start = 2; start < prefix.length;) {
       const ends = []
       for (let i = start + 1; i <= prefix.length; i++) if (prefix[i]?.role !== 'tool') ends.push(i)
-      const make = end => nativeSummaryPayload(contract.config, contract.schemas, [prefix[0], prefix[1], ...prefix.slice(start, end)], contract.assembly.compactionPrompt?.content, contract.assembly.imageTools, contract.assembly.compactionImageTools)
+      const make = end => nativeSummaryPayload(contract.config, contract.schemas, [prefix[0], prefix[1], ...prefix.slice(start, end)], contract.assembly.compactionPrompt?.content, contract.assembly.imageTools, contract.assembly.compactionImageTools, contract.assembly.compactionImagePrompt?.content)
       let end = prefix.length
       if ((measureTokens || recoveryWire) && !await fits(make(end))) {
         let low = 0, high = ends.length - 1, found = -1
@@ -167,9 +247,13 @@ export async function compactNativeHistory({ history, contract, journal, executi
       contract.checkDirectCompaction(payload, payload.messages.slice(0, -1))
       const completed = await summarize(payload)
       if (completed.finish !== 'stop' || completed.message?.tool_calls?.length || !completed.text?.trim()) fail('DIRECT_NATIVE_SUMMARY_INVALID')
-      if ([PROVENANCE_TAG, SUMMARY_OPEN_TAG, SUMMARY_CLOSE_TAG].some(tag => completed.text.includes(tag))) fail('DIRECT_NATIVE_SUMMARY_FRAME_COLLISION')
-      pieces.push(completed.text)
-      spans.push({ start: start - 2, end: end - 2, responseId: completed.responseId, summarySha256: digest(completed.text) })
+      if (completed.text.includes(PROVENANCE_TAG) || completed.text.includes('</dynamic-context-provenance>')) fail('DIRECT_NATIVE_SUMMARY_FRAME_COLLISION')
+      const text = escapeSummaryFraming(completed.text)
+      if (text !== completed.text) onEvent('compaction/summary-framing-escaped', {
+        responseId: completed.responseId, originalSha256: digest(completed.text), summarySha256: digest(text),
+      })
+      pieces.push(text)
+      spans.push({ start: start - 2, end: end - 2, responseId: completed.responseId, summarySha256: digest(text) })
       start = end
     }
     const completed = { text: pieces.join('\n\n'), responseId: spans.at(-1)?.responseId }
@@ -184,13 +268,23 @@ export async function compactNativeHistory({ history, contract, journal, executi
     const message = deepFreeze({ role: 'user', content: `${CHECKPOINT_PREAMBLE}\n\n${SUMMARY_OPEN_TAG}${completed.text}${SUMMARY_CLOSE_TAG}\n\n${PROVENANCE_TAG}${JSON.stringify(data)}</dynamic-context-provenance>` })
     const next = deepFreeze([history[0], history[1], message, ...protectedShared, ...history.slice(end)])
     const nextMeasurement = nativePressure(next, contract.schemas)
-    if (nextMeasurement.tokens >= measurement.heuristicTokens) fail('DIRECT_NATIVE_COMPACTION_NO_REDUCTION')
+    if (nextMeasurement.heuristicTokens >= measurement.heuristicTokens) {
+      const detail = { sourceMessages: removed.length, beforeHeuristicTokens: measurement.heuristicTokens,
+        afterHeuristicTokens: nextMeasurement.heuristicTokens, inputTokens: measurement.tokens, thresholdTokens: spec.thresholdTokens }
+      onEvent('compaction/no-reduction', detail)
+      if (attempt + 1 >= attempts || workPrefixEnd(history, preferred, end) === null) fail('DIRECT_NATIVE_COMPACTION_NO_REDUCTION', detail)
+      previousEnd = end
+      continue
+    }
+    previousEnd = 2
     contract.approveCheckpoint(message)
     checkDirectHistory(next, contract.checkpoints)
+    const afterPressure = await pressure(next)
     actions.push({ kind: 'llm-summary', generation: ++count, archive, sourceMessages: removed.length,
-      beforeTokens: measurement.tokens, afterTokens: nextMeasurement.tokens, responseId: completed.responseId,
+      beforeTokens: measurement.tokens, afterTokens: afterPressure.tokens, beforeHeuristicTokens: measurement.heuristicTokens,
+      afterHeuristicTokens: nextMeasurement.heuristicTokens, responseId: completed.responseId,
       summarySha256: data.summarySha256, spans })
-    history = next; measurement = await pressure(next)
+    history = next; measurement = afterPressure
     onEvent('compaction/summarized', actions.at(-1))
   }
   if (actions.some(action => action.kind === 'llm-summary')) {

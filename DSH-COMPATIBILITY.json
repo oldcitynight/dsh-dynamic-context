@@ -1,13 +1,16 @@
 {
-  "slot": 6,
+  "slot": 7,
   "branch": "0.2.1-alpha.1",
   "host": "0.2.1-alpha.1",
   "hosts": [
     "0.2.1-alpha.1"
   ],
   "schema": 1,
-  "updateRound": 6,
+  "updateRound": 0,
   "channel": "dsh-0.2.1-alpha.1",
-  "taskgraph": "0.3.1-rc.66",
-  "dynamicContext": "0.1.1-rc.66"
+  "taskgraph": "0.3.2-rc.7",
+  "dynamicContext": "0.1.2-rc.7",
+  "hostPreparation": {
+    "dynamicContext": "scripts/patch-native-presentation.mjs"
+  }
 }

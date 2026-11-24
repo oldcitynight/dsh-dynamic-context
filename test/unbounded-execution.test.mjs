@@ -131,7 +131,7 @@ test('unbounded journal verifies and extends a chain beyond the old record ceili
   fs.writeFileSync(path.join(journal.directory, 'head.json'), JSON.stringify(seal({ schema: 1, sequence: 4097, record: prior })))
   assert.equal(journal.latest().sequence, 4097)
   assert.equal(journal.append('BLOCKED', { code: 'SYNTHETIC_STOP' }).sequence, 4098)
-  assert.throws(() => new DirectJournal(root, journal.identity).latest(), /DIRECT_JOURNAL_SEQUENCE/)
+  assert.equal(new DirectJournal(root, journal.identity).latest().sequence, 4098)
   const file = path.join(journal.directory, 'record-4000.json'), value = JSON.parse(fs.readFileSync(file))
   value.data.modified = true; fs.writeFileSync(file, JSON.stringify(value))
   assert.throws(() => journal.latest(), /CHECKSUM/)

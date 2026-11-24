@@ -5,10 +5,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { digest, view } from 'dsh-better-task-grapth/core'
 import { createHarness } from '../testing/harness.mjs'
+import { withBlockageReports } from '../testing/blockage-reports.mjs'
 import { runtimeProposal } from '../testing/runtime-harness.mjs'
 import { blockageSituation, validateBlockageDecision } from '../blockage-protocol.mjs'
 import { blockageCatalog, blockageInput, blockageTools, sourceValue, readBlockage, saveBlockage } from '../blockage-evidence.mjs'
 import { blockageStatus } from '../blockage-runtime.mjs'
+import { supervisionAuthority } from '../supervision-runtime.mjs'
+import { randomUUID } from 'node:crypto'
 import { executionReportHistory } from '../report-evidence.mjs'
 import { WorkflowOrchestrator } from '../orchestration.mjs'
 import { COMPACTION_INSTRUCTION } from '../dsh-compaction-policy.mjs'
@@ -46,6 +49,8 @@ async function fixture(t, respond, config = {}) {
   return { ...h, root, projectRoot }
 }
 const handle = (runner, extra = {}) => { const s = runner.graph.read(); return runner.handleBlockage({ expectedRevision: s.revision, baseChecksum: s.checksum, ...extra }) }
+const withReports = (payload, decide, all = false) => withBlockageReports(payload, (rows, input) =>
+  decide({ ...input, affectedReports: rows, situation: { ...input.situation, related: rows.map(row => row.value.taskId) } }), { all })
 function rework(input, all = false) {
   const tasks = new Set(all ? input.situation.related : input.situation.causes)
   return { action: 'REWORK', report: { version: 1, findings: input.affectedReports.filter(r => tasks.has(r.value.taskId) && !r.value.revoked.length).map(r => ({
@@ -100,7 +105,7 @@ test('evidence rejection identifies exact points, stale attempts, dependency-onl
 test('rework archives complete reports, preserves every old event/outcome, resets dependents and starts a new attempt', async t => {
   let workers = 0, reworking = false
   const h = await fixture(t, ({ role,payload }) => {
-    if (role === 'handler') { reworking = true; return answer(rework(JSON.parse(payload.messages[1].content),true)) }
+    if (role === 'handler') return withReports(payload, input => { reworking = true; return answer(rework(input,true)) }, true)
     if (role === 'worker') {
       workers++
       if (reworking) assert.match(JSON.stringify(payload.messages), /reworkRequest/)
@@ -145,12 +150,12 @@ test('pause needs independent approval; rejection returns precise issues; waitin
   let handlers = 0, audits = 0
   const h = await fixture(t, ({role,payload}) => {
     const input = payload.response_format ? JSON.parse(payload.messages[1].content) : null
-    if (role === 'handler') {
+    if (role === 'handler') return withReports(payload, input => {
       handlers++
       if (handlers === 2) assert.equal(input.priorReview.review.issues[0].path,'/submission/summary')
       const request = pause(input); if (handlers > 1) request.report.summary += ' Verified by the cited report.'
       return answer(request)
-    }
+    })
     if (role === 'audit') {
       audits++
       assert.ok(payload.tools.every(tool => ['read_image', 'dynamic_context_generate_report', 'dynamic_context_read_report', 'dynamic_context_rewrite_report', 'dynamic_context_submit_report'].includes(tool.function.name))); assert.ok(input.evidence[0].value)
@@ -169,13 +174,15 @@ test('pause needs independent approval; rejection returns precise issues; waitin
   assert.deepEqual(h.runner.graph.read(),before)
 })
 
-test('short REPLAN signal reuses updater and independent audit without forging plan-check history', async t => {
+test('reasoned REPLAN signal reuses updater and independent audit without forging plan-check history', async t => {
   let updater=0, reviewer=0, h
   h = await fixture(t, ({role,payload}) => {
-    if (role==='handler') return answer({action:'REPLAN'})
+    if (role==='handler') return answer({action:'REPLAN',reason:'The current prerequisites strand the pending verification work.'})
     if (role==='updater') {
       updater++
       const input=JSON.parse(payload.messages[1].content), p=proposal(3)
+      assert.equal(input.blockageSignal.reason,'The current prerequisites strand the pending verification work.')
+      assert.equal(input.revisionGuard.unchanged.status,'NO_READY_LEAF')
       // Retain executed task. A new independent recovery leaf resolves the unmet
       // prerequisite for the remaining pending work under the unchanged contract.
       p.taskGraph.edges=[{kind:'prerequisite',from:'task2',to:'task1'}]
@@ -200,7 +207,7 @@ test('normal pause/restart reuses exact role and tool receipts, and does not app
     if(role==='handler') {
       if(!once) { once=true; stop=true; return {tools:[{name:'dynamic_context_blockage_shared',arguments:{source:'shared',path:'/current'}}]} }
       assert.equal(payload.messages.at(-1).role,'tool')
-      return answer(pause(JSON.parse(payload.messages[1].content)))
+      return withReports(payload, input => answer(pause(input)))
     }
     if(role==='audit') return answer({verdict:'APPROVE',reason:'The evidence supports waiting.',issues:[]})
   })
@@ -212,27 +219,29 @@ test('normal pause/restart reuses exact role and tool receipts, and does not app
   stop=false; h.runner.workflowControl.recoverModel=true
   assert.equal((await handle(h.runner,{resume:true})).status,'WAITING_USER')
   assert.equal(readBlockage(path.join(h.root,'state','blockage-control.json')).handlerRunId,id)
-  assert.equal(h.backend.requests.filter(r=>kind(r.payload)==='handler').length,2)
+  assert.equal(h.backend.requests.filter(r=>kind(r.payload)==='handler').length,3)
 })
 
 test('audited waiting cannot be resumed by the controller model without human input; the UI button is an explicit resume', async t=>{
-  const h=await fixture(t,({role,payload})=>role==='handler'?answer(pause(JSON.parse(payload.messages[1].content)))
+  const h=await fixture(t,({role,payload})=>role==='handler'?withReports(payload, input => answer(pause(input)))
     : role==='audit'?answer({verdict:'APPROVE',reason:'Evidence supports waiting.',issues:[]}):undefined)
   h.runner.submit(proposal());await h.runner.runNext({expectedRevision:1});await handle(h.runner)
-  let questions=0, followups=0
-  const agent={followup(){followups++}}, interaction={ctx:h.ctx,exact(){},mode(){return 'full'},entries:new Map([[agent,{runner:h.runner}]]),
+  let questions=0, launched=0
+  const agent={whenIdle:async()=>{},runMaintenance(job){return job(new AbortController().signal)}},
+    interaction={ctx:h.ctx,exact(){},mode(){return 'full'},entries:new Map([[agent,{runner:h.runner}]]),
     ask:async()=>{questions++;return 'wait'}}
   const o=new WorkflowOrchestrator(interaction)
   o.record=()=>({phase:'PAUSED',afterPlanning:'auto_start',reason:'BLOCKAGE_REVIEWED_WAIT',pauseKind:'normal'})
   await o.control(agent,'continue',new AbortController().signal)
   assert.equal(questions,1);assert.equal(o.queued.has(agent),false)
   o.executionView=()=>({canResume:true})
+  o.drive=async owner=>{assert.ok(o.queued.delete(owner));assert.ok(o.continuations.delete(owner));launched++}
   await o.fromView(agent,'resume',new AbortController().signal)
-  assert.equal(questions,1);assert.equal(o.queued.has(agent),true);assert.equal(followups,1)
+  assert.equal(questions,1);assert.equal(o.queued.has(agent),false);assert.equal(launched,1)
 })
 
 test('post-CAS interruption is reconciled from the exact rework event without replaying a model or old tool',async t=>{
-  const h=await fixture(t,({role,payload})=>role==='handler'?answer(rework(JSON.parse(payload.messages[1].content))):undefined)
+  const h=await fixture(t,({role,payload})=>role==='handler'?withReports(payload, input => answer(rework(input))):undefined)
   h.runner.submit(proposal());await h.runner.runNext({expectedRevision:1});await handle(h.runner)
   const file=path.join(h.root,'state','blockage-control.json'), control=readBlockage(file)
   control.phase='REWORK';delete control.resolvedRevision;saveBlockage(file,control)
@@ -245,7 +254,7 @@ test('post-CAS interruption is reconciled from the exact rework event without re
 test('program-invalid and audit-rejected blueprint changes return to the updater with exact feedback',async t=>{
   let updates=0,audits=0
   const h=await fixture(t,({role,payload})=>{
-    if(role==='handler')return answer({action:'REPLAN'})
+    if(role==='handler')return answer({action:'REPLAN',reason:'The current prerequisites strand the pending verification work.'})
     if(role==='updater'){
       updates++;const input=JSON.parse(payload.messages[1].content),p=proposal(3)
       if(updates===2)assert.equal(input.priorReview.stage,'PROGRAM')
@@ -269,35 +278,39 @@ test('program-invalid and audit-rejected blueprint changes return to the updater
   assert.equal(blockageStatus(h.runner).phase,'RESOLVED')
 })
 
-test('oversized graph prompts stop plan review instead of silently compressing protected context',async t=>{
+test('oversized background material remains in storage and plan review receives a paged summary',async t=>{
   let summaries=0
   const h=await fixture(t,({role,payload})=>{
     if(payload.messages.at(-1).content?.startsWith?.(COMPACTION_INSTRUCTION)){summaries++;return {text:'Navigation: large background reference; inspect originals for decisive claims.'}}
     if(role==='handler'){
       assert.ok(payload.tools.some(t=>t.function.name==='dynamic_context_blockage_trace'))
       assert.match(JSON.stringify(payload.messages),/_dynamicContextEvidence/)
-      return answer(pause(JSON.parse(payload.messages[1].content)))
+      return withReports(payload, input => answer(pause(input)))
     }
     if(role==='audit')return answer({verdict:'APPROVE',reason:'Evidence supports waiting.',issues:[]})
   },{maxContextCharacters:null,maxReportCharacters:null,
     revision:{policy,maxOutputTokens:32768},direct:{durable:true,compaction:{strategy:'dsh-native',contextWindow:262144},maxRequestBytes:null}})
   const p=proposal();for(let i=0;i<3;i++)p.contextGraph.nodes.push({key:'background_'+i,content:'Unbound reference material 0123456789. '.repeat(3000),parents:[]})
   h.runner.submit(p)
-  await assert.rejects(h.runner.runNext({expectedRevision:1}),{code:'REVISION_CONTEXT_ANCHORS_EXCEED_WINDOW'})
-  assert.equal(summaries,0,'graph prompts cannot be substituted by a model summary')
+  await h.runner.runNext({expectedRevision:1})
+  assert.ok(h.backend.requests.some(row => JSON.stringify(row.payload.messages).includes('materialSummary')))
+  assert.equal(summaries,0,'the stored evidence does not need an additional model call')
   assert.equal(h.runner.graph.read().contexts.nodes.filter(n=>n.key.startsWith('background_')).length,3)
 })
 
-test('report-scoped mode supplies full affected execution reports without raw tools or assembly failures by default',async t=>{
+test('report-scoped mode reads the affected report on demand and starts with only scheduler evidence',async t=>{
   const h=await fixture(t,({role,payload})=>{
     if(role==='worker')return answer({outcome:'BLOCKED',summary:blocked,executionReport:{workHistory:['Partial inspection.'],
       results:[{criterion:'Check every file',result:'Second file absent',artifactRefs:[],testIds:['check']}],directories:[],
       tests:[{id:'check',criterion:'Input exists',status:'NOT_RUN',expected:'Second file available',observed:'Input unavailable'}],limitations:['Second input unavailable.']}})
     if(role==='handler'){
-      const input=JSON.parse(payload.messages[1].content)
+      const original = JSON.parse(payload.messages[1].content)
+      assert.equal(original.affectedReports, undefined); assert.ok(!JSON.stringify(original).includes('Partial inspection.'))
+      return withReports(payload, input => {
       assert.equal(input.affectedReports[0].value.result.executionReport.workHistory[0],'Partial inspection.')
       assert.ok(!('execution' in input));assert.ok(!('tools' in input.affectedReports[0].value))
       return answer(pause(input))
+      })
     }
     if(role==='audit')return answer({verdict:'APPROVE',reason:'Evidence supports waiting.',issues:[]})
   },{supervisionContext:'reports'})
@@ -309,7 +322,7 @@ test('report-scoped mode supplies full affected execution reports without raw to
 test('an interrupted updater/auditor pair resumes its pinned role IDs and never silently repeats the completed updater',async t=>{
   let stop=false,updates=0,audits=0
   const h=await fixture(t,({role,payload})=>{
-    if(role==='handler')return answer({action:'REPLAN'})
+    if(role==='handler')return answer({action:'REPLAN',reason:'The current prerequisites strand the pending verification work.'})
     if(role==='updater'){
       updates++;stop=true;const input=JSON.parse(payload.messages[1].content),p=proposal(3)
       p.taskGraph.edges=[{kind:'prerequisite',from:'task2',to:'task1'}]
@@ -333,7 +346,7 @@ test('an interrupted updater/auditor pair resumes its pinned role IDs and never 
 test('ambiguous model transport failure remains pending until explicit recovery, then resumes the same decision role',async t=>{
   let calls=0
   const h=await fixture(t,({role,payload})=>{
-    if(role==='handler')return ++calls===1?{status:503,body:'Synthetic model outage'}:answer(rework(JSON.parse(payload.messages[1].content)))
+    if(role==='handler'){ if(++calls===1) return {status:503,body:'Synthetic model outage'}; return withReports(payload, input => answer(rework(input))) }
   })
   h.runner.submit(proposal());await h.runner.runNext({expectedRevision:1});const base=h.runner.graph.read()
   await assert.rejects(handle(h.runner))
@@ -343,6 +356,57 @@ test('ambiguous model transport failure remains pending until explicit recovery,
   assert.equal(calls,1)
   h.runner.workflowControl={recoverModel:true,beforeRequest(){}}
   assert.equal((await handle(h.runner,{resume:true})).status,'REWORKED')
-  assert.equal(readBlockage(file).handlerRunId,first);assert.equal(calls,2)
+  assert.equal(readBlockage(file).handlerRunId,first);assert.equal(calls,3)
   assert.equal(h.backend.requests.filter(r=>kind(r.payload)==='worker').length,1)
+})
+
+test('a flat root referral is investigated even when a leaf is runnable and can reopen an evidence-backed result', async t => {
+  const reason = 'An earlier verification promised two inspections but documented only one.'
+  let handled = 0, updates = 0
+  const h = await fixture(t, ({role,payload})=>{
+    if (role === 'worker') return answer({outcome:'COMPLETE',summary:'One required inspection performed.'})
+    if (role === 'plan') return answer({verdict:'REVIEW_REQUIRED'})
+    if (role === 'updater') {
+      if (++updates === 1) return {tools:[{name:'dynamic_context_generate_report',arguments:{report:{disposition:'REVISE'}}}]}
+      assert.match(payload.messages.at(-1).content,/\/taskGraph/)
+      return answer({disposition:'ESCALATE',reason,trigger:'COUNTEREXAMPLE',evidenceIds:['fact_0'],
+        taskGraph:null,contextGraph:null,coverage:[],retirements:[],invalidateReports:[]})
+    }
+    if (role === 'handler') return withReports(payload,input=>{
+      assert.equal(input.situation.code,'ROOT_UPDATE_ESCALATED')
+      assert.equal(input.situation.legalNextCount,1);assert.equal(input.situation.referral.reason,reason)
+      handled++;return answer(rework(input))
+    },true)
+  })
+  h.runner.submit(proposal(2));await h.runner.runNext({expectedRevision:1})
+  const prior=h.runner.graph.read();assert.equal(prior.supervision.rootReferral.reason,reason)
+  assert.equal((await handle(h.runner)).status,'REWORKED')
+  const final=h.runner.graph.read()
+  assert.equal(handled,1);assert.equal(final.supervision.rootReferral,undefined)
+  assert.deepEqual(final.supervision.outcomes,prior.supervision.outcomes)
+})
+
+test('an issued legacy blockage journal retains its original assembly, tools and reasonless REPLAN receipt', async t => {
+  let handlers = 0, updates = 0
+  const h = await fixture(t, ({role,payload})=>{
+    const input = payload.response_format && JSON.parse(payload.messages[1].content)
+    if (role === 'handler') {
+      assert.equal(input.protocol,'blockage-handler-v1')
+      assert.ok(input.affectedReports.length)
+      assert.ok(!payload.tools.some(row=>['dynamic_context_blockage_topology','dynamic_context_blockage_history'].includes(row.function.name)))
+      return answer(++handlers===1 ? {action:'REPLAN'} : pause(input))
+    }
+    if (role === 'updater') {
+      updates++; assert.equal(input.revisionGuard,undefined)
+      return answer({disposition:'NO_CHANGE',reason:'A past bound response.',trigger:'NONE',evidenceIds:[],
+        taskGraph:null,contextGraph:null,coverage:[],retirements:[],invalidateReports:[]})
+    }
+    if (role === 'audit') return answer({verdict:'APPROVE',reason:'Waiting is evidenced.',issues:[]})
+  })
+  h.runner.submit(proposal()); await h.runner.runNext({expectedRevision:1})
+  const state=h.runner.graph.read()
+  saveBlockage(path.join(h.root,'state','blockage-control.json'),{version:1,id:'blockage_'+randomUUID(),baseChecksum:state.checksum,
+    authorityHash:supervisionAuthority(h.runner),phase:'ANALYZE',decisions:[],handlerRunId:'revision_blockage_'+randomUUID()})
+  assert.equal((await handle(h.runner)).status,'WAITING_USER')
+  assert.equal(handlers,2);assert.equal(updates,1)
 })

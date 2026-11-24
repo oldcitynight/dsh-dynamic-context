@@ -23,14 +23,18 @@ const slowTool = (marker, name, args, finish) => ({ fragmentDelayMs: 100,
   `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
   `data: ${JSON.stringify({ choices: [], usage })}\n\n`, 'data: [DONE]\n\n',
 ] })
-let plans = 0, workers = 0, h, browser
+let plans = 0, workers = 0, foreground = 0, planningEnabled = false, h, browser
 try {
   h = await startWorkflowWeb({ respond: async ({ payload }) => {
+    if (!planningEnabled) {
+      foreground++
+      return { text: '{"verdict":"CURRENT","detail":"native-json-hidden-marker"}', usage }
+    }
     if (payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1'))) {
       if (++plans === 1) { await planGate.promise; return slowTool('规划中的实时思考片段', 'bash', { command: 'printf "terminal-browser-ok\\n"', description: 'Read a synthetic condition for planning' }, planFinish) }
       return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
     }
-    if (payload.tools?.some(row => row.function.name === 'dynamic_context_route_task')) {
+    if (payload.tools?.some(row => row.function.name === 'dynamic_context_graph_status')) {
       return { text: '{"verdict":"CURRENT","detail":"native-json-hidden-marker"}', usage }
     }
     if (++workers === 1) { await workGate.promise; return slowTool('叶执行中的实时思考片段', 'write', { file_path: 'result.txt', content: 'Produced once.' }, workFinish) }
@@ -50,19 +54,25 @@ try {
   await until(() => page.locator('body').innerText(), text => text.includes('描述你想要'), 'browser ready')
   if (await preview.isVisible()) await page.getByRole('button', { name: '继续', exact: true }).click()
   const { sessionId } = await h.call('session/create', { cwd: h.workspace })
+  for (let turn=1;turn<=2;turn++) {
+    await h.call('session/prompt', { requestId:randomUUID(), sessionId, mode:'queue',
+      content:[{type:'text',text:'Record ordinary foreground observation '+turn}] })
+    await until(() => h.backend.requests.filter(row => row.completed).length, n => n===turn, 'foreground response '+turn)
+  }
+  planningEnabled = true
   const status = () => h.call('transactionGraphView/status', { sessionId })
   await h.call('commands/execute', { agentId: sessionId, line: '/task-graph Browser workflow regression', submittedAttachments: [] })
   await until(() => plans, count => count === 1, 'planning request')
   await page.reload()
   await page.getByText('未分组', { exact: true }).click()
-  await page.getByText('Browser workflow regression', { exact: true }).click()
+  await page.locator('[data-row-key="session:' + sessionId + '"]').click()
   const dock = page.locator('.tg-dock').first(), chat = page.locator('[data-chat-node-key*="dynamic-context-execution"]')
   await chat.first().waitFor({ state: 'attached' })
   assert.equal(await dock.locator('.tg-output').count(), 0, 'execution details belong to the chat transcript, not the graph dock')
   planGate.resolve()
   await chat.getByText('思考', { exact: true }).last().click()
   await until(async () => (await chat.allTextContents()).join('\n'), text => text.includes('规划中的实时思考片段'), 'live planning text before completion')
-  assert.equal(h.backend.requests[1].completed, false)
+  assert.equal(h.backend.requests.find(request => request.payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1')))?.completed, false)
   await dock.getByRole('button', { name: '暂停', exact: true }).click()
   assert.equal((await status()).execution.state, 'pausing')
   await page.screenshot({ path: path.join(output, 'live-planning.png'), animations: 'disabled' })
@@ -118,6 +128,16 @@ try {
   const stats = page.locator('[data-composer-stat="activity"]'), tokens = page.locator('[data-composer-stat="usage"]')
   await until(() => stats.innerText(), text => text.includes('6 步'), 'all foreground and background steps')
   await until(() => tokens.innerText(), text => text.includes('660') && text.includes('60%'), 'all tokens and cache hit rate')
+  assert.deepEqual([foreground,plans,workers,h.backend.requests.length],[2,2,2,6])
+  async function expandCompletedWork() {
+    await page.getByRole('button',{name:/^已完成叶任务/}).first().waitFor()
+    for (const label of [/^已完成叶任务/, /已结束的内部步骤/]) {
+      for (const button of await page.getByRole('button',{name:label}).all()) {
+        if (await button.getAttribute('aria-expanded')==='false') await button.press('Enter')
+      }
+    }
+  }
+  await expandCompletedWork()
   const json = page.locator('[data-structured-content="执行报告 · JSON"]').last()
   await json.waitFor()
   assert.ok(!(await json.innerText()).includes('worker-json-hidden-marker'), 'JSON starts collapsed')
@@ -129,6 +149,7 @@ try {
   await page.screenshot({ path: path.join(output, 'statistics-and-json.png'), animations: 'disabled' })
   await page.reload()
   await until(() => tokens.innerText(), text => text.includes('660') && text.includes('60%'), 'refresh preserves accounting without duplication')
+  await expandCompletedWork()
   assert.ok(!(await json.innerText()).includes('worker-json-hidden-marker'), 'refreshed structured output defaults collapsed')
   await dock.getByRole('button', { name: '全屏', exact: true }).click()
   await page.screenshot({ path: path.join(output, 'complete-fullscreen.png'), animations: 'disabled' })

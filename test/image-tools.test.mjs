@@ -339,7 +339,7 @@ test('real role compaction can inspect image evidence before finishing a checkpo
     }
     return {text:'{"observed":true}'}
   })
-  const runner={ctx:h.ctx,config:validateConfig({...h.runner.config,maxOutputTokens:32768,
+  const runner={ctx:h.ctx,config:validateConfig({...h.runner.config,workflowLimits:{...h.runner.config.workflowLimits,dynamicMaterialBytes:8388608},maxOutputTokens:32768,
     direct:{...h.runner.config.direct,compaction:{strategy:'dsh-native',contextWindow:262144}}})}
   const runId='revision_group_audit_'+randomUUID()
   const result=await directRevisionRole(runner,{runId,role:'group_audit',signal:signal(),messages:[{role:'system',content:'Read historical evidence only.'},
@@ -356,7 +356,10 @@ for (const denyImages of [false,true]) test(`native worker compaction image insp
       if(!imageResults(payload).length)return {tools:[{name:'read_image',arguments:{file_path:'screen.png'}}]}
       visual++;return {text:'Historical observations summarized. Continue the current leaf; visual data was supplied.'}
     }
-    if(++normal<=5)return {text:'Historical detail. '.repeat(2000),tools:[{name:'read',arguments:{file_path:'input.txt'}}]}
+    // Drive the compaction role with an above-threshold provider receipt. The
+    // default fake reports only 100 input tokens even when this prefix grows.
+    if(++normal<=5)return {text:'Historical detail. '.repeat(2000),tools:[{name:'read',arguments:{file_path:'input.txt'}}],
+      ...(normal===4?{messagesUsage:{input_tokens:170000,cache_read_input_tokens:0,output_tokens:9000}}:{})}
     return {text:'Leaf continued after image-capable compaction.'}
   },true,{maxContextCharacters:8388608,maxOutputTokens:32768,direct:{maxRequestBytes:8388608,compaction:{strategy:'dsh-native',contextWindow:262144}}})
   fs.writeFileSync(path.join(h.projectRoot,'input.txt'),'Observed evidence.')

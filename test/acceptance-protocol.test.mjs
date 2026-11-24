@@ -4,6 +4,7 @@ import { crc32 } from 'node:zlib'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { readStored } from '../workflow-io.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
@@ -16,6 +17,16 @@ import { snapshotDirectory } from '../directory-evidence.mjs'
 import { digest } from 'dsh-better-task-grapth/core'
 import { inspectExecutionReport } from '../report-evidence.mjs'
 const sha = value => createHash('sha256').update(value).digest('hex')
+function displayedRows(output) {
+  const all = []
+  let page = output.read()
+  for (;;) {
+    all.push(...page.items.map(item => output.row(item.id)))
+    if (!page.older) return all
+    page = output.read({ before: page.items[0].sequence })
+  }
+}
+
 const plan = { version: 1, requirements: [{ id: 'goal', origin: 'USER', statement: 'Deliver the checked result', source: 'User request', verification: 'Recorded check of the actual result', required: true }], deliveryRequired: false }
 const report = (extra = {}) => ({ outcome: 'COMPLETE', summary: 'Result ready', artifacts: [], executionReport: {
   workHistory: ['Worked within the active leaf'], results: [{ criterion: 'Local result', result: 'Ready', artifactRefs: [], testIds: [] }],
@@ -102,10 +113,10 @@ test('WORK rejection executes a new segment under the same leaf and preserves or
   }, { tools: ['bash'] })
   const first = await h.runner.runNext({ expectedRevision: 1 }), state = h.runner.graph.read()
   assert.equal(state.supervision.phase, 'REWORK_RESULT')
-  const before = fs.readFileSync(path.join(first.runDirectory, 'trace.json')), attemptId = state.graph.state.active.attemptId
+  const before = readStored(path.join(first.runDirectory, 'trace.json')), attemptId = state.graph.state.active.attemptId
   const next = await h.runner.continueSupervision({ expectedRevision: state.revision, checkpointChecksum: state.checksum })
   assert.equal(next.status, 'TASK_REPORTED'); assert.equal(fs.readFileSync(path.join(h.projectRoot, 'result.txt'), 'utf8'), 'correct')
-  assert.deepEqual(fs.readFileSync(path.join(first.runDirectory, 'trace.json')), before)
+  assert.deepEqual(readStored(path.join(first.runDirectory, 'trace.json')), before)
   assert.equal(h.runner.graph.read().reports[0].attemptId, attemptId)
   assert.equal(h.runner.graph.read().graph.events.filter(row => row.type === 'FINISHED').length, 1)
   assert.notEqual(next.runDirectory, first.runDirectory)
@@ -192,6 +203,7 @@ for (const hold of [false, true]) test('a paused correction resumes its own chec
       assert.ok(!payload.tools?.some(row => row.function.name === 'dynamic_context_source_read'))
       return { text: JSON.stringify(report()) }
     }
+    assert.equal(payload.model, 'correction-model')
     if (worker === 2) return { tools: [{ name: 'bash', arguments: { command: 'printf once >> counter', description: 'Make the one amendment' } }] }
     if (worker === 3) {
       const seed = payload.messages[1].content, assembly = JSON.parse(seed.slice(seed.indexOf('{"protocol"')))
@@ -201,8 +213,13 @@ for (const hold of [false, true]) test('a paused correction resumes its own chec
     return { text: JSON.stringify(report()) }
   }, { tools: ['bash'], runtimeModules: ['shell'] })
   const initial = await h.runner.runNext({ expectedRevision: 1 }), state = h.runner.graph.read()
-  const oldBytes = fs.readFileSync(path.join(initial.runDirectory, 'trace.json'))
+  const remove = h.runner.roleModels.register({ pluginId: 'fixture', registrationId: 'correction', role: 'result_work', backend: { model: 'correction-model' } })
+  const oldBytes = readStored(path.join(initial.runDirectory, 'trace.json'))
   const paused = await h.runner.execute({ expectedRevision: state.revision, correction: true, correctionChecksum: state.checksum, pauseAfterRequests: 1 })
+  remove()
+  assert.equal(initial.trace.modelRoute.role, 'executor')
+  assert.equal(paused.trace.modelRoute.role, 'result_work')
+  assert.equal(paused.trace.modelRoute.model, 'correction-model')
   assert.equal(paused.paused, true); assert.equal(h.runner.checkpointStatus().resumablePhase, true)
   assert.equal(h.runner.graph.read().supervision.phase, 'REWORK_RESULT')
   if (hold) {
@@ -214,9 +231,8 @@ for (const hold of [false, true]) test('a paused correction resumes its own chec
   }
   const current = h.runner.graph.read(), resumed = await h.runner.continueSupervision({ expectedRevision: current.revision, checkpointChecksum: current.checksum })
   assert.equal(resumed.status, 'TASK_REPORTED'); assert.equal(fs.readFileSync(path.join(h.projectRoot, 'counter'), 'utf8'), 'once')
-  assert.deepEqual(fs.readFileSync(path.join(initial.runDirectory, 'trace.json')), oldBytes)
-  h.runner.output.read()
-  const display = [...h.runner.output.rows.values()].filter(row => row.kind === 'model')
+  assert.deepEqual(readStored(path.join(initial.runDirectory, 'trace.json')), oldBytes)
+  const display = displayedRows(h.runner.output).filter(row => row.kind === 'model')
   assert.equal(new Set(display.map(row => row.key)).size, display.length)
   assert.ok(display.some(row => row.stage === 'result_work'))
   const cleanup = await h.runner.collectOrphans({ expectedRevision: h.runner.graph.read().revision })
@@ -292,8 +308,8 @@ test('actual delivery inventory reaches a single-group final report and its publ
   assert.equal(result.status, 'TASK_REPORTED'); assert.equal(resultChecks, 1); assert.equal(groupChecks, 2)
   const root = h.runner.graph.read().graph.state.plan.nodes.find(node => node.parent === null)
   assert.ok(h.runner.graph.read().graph.state.hierarchy.groups[root.id].aliasOf)
-  const output = [...h.runner.output.rows.values()].find(row => row.title === '完整任务报告')
-  assert.match(fs.readFileSync(path.join(h.runner.output.directory, output.id + '.txt'), 'utf8'), /交付入口\n- \[product\]/)
+  const output = displayedRows(h.runner.output).find(row => row.title === '完整任务报告')
+  assert.match(h.runner.output.body({itemId:output.id}).text, /交付入口\n- \[product\]/)
 })
 test('lost model reply in a correction stays unknown until explicit recovery and retains original execution', async t => {
   let worker = 0, reviews = 0
@@ -303,14 +319,14 @@ test('lost model reply in a correction stays unknown until explicit recovery and
     if (++worker === 2) return { disconnect: true }
     return { text: JSON.stringify(report()) }
   })
-  const initial = await h.runner.runNext({ expectedRevision: 1 }), state = h.runner.graph.read(), before = fs.readFileSync(path.join(initial.runDirectory, 'trace.json'))
+  const initial = await h.runner.runNext({ expectedRevision: 1 }), state = h.runner.graph.read(), before = readStored(path.join(initial.runDirectory, 'trace.json'))
   await assert.rejects(h.runner.continueSupervision({ expectedRevision: state.revision, checkpointChecksum: state.checksum }))
   const requests = h.backend.requests.length
   await assert.rejects(h.runner.continueSupervision({ expectedRevision: state.revision, checkpointChecksum: state.checksum }), /REQUIRES_RECOVERY/)
   assert.equal(h.backend.requests.length, requests)
   const checkpoint = h.runner.checkpointStatus()
   const recovered = await h.runner.resumeActive({ expectedRevision: state.revision, checkpointChecksum: checkpoint.checksum, recover: true })
-  assert.equal(recovered.status, 'TASK_REPORTED'); assert.deepEqual(fs.readFileSync(path.join(initial.runDirectory, 'trace.json')), before)
+  assert.equal(recovered.status, 'TASK_REPORTED'); assert.deepEqual(readStored(path.join(initial.runDirectory, 'trace.json')), before)
   assert.ok(recovered.trace.requests.some(row => row.status !== 'COMPLETE'))
 })
 test('shared updates with a reused provider call ID remain distinct across correction segments', async t => {

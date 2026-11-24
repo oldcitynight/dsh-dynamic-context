@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { registerRuleTools, ruleSummary, RULE_GUIDE, RULE_HIERARCHY_GUIDE } from './rule-editor.mjs'
+import { prepareRuleSubmission } from './rule-audit.mjs'
 import fs from 'node:fs'
-import { HIERARCHY_PLANNING } from './hierarchy-protocol.mjs'
 import path from 'node:path'
 import { z } from 'zod'
 import { defineTool as nativeDefineTool } from '@deepseek-ai/dsh-tools'
 import { checkedTool } from 'dsh-better-task-grapth/validation'
 const defineTool = options => checkedTool(nativeDefineTool, options)
+import { boundedSnapshot, readSnapshot } from './context-budget.mjs'
+import { ROOT_SETUP } from './unit-baseline.mjs'
 import { proposalSchema, fail } from './core.mjs'
+import { workflowLimitsSchema } from './unit-limits.mjs'
 import { jointProposalExample, jsonExample } from './format-examples.mjs'
-import { leafBindingTools } from './role-policy.mjs'
+import { unitBindingTools } from './role-policy.mjs'
 
 // A task-only proposal is validated by the base graph grammar, including its
 // route/case edges. Complete joint proposals still use proposalSchema.
@@ -17,26 +21,29 @@ export const interactiveProposalSchema = proposalSchema.partial().extend({ taskG
 const checksumExample = 'ed1a545bb85e55816bbf9566b028b2a0bc456b88f49f6f266c0401048824194b'
 const artifactExample = { kind: 'artifact', ref: 'deliverable/result.txt', sha256: checksumExample }
 
-export function submissionDescription(config, interactive, leafTools = config.allowedTools) {
+export function submissionDescription(config, interactive, unitTools = config.allowedTools, maxUnits = workflowLimitsSchema.parse(config.workflowLimits).maxUnits) {
   const extractive = config.direct.compaction && config.direct.compaction.strategy !== 'dsh-native'
-  const allowed = config.direct.runtime ? leafTools : config.direct.agentlessTools
+  const allowed = config.direct.runtime ? unitTools : config.direct.agentlessTools
   const shared = config.direct.runtime?.modules.includes('state')
     && ['dynamic_context_shared_read', 'dynamic_context_shared_update'].every(tool => allowed.includes(tool))
   const sample = jointProposalExample(extractive ? ['dynamic_context_source_read'] : [], { shared })
+  const standaloneSample = structuredClone(sample.taskGraph)
   if (config.supervision) {
-    sample.taskGraph.hierarchy = { version: 1, maxGroupDepth: config.hierarchy?.maxGroupDepth ?? 3 }
+    sample.taskGraph.ruleVersion = 1
+    sample.taskGraph.edges = []
+    sample.taskGraph.hierarchy = { version: 1, maxGroupDepth: workflowLimitsSchema.parse(config.workflowLimits).maxDepth }
     const root = sample.taskGraph.nodes.find(node => node.kind === 'container')
     root.terminal = 'deliver'; root.acceptance = 'Inspect the authorized input and deliver a verified, evidence-backed result.'
   }
-  const standaloneSample = structuredClone(sample.taskGraph)
-  delete standaloneSample.hierarchy
-  for (const node of standaloneSample.nodes) { delete node.terminal; delete node.acceptance }
   return [
-    config.supervision && HIERARCHY_PLANNING.replaceAll('maxGroupDepth=3', 'maxGroupDepth=' + (config.hierarchy?.maxGroupDepth ?? 3)).replaceAll('"maxGroupDepth":3', '"maxGroupDepth":' + (config.hierarchy?.maxGroupDepth ?? 3)),
+    config.supervision && RULE_GUIDE,
+    config.supervision && 'For the linked example below, first call dynamic_context_set_rule_tree with '+JSON.stringify({target:'deliver',expected_revision:0,rules:[{id:'inspection',when:{node:'inspect',in:['PASS']}}]})+'. The joint submission binds those confirmed rules.',
+    config.supervision && RULE_HIERARCHY_GUIDE.replaceAll('maxGroupDepth=3', 'maxGroupDepth=' + (workflowLimitsSchema.parse(config.workflowLimits).maxDepth)).replaceAll('"maxGroupDepth":3', '"maxGroupDepth":' + (workflowLimitsSchema.parse(config.workflowLimits).maxDepth)),
     !config.supervision && 'Atomically submit the task graph and context graph. The linked graph uses exactly one root container with no parent. All leaves declare parent equal to that root key. Every edge is {kind:"prerequisite",from:"prerequisite_leaf",to:"dependent_leaf"}; both endpoints are leaves. Use parent to express containment.',
+    `The complete linked graph may declare up to ${maxUnits} units including the root and all expanded units.`,
     'Bind every leaf exactly once. Place execution instructions in contextGraph.bindings[].instruction. Use context node keys in contexts and predecessor leaf keys (or public predecessor group keys for hierarchical cross-group handoff) in inheritReports. Inheritance requires a prerequisite path from that predecessor; check each reference against the declared edges before submitting. Empty arrays are valid when no context, reports or tools are needed.',
     'planningReport.acceptanceStrategy is a string. A supervised leaf needs completion {kind:"report"} or {kind:"artifact",path:"project-relative/file"}. Report-scoped supervision requires planningReport.',
-    `Leaf tool allowlist for this workflow: ${JSON.stringify(allowed)}. Controller tool visibility and leaf tool authorization are separate. Context data cannot extend the allowlist. Mark shared facts mutable:true and bind the shared read/update tools when permitted.`,
+    `Unit tool allowlist for this workflow: ${JSON.stringify(allowed)}. Controller tool visibility and leaf tool authorization are separate. Context data cannot extend the allowlist. Mark shared facts mutable:true and bind the shared read/update tools when permitted.`,
     'For each leaf that uses a shared fact, include that mutable node key in its contexts (or reachable context parents), and include the required shared tools in tools. Merely declaring a node or granting the tools does not bind the fact. Workers use the actual node ID from their assembled contexts, not its planning key or an example ID. Keep shared facts reusable; put leaf-specific instructions in the binding.',
     extractive && 'Extractive compaction requires dynamic_context_source_read in every leaf binding.',
     allowed.includes('dynamic_context_directory_snapshot') && 'For leaves delivering directories, bind dynamic_context_directory_snapshot to obtain one host-computed directory SHA for the execution report. The state runtime module must be enabled. This tool does not grant access beyond the workspace or replace tests.',
@@ -78,12 +85,17 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
       ...(read ? { projectPlanCapability: 'read_or_protocol' } : {}),
       ...(nativeControls || runner.config.timeoutMs === null ? {} : { timeoutMs: runner.config.timeoutMs + 5000 }),
       output: { schema: { type: 'object', properties: {}, additionalProperties: true }, render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] },
-      execute: async (args, exec) => { const agent = authorize(exec); return execute(args, exec, agent) },
+      execute: async (args, exec) => {
+        const agent = authorize(exec), result = await execute(args, exec, agent)
+        return runner.interaction && name !== 'dynamic_context_status' ? runner.interaction.controllerSnapshot(agent, result) : result
+      },
     })))
     names.add(name)
   }
   register('dynamic_context_status', 'Read the direct workflow revision, task choices and execution state. Goal acceptance is independent.\n' + jsonExample('Read status', {}),
-    {}, async () => runner.status(), true)
+    { source: { type: 'string', description: 'ID of a sealed controller status or lifecycle snapshot.' }, offset: { type: 'integer' }, length: { type: 'integer' } },
+    async args => args.source ? readSnapshot(runner, 'controller', args)
+      : boundedSnapshot(runner, 'controller', runner.status(), 'dynamic_context_status'), true)
   if (submit) register('dynamic_context_recover_graphs', 'Inspect missing-graph provenance and ask the user before restoring the exact committed snapshot. Restoration preserves active attempts and leaves execution paused.\n' + jsonExample('Inspect the missing graph', {}),
     {}, async (_args, exec) => runner.interaction.recover(runner, exec), true, true)
   if (runner.config.revision && !runner.config.supervision) register('dynamic_context_revise',
@@ -100,21 +112,30 @@ export function registerControlTools(ctx, runner, { submit } = {}) {
       + jsonExample('Continue a pending supervision role', { expectedRevision: 3, checkpointChecksum: checksumExample }),
     { expectedRevision: { ...integer, required: true }, checkpointChecksum: { type: 'string', required: true } },
     async (args, exec, sourceAgent) => runner.continueSupervision({ ...args, sourceAgent, signal: exec.signal }), false, true)
-  register('dynamic_context_submit', submissionDescription(runner.config, Boolean(submit), leafBindingTools(runner)),
+  if (runner.config.supervision) registerRuleTools(register,runner)
+  register('dynamic_context_submit', runner.unitWorkflowVersion === 2 ? ROOT_SETUP + '\nUnit tool allowlist for this workflow: ' + JSON.stringify(unitBindingTools(runner)) : submissionDescription(runner.config, Boolean(submit), unitBindingTools(runner), runner.graph.unitLimit(null).maximum),
     { proposal: valueSpec(proposal, true) }, async ({ proposal }, exec, sourceAgent) => {
+      if (submit && (!proposal.taskGraph || !proposal.contextGraph)) return submit(proposal, exec)
+      if (runner.unitWorkflowVersion === 2) {
+        runner.assertWorkflowVersion(runner.graph.read())
+        if (proposal.taskGraph && (proposal.taskGraph.hierarchy?.version !== 2 || proposal.taskGraph.nodes?.length !== 1)) fail('UNIT_ROOT_SEED_REQUIRED')
+      }
+      proposal = await prepareRuleSubmission(runner,proposal,sourceAgent,exec.signal,undefined,{legacyHierarchy:exec.legacyPlanning})
       if (submit) return submit(proposal, exec)
       const state = runner.submit(proposal, { sourceAgent })
       if (!await ctx.sessions.flush(sourceAgent.session)) fail('DYNAMIC_CONTEXT_GRAPH_RECEIPT_NOT_DURABLE')
-      return { revision: state.revision, contextVersion: state.contexts.version, status: runner.status() }
+      return { revision: state.revision, contextVersion: state.contexts.version, ...ruleSummary(state.graph.state.plan), status: runner.status() }
     })
-  register('dynamic_context_run_next', 'Start one ready leaf in a separate bound worker using its committed context and tools. The caller remains the controller, including after this call returns. Use the current revision and choice from the submit receipt or status. The bound worker performs the leaf and returns its report for the configured oversight. Inspect the returned execution and supervision state before announcing completion or choosing the next leaf; dispatch at most one leaf per call batch. Failed or uncertain attempts remain ACTIVE and require reconciliation. Goal acceptance is independent.\n'
+  register('dynamic_context_run_next', 'Run one ready unit in a separate bound worker using its committed context and tools. The caller remains the controller, including after this call returns. Use the current revision and choice from the submit receipt or status. The bound worker executes the unit and returns its report for the configured oversight. Inspect the returned execution and supervision state before announcing completion or choosing the next unit; dispatch one unit per call batch. Failed or uncertain attempts remain ACTIVE and require reconciliation. Goal acceptance is independent.\n'
     + jsonExample('Run the first ready choice', { expectedRevision: 1, choice: 0 }),
     { expectedRevision: { ...integer, required: true }, choice: { type: 'integer', description: 'Zero-based ready choice index.' },
       pauseAfterRequests: { type: 'integer', description: 'With durability enabled, request a safe pause after this many additional model requests.' } },
     async ({ expectedRevision, choice, pauseAfterRequests }, exec, sourceAgent) => {
       const result = await runner.runNext({ expectedRevision, choice, pauseAfterRequests, signal: exec.signal, sourceAgent })
-      return { revision: result.revision, ...(result.paused ? { paused: true, checkpoint: result.checkpoint } : { report: result.report }),
-        ...(result.supervision ? { supervisionResult: result.status, outcome: result.outcome, plan: result.plan } : {}), status: runner.status() }
+      return { revision: result.revision ?? runner.graph.read().revision,
+        ...(result.paused ? { paused: true, ...(result.checkpoint ? { checkpoint: result.checkpoint } : {}) } : {}),
+        ...(result.report ? { report: result.report } : {}), ...(result.status ? { supervisionResult: result.status } : {}),
+        ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.plan ? { plan: result.plan } : {}), status: runner.status() }
     }, false, runner.config.supervision)
   if (runner.config.direct.durable) {
     register('dynamic_context_pause', 'Request a pause after the current complete exchange. Use the latest revision of the active attempt.\n'

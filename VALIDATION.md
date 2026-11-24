@@ -1,3 +1,3 @@
-# 0.1.1-rc.66 verification
+# 0.1.2-rc.7 本地验证
 
-The release includes the exact host compatibility manifest. Qualification runs source tests against the representative host and installs both bundles on every listed host, with a standalone task graph and a local fake model. See the signed release evidence for counts and package hashes.
+本维护线以 DSH `0.2.1-alpha.1` 为代表宿主。源码入口为 `npm test`。安装验证使用同一批两个压缩包、精确锁定的 DSH、独立 profile 和本地模拟模型，检验根单元 PASS、FAILED 与工具受阻后恢复。完整批次的逐宿主回执和压缩包 SHA-256 随本地候选目录保存。npm 的公开状态可在 [README](README.md) 所列公共登记库中查询。

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { createReportDraft, REPORT_READ, REPORT_EDIT, REPORT_SUBMIT } from '../report-draft.mjs'
+import { createReportDraft, REPORT_READ, REPORT_EDIT, REPORT_SUBMIT, REPORT_DRAFT_INSTRUCTION, FORMATTED_REPORT_INSTRUCTION } from '../report-draft.mjs'
 import { executionReportDraft } from '../execution-report-tools.mjs'
 import { directRevisionRole, readRoleRecord } from '../revision-runtime.mjs'
 import { validateConfig } from '../index.mjs'
@@ -47,6 +47,8 @@ test('fake repair edits and submits without full regeneration; full input surviv
     execution: { localContext: 'UNCHANGED_FULL_CONTEXT'.repeat(400), tools: [{ callId: 'actual', content: 'ok' }] }, feedback: 'Fix callId only.' }
   const backend = await startFakeLlama({ respond: ({ payload }) => {
     assert.deepEqual(JSON.parse(payload.messages[1].content), input)
+    assert.ok(payload.messages[0].content.includes(REPORT_DRAFT_INSTRUCTION))
+    assert.ok(!payload.messages[0].content.includes(FORMATTED_REPORT_INSTRUCTION))
     assert.ok(payload.tools.some(tool => tool.function.name === REPORT_EDIT))
     if (++sent === 1) {
       paused = true

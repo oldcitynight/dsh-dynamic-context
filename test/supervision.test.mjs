@@ -6,10 +6,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { DynamicContextRuntime } from '../index.mjs'
+import { readStored, writeStored } from '../workflow-io.mjs'
 import { createHarness } from '../testing/harness.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { COMPACTION_INSTRUCTION } from '../dsh-compaction-policy.mjs'
-import { EVIDENCE_TOOL } from '../role-context.mjs'
+import { INDEX_READER } from '../role-input-index.mjs'
+import { executionFacts } from '../supervision-runtime.mjs'
+import { monitorHotPath } from '../testing/hot-path-probe.mjs'
+import { watchValidation } from '../testing/validation-probe.mjs'
 
 const policy = { objective: 'Deliver and check the requested fixture',
   requirements: [{ id: 'result', text: 'Use the authorized fixture and preserve actual outcomes.' }] }
@@ -18,6 +22,61 @@ const accept = { text: JSON.stringify({ verdict: 'ACCEPT', reason: 'The receipt 
 const current = { text: '{"verdict":"CURRENT"}' }
 const question = { text: '{"verdict":"REVIEW_REQUIRED"}' }
 const sha = value => createHash('sha256').update(value).digest('hex')
+
+test('report repair preserves the original tool submission and requires a matching independent repair receipt', t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'unit-repair-receipt-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const original = { outcome: 'PASS', summary: 'Original submission', artifacts: [] }
+  const corrected = { ...original, summary: 'Corrected evidence citation' }
+  const text = JSON.stringify(original), call = { id: 'submitted', function: { name: 'dynamic_context_generate_report' } }
+  const message = { tool_calls: [call] }, reportDraft = { receipts: [{ name: call.function.name, result: { submitted: true, resultHash: digest(original) } }] }
+  const trace = { assembly: { task: { id: 'root', attemptId: 'attempt_one' }, contextVersion: 'v1' }, status: 'RESPONSE_RECEIVED',
+    requests: [{ finish: 'tool_calls', status: 'COMPLETE', responseMessageSha256: digest(message) }], reportDraft,
+    structuredSubmission: { callId: call.id, reportText: text, resultHash: digest(text), draftHash: digest(reportDraft) },
+    events: [{ type: 'assistant/response', data: { message } }, { type: 'tool/result', data: { callId: call.id } }] }
+  const ref = { kind: 'artifact', ref: path.join(root,'trace.json'), sha256: sha(JSON.stringify(trace)) }
+  fs.writeFileSync(ref.ref, JSON.stringify(trace))
+  const runId = 'revision_result_repair_00000000-0000-4000-8000-000000000010'
+  const folder = path.join(root,'revisions',runId); fs.mkdirSync(folder,{recursive:true})
+  const input = { attemptId:'attempt_one',contextVersion:'v1',execution:{trace:ref} }
+  const payload = { messages:[{role:'system',content:'repair'}, {role:'user',content:JSON.stringify(input)}] }
+  fs.writeFileSync(path.join(folder,'role.json'),JSON.stringify({role:'result_repair',runId,phase:'COMPLETE',payload,
+    requestHash:digest(payload),calls:[],submittedReport:corrected,resultHash:digest(corrected)}))
+  const runner = {config:{projectRoot:root,directory:root},graph:{storageRoot:root,read:()=>null}}
+  const report = {taskId:'root',attemptId:'attempt_one',contextVersion:'v1',evidence:[ref],text:JSON.stringify(corrected)}
+  const facts = change => executionFacts(runner,{...report,...change},new AbortController().signal)
+  assert.throws(()=>facts({}),{code:'SUPERVISION_TERMINAL_TRACE_REQUIRED'})
+  assert.equal(facts({repairRunId:runId}).trace.sha256,ref.sha256)
+  assert.throws(()=>facts({repairRunId:runId,text:JSON.stringify({...corrected,summary:'Different claim'})}),{code:'SUPERVISION_REPAIR_RECEIPT_INVALID'})
+  assert.throws(()=>facts({repairRunId:runId,attemptId:'attempt_other'}),{code:'SUPERVISION_REPAIR_RECEIPT_INVALID'})
+})
+
+test('report validation reads graph policy once for all historical tool receipts', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-verification-hot-path-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const report = { taskId: 'task-sample', attemptId: 'attempt-sample', contextVersion: 1, text: 'Finished.' }
+  let previousReport
+  for (let segment = 0; segment < 3; segment++) {
+    const events = Array.from({ length: 24 }, (_, index) => {
+      const data = { callId: `tool-${segment}-${index}`, name: 'read' }
+      return [{ type: 'tool/call', data }, { type: 'tool/result', data: { ...data, content: 'evidence' } }]
+    }).flat()
+    const trace = JSON.stringify({ previousReport, assembly: { task: { id: report.taskId, attemptId: report.attemptId },
+      contextVersion: report.contextVersion }, status: 'RESPONSE_RECEIVED',
+      requests: [{ status: 'COMPLETE', finish: 'stop' }], events })
+    const ref = path.join(root, `trace-${segment}.json`)
+    fs.writeFileSync(ref, trace)
+    previousReport = { ...report, evidence: [{ kind: 'artifact', ref, sha256: sha(trace) }] }
+  }
+  const runner = { graph: { storageRoot: root, read: () => ({ planningRecord: { report: { verification: { version: 1 } } } }) } }
+  const reads = watchValidation(t, runner.graph, 'read', { label: 'executionFacts graph policy', maxCalls: 1 })
+  const { value:facts } = await monitorHotPath('leaf acceptance: 72 historical tool receipts',
+    () => executionFacts(runner,previousReport,new AbortController().signal), {diagnostic:t.diagnostic.bind(t)})
+  reads()
+  assert.equal(facts.tools.length, 72)
+  assert.ok(facts.tools.every(row => typeof row.receiptScope === 'string'))
+  assert.equal(facts.precedingSegments.length, 2)
+})
 
 for (const mutate of [false, true]) test(`long artifact review preserves serial lock and commit revalidation (mutate=${mutate})`, async t => {
   const content = 'evidence item 0123456789, '.repeat(28000) + '\nTAIL_ORIGINAL_EVIDENCE\n'
@@ -33,9 +92,10 @@ for (const mutate of [false, true]) test(`long artifact review preserves serial 
     if (!payload.messages[0].content.includes('受理当前叶')) return current
     if (!read) {
       assert.ok(h.runner.graph.read().graph.state.active)
-      const source = JSON.parse(payload.messages[2].content).sources[0]
+      const field = JSON.parse(payload.messages[1].content).programValidation.artifactContents._reportIndex
+      const section = field.sections.find(row => row.path === '/0/text')
       read = true
-      return { tools: [{ name: EVIDENCE_TOOL, arguments: { id: source.id, start: source.characters - 30, end: source.characters } }] }
+      return { tools: [{ name: INDEX_READER, arguments: { source: field.source, path: section.path, start: section.characters - 30, end: section.characters } }] }
     }
     assert.match(JSON.parse(payload.messages.at(-1).content).text, /TAIL_ORIGINAL_EVIDENCE/)
     assert.ok(h.runner.graph.read().graph.state.active)
@@ -55,7 +115,8 @@ for (const mutate of [false, true]) test(`long artifact review preserves serial 
     assert.equal(h.runner.graph.read().graph.state.active, null)
     assert.equal(h.runner.graph.read().reports.length, 1)
   }
-  assert.ok(summaries > 0)
+  assert.equal(read, true)
+  assert.equal(summaries, 0)
 })
 const addLeaf = (proposal, key, predecessor) => {
   proposal.taskGraph.nodes.push({ key, kind: 'leaf', label: key, parent: 'root' })
@@ -78,8 +139,21 @@ async function fixture(t, respond, { runtime = false, config = {}, setup } = {})
       direct: { durable: true, ...config.direct },
     },
   })
-  t.after(async () => { await h.close(); fs.rmSync(root, { recursive: true, force: true }) })
-  return { ...h, projectRoot }
+  const additional = []
+  t.after(async () => {
+    try {
+      for (const runtime of additional) await runtime.close()
+    } finally {
+      try { await h.close() }
+      finally { fs.rmSync(root, { recursive: true, force: true }) }
+    }
+  })
+  return { ...h, projectRoot, reopen() {
+    const runtime = new DynamicContextRuntime(h.ctx, h.runner.config)
+    additional.push(runtime)
+    return runtime
+  } }
+
 }
 const resume = runner => {
   const state = runner.status()
@@ -193,8 +267,7 @@ test('small review returns a real write and repair reuses its evidence without r
   const file = path.join(h.projectRoot, 'result.txt')
   const original = fs.statSync(file, { bigint: true })
   await h.runner.close()
-  const reopened = new DynamicContextRuntime(h.ctx, h.runner.config)
-  t.after(() => reopened.close())
+  const reopened = h.reopen()
   assert.equal((await resume(reopened)).outcome, 'COMPLETE')
   assert.equal(reopened.graph.read().reports[0].attemptId, attempt)
   assert.equal(reopened.graph.read().reports[0].text, 'Wrote and supplied the result.txt receipt.')
@@ -292,8 +365,7 @@ test('the post-result scheduling gate survives restart and blocks a competing ru
   assert.equal(state.supervision.phase, 'CHECK_PLAN')
   assert.equal(state.graph.state.active, null)
   assert.equal(h.runner.status().taskGraph.legalNext.length, 0)
-  const other = new DynamicContextRuntime(h.ctx, h.runner.config)
-  t.after(() => other.close())
+  const other = h.reopen()
   await assert.rejects(other.runNext({ expectedRevision: 3 }), { code: 'SUPERVISION_SCHEDULING_BLOCKED' })
   await assert.rejects(other.continueSupervision({ expectedRevision: 3, checkpointChecksum: '0'.repeat(64) }), { code: 'SUPERVISION_STALE_BASE' })
   assert.equal(h.backend.requests.length, 2)
@@ -314,8 +386,7 @@ test('a durable small review response is consumed after restart without another 
   assert.equal(h.runner.status().supervision.phase, 'CHECK_RESULT')
   assert.equal(h.backend.requests.length, 2)
   await h.runner.close()
-  const other = new DynamicContextRuntime(h.ctx, h.runner.config)
-  t.after(() => other.close())
+  const other = h.reopen()
   assert.equal((await resume(other)).outcome, 'COMPLETE')
   assert.equal(h.backend.requests.length, 3)
 })
@@ -422,7 +493,6 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
     if (payload.messages[0].content.includes('你是任务图修订角色')) {
       updates++
       if (updates === 1 && rejection === 'malformed') return { text: '{"disposition":' }
-      if (updates === 1 && rejection === 'schema') return { text: '{"disposition":"REVISE"}' }
       if (updates === 2 && rejection === 'malformed') assert.match(payload.messages.at(-1).content, /MODEL_JSON_SYNTAX/)
       if (updates === 2 && rejection !== 'malformed') {
         assert.equal(input.priorReview.stage, rejection === 'audit' ? 'AUDIT' : 'PROGRAM')
@@ -430,6 +500,7 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
       }
       const { taskGraph, contextGraph } = input.snapshot
       addLeaf({ taskGraph, contextGraph }, 'recover')
+      if (updates === 1 && rejection === 'schema') taskGraph.nodes.find(row => row.key === 'recover').kind = 'invalid-node-kind'
       taskGraph.edges = [{ kind: 'prerequisite', from: 'recover', to: 'next' }]
       contextGraph.bindings.find(row => row.task === 'next').inheritReports = ['recover']
       if (updates === 1 && rejection === 'program') contextGraph.bindings.find(row => row.task === 'recover').tools = ['unauthorized_tool']
@@ -461,19 +532,18 @@ for (const rejection of ['audit', 'program', 'malformed', 'schema']) test('rejec
   await assert.rejects(h.runner.runNext({ expectedRevision: before.revision }), { code: 'SUPERVISION_SCHEDULING_BLOCKED' })
   if (rejection === 'program') {
     const receipt = path.join(h.runner.config.directory, 'revisions', before.supervision.revisionFeedback.updaterRunId, 'role.json')
-    const bytes = fs.readFileSync(receipt)
+    const bytes = readStored(receipt)
     const changed = JSON.parse(bytes)
     changed.response.text += ' '
-    fs.writeFileSync(receipt, JSON.stringify(changed))
+    if (!writeStored(receipt, JSON.stringify(changed))) fs.writeFileSync(receipt, JSON.stringify(changed))
     const requests = h.backend.requests.length
     await assert.rejects(resume(h.runner), { code: 'SUPERVISION_REVISION_FEEDBACK_CHANGED' })
     assert.equal(h.backend.requests.length, requests)
     assert.deepEqual(h.runner.graph.read(), before)
-    fs.writeFileSync(receipt, bytes)
+    if (!writeStored(receipt, bytes)) fs.writeFileSync(receipt, bytes)
   }
   await h.runner.close()
-  const reopened = new DynamicContextRuntime(h.ctx, h.runner.config)
-  t.after(() => reopened.close())
+  const reopened = h.reopen()
   assert.equal((await resume(reopened)).plan, 'COMMITTED')
   assert.equal(updates, 2)
   assert.equal(reopened.graph.read().supervision.phase, 'READY')
@@ -578,8 +648,7 @@ test('a competing runtime cannot acquire the shared lease during the full review
   const p = initial()
   addLeaf(p, 'next', 'task')
   h.runner.submit(p)
-  other = new DynamicContextRuntime(h.ctx, h.runner.config)
-  t.after(() => other.close())
+  other = h.reopen()
   assert.equal((await h.runner.runNext({ expectedRevision: 1 })).plan, 'CURRENT')
   assert.equal(other.status().taskGraph.legalNext.length, 1)
   assert.equal(h.backend.requests.length, 3)
@@ -678,14 +747,15 @@ test('a paused report role keeps its original prompt across a prompt-only upgrad
   await assert.rejects(resume(h.runner), { code: 'WORKFLOW_PAUSE_REQUESTED' })
   const roleId = h.runner.graph.read().supervision.roleRunId
   const file = path.join(h.runner.config.directory, 'revisions', roleId, 'role.json')
-  const prior = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const prior = JSON.parse(readStored(file, 'utf8'))
   assert.equal(prior.phase, 'PAUSED')
   // Represent a genuine older prompt while keeping every request and response
   // identity internally consistent in this isolated fixture only.
   prior.payload.messages[0].content = 'OLD_PINNED_ROLE_PROMPT\n' + prior.payload.messages[0].content
   prior.requestHash = digest(prior.payload)
   for (const call of prior.calls) { call.payload.messages[0].content = 'OLD_PINNED_ROLE_PROMPT\n' + call.payload.messages[0].content; call.requestHash = digest(call.payload) }
-  fs.writeFileSync(file, JSON.stringify(prior))
+  const legacy = JSON.stringify(prior)
+  if (!writeStored(file, legacy)) fs.writeFileSync(file, legacy)
   pause = false
   assert.equal((await resume(h.runner)).outcome, 'BLOCKED')
   assert.equal(h.backend.requests.length, 5)

@@ -1,9 +1,11 @@
+import { currentPlanningRecord } from './acceptance-protocol.mjs'
 // SPDX-License-Identifier: GPL-3.0-only
+import { hasStored, readStored, writeStored } from './workflow-io.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { digest } from 'dsh-better-task-grapth/core'
-import { parseModelJSON } from 'dsh-better-task-grapth/validation'
+import { located, parseModelJSON } from 'dsh-better-task-grapth/validation'
 import { fail } from './core.mjs'
 import { acquireDirectLease } from './durable-store.mjs'
 import { supervisionAuthority, assertAuthority } from './supervision-runtime.mjs'
@@ -12,7 +14,8 @@ import { directRevisionRole, readRoleRecord, roleRecordValue, revisionRecoverySt
 import { executionReportHistory } from './report-evidence.mjs'
 import { validateReview, reviewFeedback } from './review-feedback.mjs'
 import { blockageSituation, validateBlockageDecision, verifyReference, lookupPointer,
-  BLOCKAGE_INSTRUCTION, BLOCKAGE_AUDIT_INSTRUCTION, blockageTemplates } from './blockage-protocol.mjs'
+  BLOCKAGE_INSTRUCTION, WORKFLOW_PAUSE_AUDIT_INSTRUCTION, blockageTemplates, globalBlockageInstruction, globalBlockageDecisionSchema } from './blockage-protocol.mjs'
+import { diagnoseBlockage, diagnosticInput, checkGlobalDecision } from './blockage-diagnosis.mjs'
 import { readBlockage, saveBlockage, blockageCatalog, blockageInput, blockageTools } from './blockage-evidence.mjs'
 
 const roleId = role => `revision_${role}_${randomUUID()}`
@@ -68,7 +71,8 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
       saveBlockage(file, control); saveBlockage(decisionFile(runner, control.id), control)
     }
     if (!control || control.phase === 'RESOLVED') {
-      control = { version: 1, id: 'blockage_' + randomUUID(), baseChecksum: state.checksum,
+      control = { version: 1, protocolVersion: 2, id: 'blockage_' + randomUUID(), baseChecksum: state.checksum,
+        ...(control?.manualResume && control.baseChecksum === state.checksum ? { manualReview: true } : {}),
         authorityHash: supervisionAuthority(runner, sourceAgent), phase: 'ANALYZE', decisions: [],
         handlerRunId: roleId('blockage') }
       saveBlockage(file, control)
@@ -93,8 +97,20 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
       if (runner.graph.read().checksum !== state.checksum) fail('BLOCKAGE_STALE_BASE')
       if (control.authorityHash !== supervisionAuthority(runner, sourceAgent)) assertAuthority(runner, control.authorityHash, sourceAgent, combined)
     }
-    const catalog = blockageCatalog(runner, state, combined), input = blockageInput(runner, state, situation, catalog)
-    const validated = value => validateBlockageDecision(value, { state, situation, catalog })
+    const diagnosis = control.protocolVersion === 2 ? diagnoseBlockage(state, situation, state.supervision.rootReferral) : null
+    const catalog = blockageCatalog(runner, state, combined, diagnosis)
+    const input = diagnosis ? { ...diagnosticInput(state, diagnosis), baseChecksum: state.checksum }
+      : blockageInput(runner, state, situation, catalog)
+    const rootReviewed = () => diagnosis && (Boolean(state.supervision.rootReferral && !control.manualReview) || control.decisions.some(row =>
+      row.feedback?.stage === 'REVISION' && ['NO_CHANGE', 'ESCALATE'].includes(row.feedback.result?.status)))
+    const validated = value => {
+      if (!diagnosis) return validateBlockageDecision(value, { state, situation, catalog })
+      const decision = globalBlockageDecisionSchema.parse(value)
+      if (decision.action === 'REPLAN' && rootReviewed()) throw located('BLOCKAGE_SCOPE_ALREADY_REVIEWED', {
+        path: '/action', reason: 'The blueprint was already reviewed in this episode. Choose evidence-backed rework or an audited pause.' })
+      checkGlobalDecision({ ...decision, scopeId: diagnosis.rootId }, { state, diagnosis, catalog })
+      return decision
+    }
     const retry = feedback => {
       const signature = digest({ decision: control.decision, feedback })
       if (control.decisions.some(row => row.signature === signature)) fail('BLOCKAGE_NO_PROGRESS')
@@ -109,8 +125,8 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
         const runId = control.handlerRunId
         const value = await directRevisionRole(runner, { runId, role: 'blockage', signal: combined, validateOutput: true,
           validateResult: validated, readOnlyTools: blockageTools(catalog, path.join(runner.config.directory, 'revisions', runId), combined),
-          messages: messages(BLOCKAGE_INSTRUCTION + '\n\n' + blockageTemplates,
-            { ...input, ...(control.feedback ? { priorReview: control.feedback } : {}) }) })
+          messages: messages(diagnosis ? globalBlockageInstruction(false) : BLOCKAGE_INSTRUCTION + '\n\n' + blockageTemplates,
+            { ...input, ...(rootReviewed() ? { reviewedScopeIds: [diagnosis.rootId] } : {}), ...(control.feedback ? { priorReview: control.feedback } : {}) }) })
         unchanged(); control.decision = validated(value)
         control.phase = value.action === 'REWORK' ? 'REWORK' : value.action === 'REPLAN' ? 'REVISING' : 'PAUSE_REVIEW'
         persist()
@@ -126,12 +142,14 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
         const proofFile = path.join(runner.config.directory, 'blockage', control.id + '-rework.json')
         const content = JSON.stringify({ roundId: control.id, baseChecksum: state.checksum,
           runId: control.handlerRunId, decision })
-        if (fs.existsSync(proofFile)) { if (fs.readFileSync(proofFile, 'utf8') !== content) fail('BLOCKAGE_DECISION_CHANGED') }
+        if (hasStored(proofFile)) { if (readStored(proofFile, 'utf8') !== content) fail('BLOCKAGE_DECISION_CHANGED') }
         else {
           fs.mkdirSync(path.dirname(proofFile), { recursive: true, mode: 0o700 })
+          if(!writeStored(proofFile,content,{exclusive:true})) {
           const fd = fs.openSync(proofFile, 'wx', 0o600)
           try { fs.writeFileSync(fd, content); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
           const dir = fs.openSync(path.dirname(proofFile), 'r'); try { fs.fsyncSync(dir) } finally { fs.closeSync(dir) }
+          }
         }
         unchanged()
         const evidence = [{ kind: 'artifact', ref: proofFile, sha256: createHash('sha256').update(content).digest('hex') }]
@@ -154,7 +172,7 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
           return result
         }
         const review = validate(await directRevisionRole(runner, { runId: control.auditRunId, role: 'blockage_audit',
-          messages: messages(BLOCKAGE_AUDIT_INSTRUCTION, auditInput), signal: combined, validateOutput: true, validateResult: validate }))
+          messages: messages(WORKFLOW_PAUSE_AUDIT_INSTRUCTION, auditInput), signal: combined, validateOutput: true, validateResult: validate }))
         unchanged(); validated(decision)
         if (review.verdict !== 'APPROVE') { retry({ stage: 'PAUSE_AUDIT', review: JSON.parse(reviewFeedback(review, 'blockage-pause-audit')) }); continue }
         control.phase = 'WAITING_USER'; control.waitingReport = decision.report; control.pauseReview = review; persist()
@@ -165,13 +183,14 @@ export async function handleBlockage(runner, { expectedRevision, baseChecksum, s
         if (!control.revisionRuns) { control.revisionRuns = { updater: roleId('updater'), reviewer: roleId('reviewer') }; persist() }
         const record = readRoleRecord(runner, control.handlerRunId)
         const blockage = { roundId: control.id, baseChecksum: state.checksum, runId: control.handlerRunId,
-          requestHash: record.requestHash, resultHash: record.resultHash }
+          requestHash: record.requestHash, resultHash: record.resultHash, ...(decision.reason ? { reason: decision.reason } : {}) }
         const facts = [...executionReportHistory(state).map((report,index) => ({ id: 'report_' + index, text: JSON.stringify(report) })),
-          { id: 'planning', text: JSON.stringify(state.planningRecord ?? { status: 'NOT_PROVIDED' }) },
+          { id: 'planning', text: JSON.stringify(currentPlanningRecord(state) ?? { status: 'NOT_PROVIDED' }) },
           { id: 'contract', text: JSON.stringify(runner.config.revision.policy) }]
         const result = await runJointRevision(runner, { expectedRevision, facts, sourceAgent, signal: combined, blockage,
           roleRunIds: control.revisionRuns, feedback: control.revisionFeedback,
-          reason: '阻塞处理者仅发出蓝图复核信号，不提供理由或方向。独立对照既往工作成果、双图、预规划记录和固定合同判断。',
+          reason: diagnosis ? '阻塞处理者已提交改图理由。核对 blockageSignal 及固定合同，避免进入 BLOCK。'
+            : '阻塞处理者仅发出蓝图复核信号，不提供理由或方向。独立对照既往工作成果、双图、预规划记录和固定合同判断。',
           verifyFacts: unchanged })
         if (result.status === 'COMMITTED') {
           control.phase = 'RESOLVED'; control.resolvedRevision = result.revision; persist()

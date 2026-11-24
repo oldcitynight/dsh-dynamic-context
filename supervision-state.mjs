@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { runtimeRules } from 'dsh-better-task-grapth/rules'
 import { isHierarchical, hierarchyComplete } from 'dsh-better-task-grapth/hierarchy'
 import { hierarchyControlSchema, finalReportReceiptSchema } from './hierarchy-protocol.mjs'
 import { z } from 'zod'
@@ -13,7 +14,7 @@ const id = z.string().regex(/^[a-z][a-z0-9_-]{0,79}$/)
 const revision = z.number().int().positive()
 const fail = code => { throw new GraphError(code) }
 
-export const artifactReference = z.object({ kind: z.literal('artifact'), ref: nonempty.max(512), sha256: hash }).strict()
+export const artifactReference = z.object({ kind: z.literal('artifact'), ref: nonempty, sha256: hash }).strict()
 export const planningReportSchema = z.object({ understanding: nonempty, assumptions: z.array(nonempty),
   design: nonempty, acceptanceStrategy: nonempty, verification: verificationPlanSchema.optional() }).strict()
 export const directoryReportSchema = z.object({ path: nonempty, subdirectories: z.array(nonempty).default([]),
@@ -35,12 +36,12 @@ export const executionReportSchema = z.object({ workHistory: z.array(nonempty),
     expected: nonempty, observed: nonempty, callId: nonempty.optional(), quote: nonempty.optional(), evidence: evidenceBindingSchema.optional() }).strict()),
   limitations: z.array(nonempty), verification: z.array(verificationClaimSchema).optional(), delivery: deliverySchema.optional(),
 }).strict()
-export const completionSchema = z.object({ kind: z.enum(['report', 'artifact']), path: nonempty.max(512).optional() })
+export const completionSchema = z.object({ kind: z.enum(['report', 'artifact']), path: nonempty.optional() })
   .strict().refine(value => (value.kind === 'artifact') === Boolean(value.path))
-export const reportSchema = z.object({ taskId: id, attemptId: id, sessionId: nonempty.max(128), contextVersion: hash,
-  text: nonempty, acceptance: z.literal('UNVERIFIED_MODEL_REPORT'), evidence: z.array(artifactReference).min(1).max(4),
+export const reportSchema = z.object({ taskId: id, attemptId: id, sessionId: nonempty, contextVersion: hash,
+  text: nonempty, repairRunId: id.optional(), acceptance: z.literal('UNVERIFIED_MODEL_REPORT'), evidence: z.array(artifactReference).min(1),
 }).strict()
-export const dispositionSchema = z.object({ outcome: z.enum(['COMPLETE', 'BLOCKED', 'FAILED']), summary: nonempty,
+export const dispositionSchema = z.object({ outcome: z.enum(['COMPLETE', 'BLOCKED', 'PASS', 'FAILED']), summary: nonempty,
   artifacts: z.array(artifactReference).default([]), failedCallId: nonempty.optional(),
   executionReport: executionReportSchema.optional(),
 }).strict()
@@ -48,10 +49,12 @@ const checkReceipt = z.object({ runId: id, requestHash: hash, resultHash: hash, 
 export const supervisionSchema = z.object({
   phase: z.enum(['READY', 'CHECK_RESULT', 'REPAIR_RESULT', 'REWORK_RESULT', 'CHECK_PLAN', 'REVISE', 'HIERARCHY']),
   hierarchy: hierarchyControlSchema.optional(),
+  routedUnit: z.object({ taskId: id, revision, runId: id, authorityHash: hash }).strict().optional(),
+  rootReferral: z.object({ runId: id, reason: nonempty }).strict().optional(),
   finalReport: finalReportReceiptSchema.optional(),
   outcomes: z.array(z.object({
     taskId: id, attemptId: id, revision, contextVersion: hash, authorityHash: hash,
-    result: dispositionSchema, evidence: z.array(artifactReference).min(1).max(4),
+    result: dispositionSchema, evidence: z.array(artifactReference).min(1),
     check: checkReceipt.nullable(),
   }).strict()),
   pending: z.object({ report: reportSchema, authorityHash: hash }).strict().optional(),
@@ -71,9 +74,12 @@ export function validateSupervision(state) {
   if (!control) return
   const { phase, outcomes, pending, feedback, roleRunId, signal } = control
   const active = state.graph.state.active
+  if (control.routedUnit && (!state.unitRoleVersion || phase !== 'READY' || active || control.routedUnit.revision !== state.revision
+      || !state.graph.state.leaves[control.routedUnit.taskId])) fail('UNIT_ROUTE_RECEIPT_INVALID')
+  if (control.rootReferral && (phase !== 'READY' || active || isHierarchical(state.graph.state.plan))) fail('ROOT_UPDATE_REFERRAL_INVALID')
   if ((phase === 'HIERARCHY' || control.hierarchy || control.finalReport) && !isHierarchical(state.graph.state.plan)) fail('HIERARCHY_POLICY_REQUIRED')
   if (phase === 'HIERARCHY' && active || control.hierarchy && phase !== 'HIERARCHY') fail('HIERARCHY_PHASE_INVALID')
-  if (control.finalReport && (!hierarchyComplete(state.graph.state, state.graph.state.plan.nodes.find(node => node.parent === null).id) || phase !== 'READY')) fail('HIERARCHY_REPORT_BEFORE_ACCEPTANCE')
+  if (control.finalReport && (!(state.graph.state.plan.hierarchy?.version === 2 ? ['PASS', 'FAILED'].includes(runtimeRules(state.graph.state).outcome(state.graph.state.plan.nodes.find(node => node.parent === null).id)) : hierarchyComplete(state.graph.state, state.graph.state.plan.nodes.find(node => node.parent === null).id)) || phase !== 'READY')) fail('HIERARCHY_REPORT_BEFORE_ACCEPTANCE')
   if ((phase === 'REWORK_RESULT') !== Boolean(control.correction) || control.correction && (!acceptanceEnabled(state) || !feedback)) fail('SUPERVISION_CORRECTION_INVALID')
   if (control.correction && canonical(control.correction.previousReport) !== canonical(pending?.report)) fail('SUPERVISION_CORRECTION_SOURCE_MISMATCH')
   const checkingResult = phase === 'CHECK_RESULT' || phase === 'REPAIR_RESULT' || phase === 'REWORK_RESULT'
@@ -97,7 +103,7 @@ export function validateSupervision(state) {
     const event = terminal[index]
     if (entry.revision !== event.seq || entry.taskId !== event.data.nodeId || entry.attemptId !== event.data.attemptId
         || canonical(entry.evidence) !== canonical(event.data.evidence)
-        || (entry.result.outcome === 'COMPLETE') !== (event.data.outcome === 'complete')
+        || (['COMPLETE','PASS'].includes(entry.result.outcome)) !== (event.data.outcome === 'complete')
         || entry.result.outcome === 'FAILED' && event.data.disposition !== 'FAILED'
         || Boolean(entry.check) !== (event.type === 'FINISHED')) fail('SUPERVISION_OUTCOME_NOT_COMMITTED')
   }
@@ -115,6 +121,12 @@ export function checkSupervisionUpdate(previous, next) {
     if (isHierarchical(previous.graph.state.plan)) { transitions.HIERARCHY = ['HIERARCHY', 'READY']; transitions.READY.push('HIERARCHY') }
     if (!transitions[before.phase].includes(after.phase) || canonical(before.outcomes) !== canonical(after.outcomes))
       fail('SUPERVISION_TRANSITION_INVALID')
+    if (after.routedUnit) {
+      const flow = before.hierarchy
+      const router = flow?.stage === 'UNIT_ROUTE' ? before.roleRunId : flow?.stage === 'UPDATE' ? flow.routeRunId : null
+      if (flow?.routeTaskId !== after.routedUnit.taskId || router !== after.routedUnit.runId
+          || flow.routeAuthority !== after.routedUnit.authorityHash) fail('UNIT_ROUTE_RECEIPT_INVALID')
+    }
     if (before.phase === 'REWORK_RESULT' && after.phase === 'REWORK_RESULT' && canonical(before.correction) !== canonical(after.correction)) fail('SUPERVISION_CORRECTION_IMMUTABLE')
     if (before.phase === 'REVISE' && after.phase === 'REVISE' && canonical(before.signal) !== canonical(after.signal))
       fail('SUPERVISION_REVISION_SIGNAL_CHANGED')
@@ -138,6 +150,10 @@ export function checkSupervisionUpdate(previous, next) {
         || canonical(after.outcomes.slice(0, -1)) !== canonical(before.outcomes)
         || event.type === 'FINISHED' && after.outcomes.at(-1).check?.runId !== before.roleRunId)
       fail('SUPERVISION_RESULT_COMMIT_REQUIRED')
+  } else if (event.type === 'BEGUN' && previous.unitRoleVersion) {
+    const { routedUnit, ...expected } = before
+    if (routedUnit?.taskId !== event.data.nodeId || routedUnit.revision !== previous.revision
+        || canonical(after) !== canonical(expected)) fail('UNIT_ROUTE_REQUIRED')
   } else if (event.type === 'REVISED') {
     const exception = event.data.review.blockageSignal
     const fromBlockage = exception && before.phase === 'READY' && blockageSituation(previous)
@@ -152,5 +168,8 @@ export function checkSupervisionUpdate(previous, next) {
   } else if (isHierarchical(previous.graph.state.plan) && ['SCOPE_REVIEWED', 'REOPENED'].includes(event.type) && before.phase === 'HIERARCHY') {
     if (event.type === 'SCOPE_REVIEWED' && event.data.runId !== before.roleRunId) fail('HIERARCHY_GATE_ROLE_MISMATCH')
     if (after.phase !== (event.type === 'REOPENED' ? 'READY' : 'HIERARCHY') || canonical(before.outcomes) !== canonical(after.outcomes)) fail('HIERARCHY_GATE_TRANSITION_INVALID')
+  } else if (event.type === 'REOPENED' && before.rootReferral && before.phase === 'READY') {
+    const { rootReferral, ...rest } = before
+    if (canonical(rest) !== canonical(after)) fail('SUPERVISION_SCHEDULING_BLOCKED')
   } else if (before.phase !== 'READY' || canonical(before) !== canonical(after)) fail('SUPERVISION_SCHEDULING_BLOCKED')
 }

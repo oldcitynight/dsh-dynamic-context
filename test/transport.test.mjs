@@ -298,7 +298,7 @@ for (const revoke of [false, true]) test(revoke
   }
 })
 
-for (const transport of ['direct']) test(`${transport} input budget includes host policy and tool schemas`, async t => {
+for (const transport of ['direct']) test(`${transport} accepts host policy and tool schemas exceeding the former character quota`, async t => {
   const h = await fixture(t, { transport, config: {
     systemPrompt: 'HOST_POLICY_KEEP '.repeat(900), allowedTools: ['fixture_read_a', 'fixture_read_b', 'fixture_large'],
     ...(transport === 'direct' ? { direct: { agentlessTools: ['fixture_read_a', 'fixture_read_b', 'fixture_large'] } } : {}),
@@ -306,8 +306,10 @@ for (const transport of ['direct']) test(`${transport} input budget includes hos
   h.ctx.tools.register(defineTool({ name: 'fixture_large', description: 'large schema description '.repeat(2400), parameters: {},
     output: { schema: { type: 'object', properties: {}, additionalProperties: false }, render: () => [] }, execute: async () => ({}) }))
   const p = proposal(); p.contextGraph.bindings[0].tools = ['fixture_large']; h.runner.submit(p)
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /REQUEST_INPUT_BUDGET_EXCEEDED/)
-  assertBlocked(h, 0)
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.ok(result.report.text)
+  assert.ok(h.backend.requests.length)
+
 })
 
 test('direct missing credentials cannot fall back to ambient credentials or an unauthenticated request', async t => {

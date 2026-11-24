@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { unitSnapshotCodec, unitWitnessCodec } from './unit-storage.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -15,19 +16,21 @@ const sync = directory => { const fd = fs.openSync(directory, fs.constants.O_RDO
  * A PREPARED receipt is uncertainty, never proof that no graph existed.
  */
 export class TrackedGraphStore {
+  #verifiedWitnessState = null
+
   constructor(options, factory = config => new FileGraphStore(config)) {
-    this.raw = factory(options)
-    for (const key of ['file', 'directory', 'projectRoot', 'maximumBytes']) this[key] = this.raw[key]
+    this.raw = factory({ ...options, codec: unitSnapshotCodec, reuseValidatedReads: true })
+    for (const key of ['file', 'directory', 'projectRoot']) this[key] = this.raw[key]
     this.validate = options.validator; this.checkUpdate = options.updateValidator
     this.binding = digest({ projectRoot: this.projectRoot, directory: this.directory, file: path.basename(this.file) })
     this.witness = factory({ projectRoot: this.projectRoot,
-      directory: path.join(this.projectRoot, '.dsh', 'workflow-witnesses-v1', this.binding), fileName: 'witness.json', maximumBytes: null,
+      directory: path.join(this.projectRoot, '.dsh', 'workflow-witnesses-v1', this.binding), fileName: 'witness.json', codec: unitWitnessCodec, reuseValidatedReads: true,
       validator: value => {
         if (!value || !Number.isSafeInteger(value.revision) || value.revision < 1 || value.binding !== this.binding
             || !['PREPARED', 'COMMITTED'].includes(value.phase)) fail('GRAPH_WITNESS_INVALID')
         const { checksum, ...body } = value
         if (checksum !== digest(body) || !/^[a-f0-9]{64}$/.test(value.candidateChecksum)) fail('GRAPH_WITNESS_INVALID')
-        if (value.committed) this.validate(value.committed)
+        if (value.committed && value.committed !== this.#verifiedWitnessState) this.validate(value.committed)
         if (value.phase === 'COMMITTED' && value.committed?.checksum !== value.candidateChecksum) fail('GRAPH_WITNESS_INVALID')
       },
       updateValidator: (before, after) => {
@@ -35,20 +38,30 @@ export class TrackedGraphStore {
       } })
   }
   writeWitness(previous, phase, committed, candidateChecksum) {
-    return this.witness.compareAndSwap(previous?.revision ?? 0, () => seal({ revision: (previous?.revision ?? 0) + 1,
-      binding: this.binding, phase, committed: committed ? copy(committed) : null, candidateChecksum }))
+    return this.#recordWitness(previous, phase, committed, candidateChecksum, false)
   }
-  inspect({ reconcilePrepared = true } = {}) {
+  #recordWitness(previous, phase, committed, candidateChecksum, alreadyValidated) {
+    const snapshot = committed ? copy(committed) : null
+    // This exemption applies only to this exact object inside the synchronous
+    // CAS. Witnesses loaded from disk still go through the normal verifier.
+    if (alreadyValidated) this.#verifiedWitnessState = snapshot
+    try {
+      return this.witness.compareAndSwap(previous?.revision ?? 0, () => seal({ revision: (previous?.revision ?? 0) + 1,
+        binding: this.binding, phase, committed: snapshot, candidateChecksum }))
+    } finally { this.#verifiedWitnessState = null }
+  }
+  inspect(options) { return this.#inspect(options) }
+  #inspect({ reconcilePrepared = true, readState = () => this.raw.read() } = {}) {
     let witness, state, readError
     try { witness = this.witness.read() } catch (error) { return { presence: { state: 'WITNESS_INVALID', previouslyCommitted: null, code: error.code ?? error.name } } }
-    try { state = this.raw.read() } catch (error) { readError = error }
+    try { state = readState() } catch (error) { readError = error }
     const prior = Boolean(witness?.committed)
     if (readError) {
       let kind = prior ? 'INVALID_AFTER_COMMIT' : 'UNVERIFIED_GRAPH_DATA'
       // This observation classifies damage only; it never authorizes a commit.
       try {
         const stat = fs.lstatSync(this.file)
-        if (stat.isFile() && !stat.isSymbolicLink() && (this.maximumBytes === null || stat.size <= this.maximumBytes)) {
+        if (stat.isFile() && !stat.isSymbolicLink()) {
           const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'))
           if (prior && !raw.graph && raw.contexts) kind = 'TASK_GRAPH_LOST'
           if (prior && raw.graph && !raw.contexts) kind = 'CONTEXT_GRAPH_LOST'
@@ -70,30 +83,40 @@ export class TrackedGraphStore {
     return { witness, state, presence: { state: 'READY', previouslyCommitted: true, revision: state.revision, witnessChecksum: witness.checksum } }
   }
   presence() { return this.inspect().presence }
-  read() {
-    const result = this.inspect()
+  read(result = this.inspect()) {
     if (!['NEVER_CREATED', 'READY'].includes(result.presence.state)) fail('GRAPH_RECOVERY_REQUIRED', result.presence)
     return result.state ?? null
   }
   compareAndSwap(expectedRevision, update) {
+    const db = this.raw.db
+    if (db && !db.inTransaction) return db.transaction(() => this.compareAndSwap(expectedRevision,update))
     this.read()
+    let witness
     let prepared
-    const next = this.raw.compareAndSwap(expectedRevision, previous => {
-      const before = this.inspect()
+    const inspectAndUpdate = previous => {
+      const before = this.#inspect({ readState: () => previous })
       if (!['NEVER_CREATED', 'READY'].includes(before.presence.state)) fail('GRAPH_RECOVERY_REQUIRED', before.presence)
-      const candidate = update(previous)
+      witness = before.witness
+      return update(previous)
+    }
+    const prepare = (previous, candidate) => {
+      prepared = this.#recordWitness(witness, 'PREPARED', previous, candidate.checksum, true)
+    }
+    let next
+    if (typeof this.raw.compareAndSwapPrepared === 'function') {
+      next = this.raw.compareAndSwapPrepared(expectedRevision, inspectAndUpdate, prepare)
+    } else next = this.raw.compareAndSwap(expectedRevision, previous => {
+      const candidate = inspectAndUpdate(previous)
       if (candidate?.then) fail('ASYNC_STORE_UPDATE_FORBIDDEN')
       this.validate(candidate); this.checkUpdate(previous, candidate)
-      const bytes = Buffer.byteLength(JSON.stringify(candidate) + '\n')
-      if (this.maximumBytes !== null && bytes > this.maximumBytes) fail('STORE_BYTE_LIMIT')
-      prepared = this.writeWitness(before.witness, 'PREPARED', previous, candidate.checksum)
+
+      prepare(previous, candidate)
       return candidate
     })
-    this.writeWitness(prepared, 'COMMITTED', next, next.checksum)
+    this.#recordWitness(prepared, 'COMMITTED', next, next.checksum, true)
     return next
   }
-  recoveryPlan() {
-    const { witness, presence } = this.inspect()
+  recoveryPlan({ witness, presence } = this.inspect()) {
     return { ...presence, recoveryRequired: !['READY', 'NEVER_CREATED'].includes(presence.state),
       canRestore: witness?.phase === 'COMMITTED' && Boolean(witness.committed),
       ...(witness?.phase === 'COMMITTED' ? { expectedWitnessChecksum: witness.checksum, restoreRevision: witness.committed.revision,
@@ -105,6 +128,12 @@ export class TrackedGraphStore {
     if (!witness || witness.phase !== 'COMMITTED' || witness.checksum !== expectedWitnessChecksum) fail('GRAPH_RECOVERY_WITNESS_CHANGED')
     this.validate(witness.committed)
     if (before.presence.state === 'READY') return { restored: false, revision: witness.committed.revision }
+    if (this.raw.restoreCommitted) return this.raw.db.transaction(() => {
+      if (this.witness.read()?.checksum !== expectedWitnessChecksum) fail('GRAPH_RECOVERY_WITNESS_CHANGED')
+      this.raw.restoreCommitted(witness.committed)
+      const restored=this.read()
+      return { restored:true, revision:restored.revision, activeAttemptPreserved:Boolean(restored.graph.state.active), executionResumed:false }
+    })
     this.raw.checkDirectory()
     try { fs.mkdirSync(this.raw.lock, { mode: 0o700 }) } catch (error) { if (error.code === 'EEXIST') fail('CAS_LOCK_BUSY_NO_AUTOMATIC_STEAL'); throw error }
     const identity = fs.lstatSync(this.raw.lock), temporary = path.join(this.directory, '.restore-' + randomUUID() + '.tmp')
@@ -112,7 +141,7 @@ export class TrackedGraphStore {
     try {
       if (this.witness.read()?.checksum !== expectedWitnessChecksum) fail('GRAPH_RECOVERY_WITNESS_CHANGED')
       const fd = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600)
-      try { fs.writeFileSync(fd, JSON.stringify(witness.committed) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+      try { fs.writeFileSync(fd, JSON.stringify(unitSnapshotCodec.encode(witness.committed)) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
       this.raw.checkDirectory()
       if (fs.existsSync(this.file)) {
         const stat = fs.lstatSync(this.file)

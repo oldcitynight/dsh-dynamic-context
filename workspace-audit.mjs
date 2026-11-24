@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { namesStored } from './workflow-io.mjs'
 // Independent final-audit observations. Project bytes are never written or run.
 import fs from 'node:fs'
 import { IMAGE_TOOL } from './image-content.mjs'
@@ -40,7 +41,7 @@ function register(catalog, stored) {
 export function registerWorkspaceReceipts(directory, catalog) {
   const folder = receiptFolder(directory)
   if (!fs.existsSync(folder)) return
-  for (const name of fs.readdirSync(folder).filter(name => /^\d+\.json$/.test(name))) register(catalog, readBlockage(path.join(folder, name)))
+  for (const name of namesStored(folder).filter(name => /^\d+\.json$/.test(name))) register(catalog, readBlockage(path.join(folder, name)))
 }
 function pageOf(textOrRows, args, maximum) {
   const count = textOrRows.length, isText = typeof textOrRows === 'string'
@@ -176,8 +177,8 @@ export function workspaceAuditTools(runner, directory, catalog, signal, { images
     if (name !== WORKSPACE_TOOLS.zip) fail('WORKSPACE_TOOL_UNKNOWN')
     return archiveObservation(args)
   }
-  async function inspectImage(args) {
-    const { identity, image, display } = await readAuditImage(runner, args.path, signal, imageTarget, observeFile)
+  async function inspectImage(args, modelConfig) {
+    const { identity, image, display } = await readAuditImage({ ctx: runner.ctx, config: modelConfig }, args.path, signal, imageTarget, observeFile)
     return { identity, value: { ...identity, image, qualification, display } }
   }
   const tools = [...(imagesOnly ? [] : [wire(WORKSPACE_TOOLS.list, 'Read a shallow directory listing inside the workflow workspace. No writes or symlink traversal. Excluded private entries are counted; this is not a recursive directory identity. Follow next to paginate. Example: {"path":".","start":0,"end":100}.'),
@@ -189,7 +190,7 @@ export function workspaceAuditTools(runner, directory, catalog, signal, { images
     const latest = new Map()
     for (const [source, observation] of observations) latest.set(observation.path, { source, sourceSha256: digest(catalog.get(source).load()), ...observation })
     return { protocol: 'workspace-readonly-v1', qualification, observations: [...latest.values()] }
-  }, execute(tool) {
+  }, execute(tool, modelConfig = config) {
     signal?.throwIfAborted()
     const identity = { ordinal: ++ordinal, name: tool.function.name, id: tool.id, arguments: tool.function.arguments }
     const file = path.join(receiptFolder(directory), ordinal + '.json'), stored = readBlockage(file)
@@ -249,7 +250,7 @@ export function workspaceAuditTools(runner, directory, catalog, signal, { images
       args = tool.function.name === IMAGE_TOOL
         ? { path: z.object({ file_path: z.string().min(1) }).strict().parse(raw).file_path, start: 0 }
         : pageSchema.parse(raw)
-      const result = tool.function.name === IMAGE_TOOL ? inspectImage(args)
+      const result = tool.function.name === IMAGE_TOOL ? inspectImage(args, modelConfig)
         : inspect(tool.function.name, args, Object.hasOwn(raw, 'start') || Object.hasOwn(raw, 'end'))
       return result?.then ? result.then(accept, rejected) : accept(result)
     } catch (error) { return rejected(error) }

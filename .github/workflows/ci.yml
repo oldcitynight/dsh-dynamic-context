@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ['24.x']
+        node: ['22.x', '24.x']
     env:
       TMPDIR: ${{ github.workspace }}/.test-tmp
       DSH_HOME: ${{ github.workspace }}/.test-home/dsh
@@ -55,5 +55,22 @@ jobs:
           execFileSync('npm', ['cache', 'add', local], { stdio: 'inherit' })
           NODE
       - run: npm ci --prefer-offline
-      - run: npm test
+      - name: Run the complete npm test entry point
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          if [[ "$(node --version)" == v22.* ]]; then
+            # Node 22 also times the entire file. Retain npm lifecycle hooks,
+            # documentation checks and the matching host compatibility bootstrap.
+            trap 'git restore -- scripts/test.mjs' EXIT
+            python3 - <<'PYTHON'
+          from pathlib import Path
+          runner = Path('scripts/test.mjs')
+          source = runner.read_text()
+          old, new = "'--test-timeout=60000'", "'--test-timeout=180000'"
+          assert source.count(old) == 1, 'Direct test runner timeout changed'
+          runner.write_text(source.replace(old, new))
+          PYTHON
+          fi
+          npm test
       - run: npm pack --dry-run

@@ -13,6 +13,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { bindScopeParent, createScope } from '@deepseek-ai/dsh-scope'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { executeFixtureTool } from '../testing/harness.mjs'
+import { rootTask, unitBackend } from '../testing/unit-proposal.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { DynamicContextRuntime, validateConfig } from '../index.mjs'
 import { MODE_OPTIONS, MODE_RECORD } from '../interaction.mjs'
@@ -53,12 +54,38 @@ for (const mode of ['native', 'task-graph', 'full']) test(`human /task-graph com
   assert.deepEqual(lifecycle.map(row => row.type), ['command/run', 'command/done'])
 })
 
+test('the default human command enters full units once and preserves an unrelated native conversation', async t => {
+  const f = await fixture(t, { setup: ctx => ctx.plugin(Commands), config: { interaction: { mode: 'interactive', orchestration: false } } })
+  const { agent } = await f.agent('default-full-command')
+  const sibling = (await f.agent('default-native-sibling')).agent
+  assert.equal(f.h.runner.interaction.mode(agent), 'native')
+  const command = () => f.h.ctx.commands.execute(agent, '/task-graph Build the fixture.', [], new AbortController().signal)
+  assert.equal((await command()).result.kind, 'success')
+  await agent.whenIdle()
+  const selection = f.h.runner.interaction.record(agent)
+  assert.equal(selection.mode, 'full')
+  assert.equal(selection.unitWorkflowVersion, 2)
+  assert.equal(selection.evidence.source, 'human-command')
+  const runner = f.h.runner.interaction.entries.get(agent).runner
+  assert.equal(runner.graph.read(), null)
+  const release = runner.storage
+    ? JSON.parse(runner.storage.db.q('SELECT workflow_release FROM instance WHERE id=1').get().workflow_release)
+    : JSON.parse(fs.readFileSync(path.join(runner.config.directory, '.workflow-storage-v1'), 'utf8').split('\n')[1]).release
+  assert.equal(release.workflowCompatibilityEpoch, 1)
+  assert.deepEqual(Object.keys(release.pluginVersions).sort(), ['dsh-better-task-grapth', 'dsh-dynamic-context'])
+  assert.equal(f.h.runner.interaction.mode(sibling), 'native')
+  await command()
+  await agent.whenIdle()
+  assert.equal(f.questions.length, 0)
+  assert.equal(agent.session.snapshotEvents().filter(row => row.type === MODE_RECORD).length, 1)
+})
+
 test('an empty command reuses the current task and repeats do not ask again or replace a committed graph', async t => {
   const f = await fixture(t, { setup: ctx => ctx.plugin(Commands) })
   const { agent } = await f.agent('repeat-command', 'EXISTING_USER_TASK')
   const invoke = () => f.h.ctx.commands.execute(agent, '/task-graph', [], new AbortController().signal)
   await invoke(); await agent.whenIdle()
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const runner = f.h.runner.interaction.entries.get(agent).runner, before = runner.graph.read().checksum
   await invoke(); await agent.whenIdle()
   assert.equal(f.questions.length, 1)
@@ -71,13 +98,14 @@ test('a human command may reconsider a previous native choice, but missing histo
   let choice = 'native'
   const f = await fixture(t, { choice: () => choice, setup: ctx => ctx.plugin(Commands) })
   const { agent } = await f.agent('reconsider-command')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: 'first choice' })
+  await startGraph(f, agent, '')
+  await agent.whenIdle()
   choice = 'full'
   const invoke = () => f.h.ctx.commands.execute(agent, '/task-graph', [], new AbortController().signal)
   assert.equal((await invoke()).result.kind, 'success'); await agent.whenIdle()
   assert.equal(f.questions.length, 2)
   const runner = f.h.runner.interaction.entries.get(agent).runner
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const graphFile = runner.graph.store.file
   // Damage the actual ledger, preserving its witness and session receipts.
   fs.writeFileSync(graphFile, 'broken ledger')
@@ -93,7 +121,7 @@ test('the command enters the real graph submission and direct worker path under 
       workers++; return { text: 'Fake leaf evidence-qualified result.' }
     }
     rootSteps++
-    if (rootSteps === 1) return { tools: [{ name: 'dynamic_context_submit', arguments: { proposal: runtimeProposal([]) } }] }
+    if (rootSteps === 1) return { tools: [{ name: 'dynamic_context_submit', arguments: { proposal: rootTask() } }] }
     if (rootSteps === 2) {
       const submitted = JSON.parse(payload.messages.findLast(row => row.role === 'tool').content)
       return { tools: [{ name: submitted.nextTool, arguments: submitted.arguments }] }
@@ -155,14 +183,14 @@ async function readGraphDock(ctx, agent) {
   return createRemoteContribution(z).descriptors[0].result.create().parse(result)
 }
 
-async function fixture(t, { choice = 'full', revision = false, respond, taskGraph = true, setup, config = {} } = {}) {
+async function fixture(t, { choice = 'full', revision = false, respond, taskGraph = true, setup, config = {}, plan } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-boundaries-')))
   const projectRoot = path.join(root, 'project'); fs.mkdirSync(projectRoot)
   const questions = [], handles = []
   const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), taskGraph,
-    config: { storageRoot: root, interaction: { mode: 'interactive', orchestration: false }, exposeControlTools: true,
+    config: { storageRoot: root, interaction: { mode: 'interactive', orchestration: false, commandMode: 'ask' }, exposeControlTools: true,
       ...(revision ? { revision: { policy: { objective: 'MUST_NOT_LEAK_TEMPLATE_GOAL', requirements: [{ id: 'original', text: 'Template only.' }] } } } : {}), ...config },
-    respond: respond ?? (() => ({ text: 'Fake scoped result.' })),
+    respond: unitBackend(respond ?? (() => ({ text: 'Fake scoped result.' })), { plan }),
     setup: async ctx => {
       await ctx.plugin(UserQuestions)
       await ctx.plugin(Persistence, { root: path.join(root, 'sessions') })
@@ -185,7 +213,9 @@ async function fixture(t, { choice = 'full', revision = false, respond, taskGrap
     return { handle, agent: handle.agent, message }
   }
   const call = (agent, name, args) => h.ctx.tools.get(name, agent).execute(args, { agent, name, callId: 'fixture-' + name, signal: new AbortController().signal })
-  return { h, root, projectRoot, questions, agent, call }
+  // Exercise mode transitions in isolation, without queuing a model turn.
+  const selectMode = (agent, args) => h.runner.interaction.select(agent, args, new AbortController().signal)
+  return { h, root, projectRoot, questions, agent, call, selectMode }
 }
 const schemaNames = (ctx, agent) => ctx.tools.schemas(agent).map(row => row.name)
 
@@ -225,11 +255,13 @@ test('forked chats remain controllers while delegated and direct worker sessions
   assert.match(JSON.stringify(await initial(fork.agent)), /任务图与动态上下文使用指引/)
   assert.doesNotMatch(JSON.stringify(await initial(delegated.agent)), /任务图与动态上下文使用指引/)
   await assert.rejects(f.call(delegated.agent, 'dynamic_context_select_mode', { reason: '项目级工作' }),
-    /DYNAMIC_CONTEXT_ROOT_CONTROLLER_REQUIRED/)
+    /DYNAMIC_CONTEXT_COMMAND_REQUIRED/)
   assert.equal(f.questions.length, 0)
-  await f.call(fork.agent, 'dynamic_context_select_mode', { reason: '项目级工作' })
-  await f.call(fork.agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
-  assert.equal((await f.call(fork.agent, 'dynamic_context_run_next', { expectedRevision: 1 })).revision, 3)
+  await f.selectMode(fork.agent, { reason: '项目级工作' })
+  const committed = await f.call(fork.agent, 'dynamic_context_submit', { proposal: rootTask() })
+  assert.equal(committed.revision, 1)
+  assert.equal(f.h.runner.interaction.entries.get(fork.agent).runner.unitWorkflowVersion, 2)
+  assert.equal(f.h.runner.interaction.entries.has(delegated.agent), false)
   assert.equal(f.questions.length, 1)
 })
 
@@ -242,12 +274,12 @@ for (const mode of ['native', 'task-graph', 'full']) test(`human choice ${mode} 
   assert.equal(schemaNames(f.h.ctx, first.agent).includes('transaction_graph_create'), false)
   assert.equal(schemaNames(f.h.ctx, first.agent).includes('dynamic_context_submit'), false)
   assert.ok(initial.contexts.some(row => row.text.includes('当前未通过 /task-graph 启用任务图')))
-  assert.equal((await f.call(first.agent, 'dynamic_context_select_mode', { reason: '项目级工作' })).mode, mode)
+  assert.equal((await f.selectMode(first.agent, { reason: '项目级工作' })).mode, mode)
   assert.deepEqual(f.questions[0][0].options.map(row => row.label), MODE_OPTIONS.map(row => row.label))
   assert.equal(f.h.runner.interaction.mode(second.agent), 'native')
   assert.equal(schemaNames(f.h.ctx, first.agent).includes('transaction_graph_create'), mode === 'task-graph')
   assert.equal(schemaNames(f.h.ctx, first.agent).includes('dynamic_context_submit'), mode === 'full')
-  assert.equal((await f.call(first.agent, 'dynamic_context_select_mode', { reason: '重复调用' })).alreadySelected, true)
+  assert.equal((await f.selectMode(first.agent, { reason: '重复调用' })).alreadySelected, true)
   assert.equal(f.questions.length, 1)
   assert.ok(first.agent.session.snapshotEvents().some(row => row.type === MODE_RECORD && row.data.mode === mode))
   const selected = await f.h.ctx.systemPrompt.assemble({ agent: first.agent, scope: first.agent })
@@ -259,15 +291,15 @@ for (const mode of ['native', 'task-graph', 'full']) test(`human choice ${mode} 
     const firstPrompt = await f.h.ctx.systemPrompt.assemble({ agent: first.agent, scope: first.agent })
     assert.match(JSON.stringify(firstPrompt), /FIRST_TASK_CONTRACT/)
     assert.doesNotMatch(JSON.stringify(firstPrompt), /SECOND_TASK_CONTRACT|MUST_NOT_LEAK_TEMPLATE_GOAL/)
-    await f.call(first.agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+    await f.call(first.agent, 'dynamic_context_submit', { proposal: rootTask() })
     const result = await f.call(first.agent, 'dynamic_context_run_next', { expectedRevision: 1 })
-    assert.equal(result.revision, 3); assert.equal(f.h.backend.requests.length, 1)
+    assert.equal(result.revision, 3); assert.equal(f.h.backend.requests.length, 5)
   } else assert.equal(f.h.backend.requests.length, 0)
 })
 
 test('task-only proposal falls back to original graph tools without committing a joint ledger', async t => {
   const f = await fixture(t), { agent } = await f.agent('task-only')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目级任务' })
+  await f.selectMode(agent, { reason: '项目级任务' })
   const child = f.h.runner.interaction.entries.get(agent).runner
   const taskGraph = runtimeProposal([]).taskGraph
   const result = await f.call(agent, 'dynamic_context_submit', { proposal: { taskGraph } })
@@ -283,7 +315,7 @@ test('task-only proposal falls back to original graph tools without committing a
 for (const fallback of ['回退到原生状态', '不回退，补齐任务图', null]) test(`orphan context reports error and requests human fallback: ${fallback}`, async t => {
   const f = await fixture(t, { choice: (_request, count) => count === 1 ? 'full' : fallback })
   const { agent } = await f.agent('orphan')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目级任务' })
+  await f.selectMode(agent, { reason: '项目级任务' })
   const child = f.h.runner.interaction.entries.get(agent).runner
   const result = await f.call(agent, 'dynamic_context_submit', { proposal: { contextGraph: runtimeProposal([]).contextGraph } })
   assert.equal(result.code, 'CONTEXT_GRAPH_REQUIRES_TASK_GRAPH')
@@ -294,7 +326,7 @@ for (const fallback of ['回退到原生状态', '不回退，补齐任务图', 
 
 test('unanswered initial question never selects the recommended full mode', async t => {
   const f = await fixture(t, { choice: null }), { agent } = await f.agent('unanswered')
-  const result = await f.call(agent, 'dynamic_context_select_mode', { reason: '项目级任务' })
+  const result = await f.selectMode(agent, { reason: '项目级任务' })
   assert.equal(result.status, 'NEEDS_USER_CHOICE'); assert.equal(result.changed, false)
   assert.equal(f.h.runner.interaction.record(agent), undefined)
   assert.equal(f.h.backend.requests.length, 0)
@@ -303,10 +335,10 @@ test('unanswered initial question never selects the recommended full mode', asyn
 test('whole explicit user choice is honored; quoted or negated phrases do not authorize a mode', async t => {
   const f = await fixture(t, { choice: 'native' })
   const explicit = await f.agent('explicit', '使用动态上下文')
-  const result = await f.call(explicit.agent, 'dynamic_context_select_mode', { reason: '用户指定', explicit: { mode: 'full', userMessageId: explicit.message.id, quote: '使用动态上下文' } })
+  const result = await f.selectMode(explicit.agent, { reason: '用户指定', explicit: { mode: 'full', userMessageId: explicit.message.id, quote: '使用动态上下文' } })
   assert.equal(result.mode, 'full'); assert.equal(f.questions.length, 0)
   const negated = await f.agent('negated', '不要“使用动态上下文”，这是一个反例。')
-  const denied = await f.call(negated.agent, 'dynamic_context_select_mode', { reason: '需要确认', explicit: { mode: 'full', userMessageId: negated.message.id, quote: '使用动态上下文' } })
+  const denied = await f.selectMode(negated.agent, { reason: '需要确认', explicit: { mode: 'full', userMessageId: negated.message.id, quote: '使用动态上下文' } })
   assert.equal(denied.mode, 'native'); assert.equal(f.questions.length, 1)
 })
 
@@ -316,7 +348,7 @@ test('new conversations in different projects get guidance and distinct full wor
   for (const item of [a, b]) {
     const prompt = await f.h.ctx.systemPrompt.assemble({ agent: item.agent, scope: item.agent })
     assert.match(JSON.stringify(prompt), /任务图与动态上下文使用指引/)
-    await f.call(item.agent, 'dynamic_context_select_mode', { reason: '项目任务' })
+    await f.selectMode(item.agent, { reason: '项目任务' })
   }
   const one = f.h.runner.interaction.entries.get(a.agent).runner, two = f.h.runner.interaction.entries.get(b.agent).runner
   assert.notEqual(one.config.interop.workflowId, two.config.interop.workflowId)
@@ -329,28 +361,30 @@ test('new conversations in different projects get guidance and distinct full wor
 
 test('mode switches cannot release an active leaf and base loss blocks further requests', async t => {
   const f = await fixture(t), { agent } = await f.agent('active')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
+  await f.selectMode(agent, { reason: '项目任务' })
   const child = f.h.runner.interaction.entries.get(agent).runner
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
+  await child.runNext({ expectedRevision: 1, routeOnly: true, sourceAgent: agent })
   child.graph.begin({ expectedRevision: 1, choice: 0 })
-  await assert.rejects(f.call(agent, 'dynamic_context_select_mode', { reason: '改变模式', reconsider: true }), /IDLE_BOUNDARY/)
+  await assert.rejects(f.selectMode(agent, { reason: '改变模式', reconsider: true }), /IDLE_BOUNDARY/)
   assert.ok(child.graph.read().graph.state.active)
   f.h.ctx.transactionGraph.workflows.close()
   await assert.rejects(child.runNext({ expectedRevision: 2, sourceAgent: agent }), /DYNAMIC_CONTEXT_REQUIRES_ACTIVE_TASK_GRAPH/)
-  assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(f.h.backend.requests.length, 2)
 })
 
 for (const answer of ['恢复已核验快照（推荐）', '暂停并保留现场', null]) test(`committed graph loss requires recovery consent: ${answer}`, async t => {
   const f = await fixture(t, { choice: (_request, count) => count === 1 ? 'full' : answer })
   const { agent } = await f.agent('lost-graph')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const child = f.h.runner.interaction.entries.get(agent).runner
+  await child.runNext({ expectedRevision: 1, routeOnly: true, sourceAgent: agent })
   child.graph.begin({ expectedRevision: 1, choice: 0 }); const saved = child.graph.read()
   fs.unlinkSync(child.graph.store.file)
   const status = await f.call(agent, 'dynamic_context_graph_status', {})
   assert.equal(status.linked.state, 'BOTH_GRAPHS_LOST')
-  assert.equal((await f.call(agent, 'dynamic_context_select_mode', { reason: '改用原生', reconsider: true })).status, 'RECOVERY_REQUIRED')
+  assert.equal((await f.selectMode(agent, { reason: '改用原生', reconsider: true })).status, 'RECOVERY_REQUIRED')
   assert.equal((await f.call(agent, 'dynamic_context_submit', { proposal: { taskGraph: runtimeProposal([]).taskGraph } })).code, 'GRAPH_RECOVERY_REQUIRED')
   await assert.rejects(child.runNext({ sourceAgent: agent, expectedRevision: 2 }), /GRAPH_RECOVERY_REQUIRED/)
   const result = await f.call(agent, 'dynamic_context_recover_graphs', {})
@@ -358,13 +392,13 @@ for (const answer of ['恢复已核验快照（推荐）', '暂停并保留现�
     assert.equal(result.restored, true); assert.equal(result.executionResumed, false)
     assert.deepEqual(child.graph.read(), saved)
   } else { assert.equal(result.changed, false); assert.equal(fs.existsSync(child.graph.store.file), false) }
-  assert.equal(f.h.runner.interaction.mode(agent), 'full'); assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(f.h.runner.interaction.mode(agent), 'full'); assert.equal(f.h.backend.requests.length, 2)
 })
 
 test('session commit receipt prevents fresh creation after both graph and witness are removed', async t => {
   const f = await fixture(t), { agent } = await f.agent('double-loss')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const child = f.h.runner.interaction.entries.get(agent).runner
   assert.ok(agent.session.snapshotEvents().some(event => event.type === GRAPH_COMMIT_RECORD))
   fs.unlinkSync(child.graph.store.file); fs.unlinkSync(child.graph.store.witness.file)
@@ -372,14 +406,14 @@ test('session commit receipt prevents fresh creation after both graph and witnes
   assert.equal(child.graphPresence().canRestore, false)
   assert.throws(() => child.submit(runtimeProposal([]), { sourceAgent: agent }), /GRAPH_RECOVERY_REQUIRED/)
   assert.throws(() => f.h.runner.interaction.ensureIdle(agent), /GRAPH_RECOVERY_REQUIRED/)
-  assert.equal((await f.call(agent, 'dynamic_context_select_mode', { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
-  assert.equal(f.h.backend.requests.length, 0)
+  assert.equal((await f.selectMode(agent, { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
+  assert.equal(f.h.backend.requests.length, 1)
 })
 
 test('a partial replacement cannot discard a committed joint graph', async t => {
   const f = await fixture(t), { agent } = await f.agent('partial-replacement')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const child = f.h.runner.interaction.entries.get(agent).runner, before = child.graph.read()
   for (const key of ['taskGraph', 'contextGraph']) {
     const result = await f.call(agent, 'dynamic_context_submit', { proposal: { [key]: runtimeProposal([])[key] } })
@@ -390,11 +424,11 @@ test('a partial replacement cannot discard a committed joint graph', async t => 
 
 test('switching an idle workflow off does not erase its historical presence in graph status', async t => {
   const f = await fixture(t), { agent } = await f.agent('inactive-history')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const message = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '不启用任务图' }] })
   agent.session.append('user/message', message, { surfaceOp: 'append' })
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '用户更改选择', reconsider: true,
+  await f.selectMode(agent, { reason: '用户更改选择', reconsider: true,
     explicit: { mode: 'native', userMessageId: message.id, quote: '不启用任务图' } })
   const result = await f.call(agent, 'dynamic_context_graph_status', {})
   assert.equal(result.mode, 'native')
@@ -404,8 +438,8 @@ test('switching an idle workflow off does not erase its historical presence in g
 
 test('persisted full mode remounts its original graph after the controller is recreated', async t => {
   const f = await fixture(t), first = await f.agent('reopen')
-  await f.call(first.agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(first.agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(first.agent, { reason: '项目任务' })
+  await f.call(first.agent, 'dynamic_context_submit', { proposal: rootTask() })
   const before = f.h.runner.interaction.entries.get(first.agent).runner.graph.read()
   await first.handle.dispose()
   const next = await f.h.ctx.agents.resume({ resumeSessionId: 'reopen', agentOptions: { provider: 'dynamic-context-fake', model: 'fake-llama' } })
@@ -417,21 +451,20 @@ test('persisted full mode remounts its original graph after the controller is re
 })
 
 test('the Web status RPC displays the committed linked graph for its session, including after reopening', async t => {
-  const f = await fixture(t), { agent, handle } = await f.agent('web-linked')
+  const f = await fixture(t, { plan: { keys: ['task','later'], rules: [{ id: 'after', when: { node: 'task', in: ['PASS'] } }] } }), { agent, handle } = await f.agent('web-linked')
   const other = await f.agent('web-other-session')
   assert.equal((await readGraphDock(f.h.ctx, agent)).status, 'empty')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
+  await f.selectMode(agent, { reason: '项目任务' })
   assert.equal((await readGraphDock(f.h.ctx, agent)).status, 'empty')
-  const proposal = runtimeProposal([])
+  const proposal = rootTask()
   proposal.contextGraph.nodes[0].content = 'PRIVATE_CONTEXT_DO_NOT_DISPLAY'
-  proposal.taskGraph.nodes.push({ key: 'later', kind: 'leaf', label: 'Deliver', parent: 'root' })
-  proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'task', to: 'later' })
-  proposal.contextGraph.bindings.push({ task: 'later', instruction: 'Deliver the result.', contexts: [], inheritReports: ['task'], tools: [] })
   await f.call(agent, 'dynamic_context_submit', { proposal })
   const child = f.h.runner.interaction.entries.get(agent).runner
+  await child.runNext({ expectedRevision: 1, routeOnly: true, sourceAgent: agent })
+  const planned = child.graph.read().revision
   const created = await readGraphDock(f.h.ctx, agent)
   assert.equal(created.status, 'ready')
-  assert.equal(created.graph.revision, 1)
+  assert.equal(created.graph.revision, planned)
   assert.equal(created.graph.nodes.length, 3)
   assert.equal(created.graph.edges.length, 1)
   assert.equal(created.graph.legalNext.length, 1)
@@ -440,27 +473,29 @@ test('the Web status RPC displays the committed linked graph for its session, in
   assert.equal((await readGraphDock(f.h.ctx, other.agent)).status, 'empty')
   assert.equal(f.h.ctx.transactionGraph.host.snapshot(agent.session).status, 'empty')
 
-  child.graph.begin({ expectedRevision: 1 })
+  await child.runNext({ expectedRevision: planned, routeOnly: true, sourceAgent: agent })
+  child.graph.begin({ expectedRevision: planned })
   const started = await readGraphDock(f.h.ctx, agent)
-  assert.equal(started.graph.revision, 2)
+  assert.equal(started.graph.revision, planned + 1)
   assert.equal(started.graph.active.recoveryRequired, false)
   assert.deepEqual(started.graph.legalNext, [])
-  assert.equal(started.graph.nodes.find(node => node.label === 'Deliver').blocked, true)
+  assert.equal(started.graph.nodes.find(node => node.label === 'later').blocked, true)
+  const requests = f.h.backend.requests.length
   await handle.dispose()
   const reopened = await f.h.ctx.agents.resume({ resumeSessionId: agent.session.id,
     agentOptions: { provider: 'dynamic-context-fake', model: 'fake-llama' } })
   t.after(() => reopened.dispose())
   const resumed = await readGraphDock(f.h.ctx, reopened.agent)
-  assert.equal(resumed.graph.revision, 2)
+  assert.equal(resumed.graph.revision, planned + 1)
   assert.equal(resumed.graph.active.recoveryRequired, true)
   assert.equal(resumed.graph.active.nodeId, started.graph.active.nodeId)
-  assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(f.h.backend.requests.length, requests)
 })
 
 test('the Web status RPC does not repair an unresolved witness or hide a missing committed graph as empty', async t => {
   const f = await fixture(t), { agent } = await f.agent('web-recovery')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '项目任务' })
-  await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '项目任务' })
+  await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const { graph } = f.h.runner.interaction.entries.get(agent).runner
   const state = graph.read(), witness = graph.store.witness.read()
   graph.store.writeWitness(witness, 'PREPARED', state, state.checksum)
@@ -473,7 +508,7 @@ test('the Web status RPC does not repair an unresolved witness or hide a missing
   assert.equal((await readGraphDock(f.h.ctx, agent)).status, 'unavailable')
   assert.equal(fs.existsSync(graph.store.file), false)
   assert.equal(fs.existsSync(graph.store.witness.file), false)
-  assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(f.h.backend.requests.length, 1)
 })
 
 for (const full of [false, true]) test(`native tool loop reaches ${full ? 'joint direct' : 'original task graph'} execution after human selection`, async t => {
@@ -483,7 +518,7 @@ for (const full of [false, true]) test(`native tool loop reaches ${full ? 'joint
     // A direct worker request has no mode selector; it executes the leaf only.
     if (!payload.tools?.some(row => row.function.name === 'dynamic_context_graph_status')) return { text: 'Scoped leaf result.' }
     step++
-    if (step === 2) return call('dynamic_context_submit', { proposal: full ? runtimeProposal([]) : { taskGraph: runtimeProposal([]).taskGraph } })
+    if (step === 2) return call('dynamic_context_submit', { proposal: full ? rootTask() : { taskGraph: runtimeProposal([]).taskGraph } })
     if (full) return step === 3 ? call('dynamic_context_run_next', { expectedRevision: 1 }) : { text: 'Joint workflow submitted its report.' }
     if (step === 3) return call('transaction_graph_create', { expectedRevision: 0, definition: runtimeProposal([]).taskGraph })
     if (step === 4) return call('transaction_graph_begin', { expectedRevision: 1, choice: 0 })
@@ -513,7 +548,7 @@ for (const full of [false, true]) test(`native tool loop reaches ${full ? 'joint
     const { binding, key } = f.h.ctx.transactionGraph.host.journal(controller.session)
     fs.unlinkSync(path.join(binding.projectRoot, '.dsh', 'transaction-graphs-v4', key, 'transaction-host-journal.json'))
     assert.equal(f.h.runner.interaction.mode(controller), 'recovery')
-    assert.equal((await f.call(controller, 'dynamic_context_select_mode', { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
+    assert.equal((await f.selectMode(controller, { reason: '回退', reconsider: true })).status, 'RECOVERY_REQUIRED')
   }
   assert.equal(f.questions.length, 1)
 })
@@ -531,7 +566,7 @@ test('the native planner receives a usable joint template and specific tool and 
         for (const args of samples) assert.deepEqual(validateJsonSchemaValue(tool.parameters, args, ''), [], tool.name)
       }
       const doc = tools.find(row => row.name === 'dynamic_context_submit').description
-      assert.match(doc, /Leaf tool allowlist for this workflow: \["read","write"/)
+      assert.match(doc, /Unit tool allowlist for this workflow: \["read","write"/)
       accepted = JSON.parse(doc.match(/```json\n([^\n]+)\n```/)[1])
       const denied = structuredClone(accepted)
       denied.proposal.contextGraph.bindings[0].tools = ['fixture_forbidden']
@@ -539,15 +574,15 @@ test('the native planner receives a usable joint template and specific tool and 
     }
     if (step === 3) {
       const feedback = JSON.stringify(payload.messages.at(-1))
-      for (const text of ['CONTEXT_CANNOT_GRANT_TOOL_PERMISSION', 'inspect', 'fixture_forbidden', 'allowedTools']) assert.ok(feedback.includes(text), feedback)
+      for (const text of ['CONTEXT_CANNOT_GRANT_TOOL_PERMISSION', 'root', 'fixture_forbidden', 'allowedTools']) assert.ok(feedback.includes(text), feedback)
       const invalid = structuredClone(accepted)
-      delete invalid.proposal.taskGraph.nodes[1].parent
+      invalid.proposal.taskGraph.nodes.push({ key: 'inspect', label: 'Premature child', parent: 'root', kind: 'leaf' })
       invalid.proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'root', to: 'inspect' })
       return call('dynamic_context_submit', invalid)
     }
     if (step === 4) {
       const feedback = JSON.stringify(payload.messages.at(-1))
-      for (const text of ['PROTOTYPE_REQUIRES_ONE_ROOT_WITH_LEAF_PREREQUISITES', 'leavesNeedingRootParent', 'edgesTouchingRoot', 'inspect']) assert.ok(feedback.includes(text), feedback)
+      for (const text of ['UNIT_ROOT_SEED_REQUIRED']) assert.ok(feedback.includes(text), feedback)
       return call('dynamic_context_submit', accepted)
     }
     return { text: 'The documented template passed graph validation.' }
@@ -559,7 +594,7 @@ test('the native planner receives a usable joint template and specific tool and 
   assert.equal(step, 5)
   const state = f.h.runner.interaction.entries.get(agent).runner.graph.read()
   assert.equal(state.revision, 1)
-  assert.equal(state.graph.state.plan.edges.length, 1)
+  assert.equal(state.graph.state.plan.edges.length, 0)
 })
 
 test('the command-selected full controller dispatches the leaf from its receipt', async t => {
@@ -585,7 +620,7 @@ test('the command-selected full controller dispatches the leaf from its receipt'
     respond({ payload }) {
       const names = payload.tools?.map(row => row.function.name) ?? []
       if (!names.includes('dynamic_context_graph_status')) {
-        assert.deepEqual(names, ['write'])
+        assert.ok(names.includes('write')); assert.ok(!names.includes('bash') && !names.includes('todo_write'))
         if (workerRequests++ === 0) return tools('write', { file_path: 'worker-result.txt', content: 'Written under the committed leaf.' })
         return { text: 'Checked fixture handoff.' }
       }
@@ -594,16 +629,16 @@ test('the command-selected full controller dispatches the leaf from its receipt'
       for (const name of ['todo_write', 'bash', 'write', 'subagent']) assert.ok(!names.includes(name), name)
       assert.ok(names.includes('read'))
       if (step === 2) {
-        assert.match(text(payload, 'user'), /当前等待双图提交/)
-        assert.match(text(payload, 'user'), /基础条件探查/)
-        assert.match(text(payload, 'user'), /未知且不阻止规划的条件可安排为调查叶/)
+        assert.match(text(payload, 'user'), /唯一的根单元/)
+        assert.match(text(payload, 'user'), /既有条件|已有条件/)
+        assert.match(text(payload, 'user'), /尚待验证的内容标作假设/)
         return { tools: ['read', 'todo_write', 'late_fixture_write'].map(name => ({ name, arguments: {} })) }
       }
       if (step === 3) {
         assert.match(text(payload, 'tool'), /executed read/)
         assert.match(text(payload, 'tool'), /DYNAMIC_CONTEXT_CONTROLLER_TOOL_NOT_ALLOWED: todo_write/)
         assert.match(text(payload, 'tool'), /DYNAMIC_CONTEXT_CONTROLLER_TOOL_NOT_ALLOWED: late_fixture_write/)
-        const proposal = runtimeProposal(['write'])
+        const proposal = rootTask(['write'])
         return { tools: [
           { name: 'dynamic_context_submit', arguments: { proposal } },
           { name: 'bash', arguments: {} }, { name: 'write', arguments: {} },
@@ -664,7 +699,7 @@ test('controller identity and committed status survive a two-leaf handoff and a 
     const line = text.split('\n').findLast(line => line.startsWith('{') && line.includes('"standaloneGraphPresence"'))
     return { text, state: JSON.parse(line) }
   }
-  const f = await fixture(t, { respond: ({ payload }) => {
+  const f = await fixture(t, { plan: { keys: ['task','verify'], rules: [{ id: 'after', when: { node: 'task', in: ['PASS'] } }], bindings: { verify: { inheritReports: ['task'] } } }, respond: ({ payload }) => {
     if (!payload.tools?.some(row => row.function.name === 'dynamic_context_graph_status')) {
       workers++
       assert.doesNotMatch(payload.messages[0].content, /你当前是完整模式主会话控制器/)
@@ -677,22 +712,19 @@ test('controller identity and committed status survive a two-leaf handoff and a 
     assert.equal(state.role, 'controller')
     assert.match(text, /legalNext 是可调度候选，不是已启动的叶/)
     if (step === 2) {
-      const proposal = runtimeProposal([])
-      proposal.taskGraph.nodes.push({ key: 'verify', kind: 'leaf', label: 'Compatibility checks', parent: 'root' })
-      proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'task', to: 'verify' })
-      proposal.contextGraph.bindings.push({ task: 'verify', instruction: 'Check the first result.', contexts: [], inheritReports: ['task'], tools: [] })
+      const proposal = rootTask()
       const desc = payload.tools.find(row => row.function.name === 'dynamic_context_submit').function.description
-      assert.match(desc, /Submission only commits the plan/)
+      assert.match(desc, /唯一的根单元/)
       return call('dynamic_context_submit', { proposal })
     }
     assert.equal(state.status.taskGraph.active, null)
     assert.doesNotMatch(text, /当前等待双图提交/)
-    if (step === 3 || step === 5) {
-      assert.equal(state.status.revision, step === 3 ? 1 : 3)
+    if ([3,4,6].includes(step)) {
+      assert.equal(state.arguments.expectedRevision, state.status.revision)
       return call(state.nextTool, state.arguments)
     }
-    assert.equal(state.status.reportStates.length, step === 4 ? 1 : 2)
-    return { text: step === 4 ? 'First leaf report recorded; waiting for the next user turn in this fixture.' : 'Both leaf reports recorded; semantic acceptance remains independent.' }
+    assert.equal(state.status.reportStates.length, step === 5 ? 1 : 2)
+    return { text: step === 5 ? 'First leaf report recorded; waiting for the next user turn in this fixture.' : 'Both leaf reports recorded; semantic acceptance remains independent.' }
   } })
   const { agent } = await f.agent('serial-role-handoff', null)
   const followup = text => agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
@@ -704,35 +736,35 @@ test('controller identity and committed status survive a two-leaf handoff and a 
   await agent.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
   assert.equal(workers, 2)
-  assert.equal(step, 6)
+  assert.equal(step, 7)
   assert.equal(f.questions.length, 1)
   const runner = f.h.runner.interaction.entries.get(agent).runner
-  assert.equal(runner.status().revision, 5)
+  assert.equal(runner.status().taskGraph.rootOutcome, 'PASS')
   assert.equal(runner.graph.read().reports.length, 2)
   assert.deepEqual(runner.status().taskGraph.legalNext, [])
   assert.equal(runner.status().semanticAcceptance, 'NOT_EVALUATED')
   assert.deepEqual(agent.session.snapshotEvents().filter(row => row.type === 'tool/call').map(row => row.data.name),
-    ['dynamic_context_submit', 'dynamic_context_run_next', 'dynamic_context_run_next'])
+    ['dynamic_context_submit', 'dynamic_context_run_next', 'dynamic_context_run_next', 'dynamic_context_run_next'])
 })
 
 test('the advertised shared proposal actually binds the fact and hands its update to the next worker', async t => {
   const read = 'dynamic_context_shared_read', update = 'dynamic_context_shared_update'
   let requests = 0, sharedId
-  const f = await fixture(t, { config: { allowedTools: [read, update] }, respond: ({ payload }) => {
+  const f = await fixture(t, { plan: { keys: ['inspect','finish'], rules: [{ id: 'after', when: { node: 'inspect', in: ['PASS'] } }], bindings: { inspect: { tools: [read,update] }, finish: { tools: [read], inheritReports: ['inspect'] } } }, config: { allowedTools: [read, update] }, respond: ({ payload }) => {
     const names = payload.tools?.map(row => row.function.name) ?? []
     assert.ok(!names.includes('dynamic_context_submit'))
     const seed = JSON.parse(payload.messages[1].content.split('\n\n').at(-1))
-    const fact = seed.contexts.find(row => row.key === 'shared_fact')
+    const fact = seed.contexts.find(row => row.key === 'shared')
     assert.ok(fact)
     requests++
     if (requests === 1) {
       sharedId = fact.id
-      assert.notEqual(sharedId, 'shared_fact')
+      assert.notEqual(sharedId, 'shared')
       assert.ok(names.includes(update))
       return { tools: [{ name: update, arguments: { id: sharedId, content: 'The inspected input is ready.', reason: 'The bound input records readiness.' } }] }
     }
     if (requests === 2) {
-      const result = JSON.parse(payload.messages.at(-1).content)
+      const result = JSON.parse(payload.messages.findLast(row => row.role === 'tool').content.split('</host-receipt>\n').at(-1))
       assert.equal(result.status, 'APPLIED')
       assert.equal(result.revision, 2)
       return { text: 'Inspected input and published the shared fact.' }
@@ -740,18 +772,19 @@ test('the advertised shared proposal actually binds the fact and hands its updat
     assert.equal(fact.id, sharedId)
     assert.equal(fact.content, 'The inspected input is ready.')
     assert.equal(fact.revision, 2)
-    assert.deepEqual(names, [read])
+    assert.ok(names.includes(read)); assert.ok(!names.includes(update))
     assert.match(JSON.stringify(seed.inheritedReports), /Inspected input and published/)
     return { text: 'Delivered from the current shared fact and predecessor report.' }
   } })
   const { agent } = await f.agent('shared-template')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '分阶段处理并交接可变事实' })
+  await f.selectMode(agent, { reason: '分阶段处理并交接可变事实' })
   const schemas = f.h.ctx.tools.schemas(agent)
   assert.ok(!schemas.some(row => [read, update].includes(row.name)))
   const description = schemas.find(row => row.name === 'dynamic_context_submit').description
   const { proposal } = JSON.parse([...description.matchAll(/```json\n([^\n]+)\n```/g)][0][1])
   const submitted = await f.call(agent, 'dynamic_context_submit', { proposal })
-  const first = await f.call(agent, submitted.nextTool, submitted.arguments)
+  const plan = await f.call(agent, submitted.nextTool, submitted.arguments)
+  const first = await f.call(agent, 'dynamic_context_run_next', { expectedRevision: plan.revision, choice: 0 })
   assert.equal(first.status.reportStates.length, 1)
   const second = await f.call(agent, 'dynamic_context_run_next', { expectedRevision: first.revision, choice: 0 })
   assert.equal(second.status.reportStates.length, 2)
@@ -770,14 +803,14 @@ test('the full-mode receipt and tool gate respect the native planning boundary',
     })
   } })
   const { agent } = await f.agent('plan-only')
-  await f.call(agent, 'dynamic_context_select_mode', { reason: '先规划项目' })
-  const submitted = await f.call(agent, 'dynamic_context_submit', { proposal: runtimeProposal([]) })
+  await f.selectMode(agent, { reason: '先规划项目' })
+  const submitted = await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   assert.equal(submitted.revision, 1)
   assert.equal(submitted.nextTool, undefined)
   const blocked = await executeFixtureTool(f.h.ctx, { agent, name: 'dynamic_context_run_next', arguments: { expectedRevision: 1 },
     callId: 'before-plan-approval', signal: new AbortController().signal })
   assert.match(blocked.error?.message, /DYNAMIC_CONTEXT_PLAN_MODE_ACTIVE/)
-  assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(f.h.backend.requests.length, 1)
   agent.session.append('plan/mode', { active: false })
   const ran = await executeFixtureTool(f.h.ctx, { agent, name: 'dynamic_context_run_next', arguments: { expectedRevision: 1 },
     callId: 'after-plan-approval', signal: new AbortController().signal })
@@ -786,17 +819,17 @@ test('the full-mode receipt and tool gate respect the native planning boundary',
 })
 
 test('settings are snapshotted on explicit activation and never rewrite an existing workflow', async t => {
-  const f = await fixture(t, { config: { direct: { api: 'deepseek' } } })
+  const f = await fixture(t, { config: { workflowLimits: { maxDepth: 35 }, direct: { api: 'deepseek' } } })
   let settings = { reasoningEffort: 'high', maxGroupDepth: 5 }
   f.h.runner.preferences = () => structuredClone(settings)
   const first = (await f.agent('settings-first')).agent
   await f.h.runner.interaction.set(first, 'full', { source: 'human-question' })
   const runner = f.h.runner.interaction.entries.get(first).runner
-  assert.equal(runner.config.direct.reasoningEffort, 'high'); assert.equal(runner.config.hierarchy.maxGroupDepth, 5)
+  assert.equal(runner.config.direct.reasoningEffort, 'high'); assert.equal(runner.config.workflowLimits.maxDepth, 35)
   settings = { reasoningEffort: 'low', maxGroupDepth: 2 }
   await f.h.runner.interaction.unmount(first)
   const restored = f.h.runner.interaction.mount(first, f.h.runner.interaction.record(first))
-  assert.equal(restored.config.direct.reasoningEffort, 'high'); assert.equal(restored.config.hierarchy.maxGroupDepth, 5)
+  assert.equal(restored.config.direct.reasoningEffort, 'high'); assert.equal(restored.config.workflowLimits.maxDepth, 35)
   const second = (await f.agent('settings-second')).agent
   await f.h.runner.interaction.set(second, 'full', { source: 'human-question' })
   assert.equal(f.h.runner.interaction.entries.get(second).runner.config.direct.reasoningEffort, 'low')

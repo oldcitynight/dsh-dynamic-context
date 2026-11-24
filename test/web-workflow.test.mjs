@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { startWorkflowWeb, until } from '../testing/web-workflow-harness.mjs'
-import { runtimeProposal } from '../testing/runtime-harness.mjs'
+import { rootTask, unitReport } from '../testing/unit-proposal.mjs'
 
 const names = payload => (payload.tools ?? []).map(row => row.function.name)
 const callTool = (name, args) => ({ tools: [{ name, arguments: args }] })
@@ -18,13 +18,13 @@ test('real Web displays live planning/leaf reasoning, native terminal receipts, 
   const h = await startWorkflowWeb({ respond: ({ payload }) => {
     if (payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1'))) {
       if (++plans === 1) return slow('planning-live', 'bash', { command: 'printf "terminal-fixture-ok\\n"', description: 'Read synthetic foundational condition' })
-      return callTool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+      return callTool('dynamic_context_submit', { proposal: rootTask(['write']) })
     }
     if (names(payload).includes('dynamic_context_graph_status')) {
       return { text: 'Done.' }
     }
     if (++workers === 1) return slow('worker-live', 'write', { file_path: 'result.txt', content: 'One result.' })
-    return { reasoning: 'Check the saved result.', text: 'The result is saved.' }
+    return { reasoning: 'Check the saved result.', text: JSON.stringify(unitReport('The result is saved.')) }
   } })
   t.after(() => h.stop())
   const { sessionId } = await h.call('session/create', { cwd: h.workspace })
@@ -48,11 +48,11 @@ test('real Web displays live planning/leaf reasoning, native terminal receipts, 
   const final = await output()
   const projections = () => h.call('session/projections', { sessionId })
   // The root's native completion receipt can follow the workflow-complete event.
-  const totals = await until(projections, result => result.values.tokenUsage.outputTokens + result.values.dynamicContextPerformance.usage.outputTokens === 30, 'all request usage receipts')
+  const totals = await until(projections, result => result.values.tokenUsage.outputTokens + result.values.dynamicContextPerformance.usage.outputTokens === 70, 'all request usage receipts')
   const requests = h.backend.requests.length
-  assert.equal(totals.values.dynamicContextPerformance.requests, 4, 'both planning and both direct requests are included')
-  assert.equal(totals.values.dynamicContextPerformance.stats.steps, 4)
-  assert.equal(totals.values.tokenUsage.outputTokens + totals.values.dynamicContextPerformance.usage.outputTokens, 30)
+  assert.equal(totals.values.dynamicContextPerformance.requests, 8, 'includes planning, root review, routing, execution, acceptance and reporting')
+  assert.equal(totals.values.dynamicContextPerformance.stats.steps, 8)
+  assert.equal(totals.values.tokenUsage.outputTokens + totals.values.dynamicContextPerformance.usage.outputTokens, 70)
   assert.equal(totals.values.dynamicContextPerformance.missingUsage, 1, 'direct requests without a usage receipt are unknown; native adapter zero samples retain native semantics')
   assert.ok(final.items.some(row => row.kind === 'tool' && row.title === 'write' && row.state === 'complete'))
   assert.ok(!JSON.stringify(final).includes('DYNAMIC_CONTEXT_PREPLANNER_V1'), 'system instructions never cross the display port')
@@ -71,13 +71,13 @@ test('real Web RPC exposes planning, pauses, rejects cross-session control and r
   const h = await startWorkflowWeb({ respond: async ({ payload }) => {
     if (payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1'))) {
       if (++plans === 1) { planning.resolve(); await release.promise; return callTool('read', { file_path: 'probe.txt' }) }
-      return callTool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+      return callTool('dynamic_context_submit', { proposal: rootTask(['write']) })
     }
     if (names(payload).includes('dynamic_context_graph_status')) {
       return { text: 'Done.' }
     }
     if (++workers === 1) return callTool('write', { file_path: 'result.txt', content: 'Produced once.' })
-    return { text: 'The result is saved.' }
+    return { text: JSON.stringify(unitReport('The result is saved.')) }
   } })
   t.after(() => h.stop())
   fs.writeFileSync(path.join(h.workspace, 'probe.txt'), 'Foundational condition available.')
@@ -112,13 +112,13 @@ test('real Web Continue keeps a failed executor in its workflow without starting
   let leaves = 0, controllers = 0
   const h = await startWorkflowWeb({ respond: ({ payload }) => {
     if (payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1')))
-      return callTool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+      return callTool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (names(payload).includes('dynamic_context_graph_status')) {
       controllers++
       return { text: 'Native controller request.' }
     }
     if (++leaves <= 2) return { disconnect: true }
-    return { text: 'Completed the retained leaf.' }
+    return { text: JSON.stringify(unitReport('Completed the retained leaf.')) }
   } })
   t.after(() => h.stop())
   const { sessionId } = await h.call('session/create', { cwd: h.workspace })
@@ -143,13 +143,13 @@ test('real Web resumes an unexpectedly killed preplanner without silently starti
   const h = await startWorkflowWeb({ respond: ({ payload }) => {
     if (payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1'))) {
       if (++plans === 1) return { hang: true }
-      return callTool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+      return callTool('dynamic_context_submit', { proposal: rootTask(['write']) })
     }
     if (names(payload).includes('dynamic_context_graph_status')) {
       return { text: 'Done.' }
     }
     if (++workers === 1) return callTool('write', { file_path: 'result.txt', content: 'Produced once.' })
-    return { text: 'The result is saved.' }
+    return { text: JSON.stringify(unitReport('The result is saved.')) }
   } })
   t.after(() => h.stop())
   const { sessionId } = await h.call('session/create', { cwd: h.workspace })

@@ -2,18 +2,36 @@
 
 Direct 执行器默认将原生工具的失败结果交给当前 Agent。失败不是成功证明，也不证明没有副作用；宿主不自动重试。原始展示文本、`isError`、结构化 `error`、`meta` 和可用的 `value` 保留在执行证据中。Messages API 使用原生 `is_error`，Chat Completions 将错误信息保留在工具内容中，不发送非标准 `isError` 消息字段。
 
+## 配置文件与整工具规则
+
+随包黑名单在 [policies/tool-errors.json](./policies/tool-errors.json)。`rolePolicyFile` 中的 `toolErrors` 支持 `mode`、`includeDefaults` 和 `rules`。手动加入一个工具名即可匹配该工具报告的全部错误。也可以填写 `toolId`、`errorCode`、`errorType`、`when` 和可选 `role`。省略角色覆盖所有适用角色。错误类型匹配结构化异常名或类型，错误码匹配结构化 code，同时填写时两者都须匹配。普通成功回执继续执行。原生错误标志、结构化错误以及工具显式返回的 `{status:"ERROR"}` 或 `{error:…}` 可识别为失败。已有 `when` 规则也可以明确指认封装在成功结果中的故障。
+
+默认 `mode: "blacklist"` 将命中的错误交给任务图暂停，其余错误连同原工具回执交给当前角色。`mode: "whitelist"` 将未列入白名单的错误交给任务图暂停。文件条目默认加入当前模式的名单，插件通过查询得到的登记入口加入该名单。同一工具 ID 先选最高 `priority` 再匹配错误条件，同优先级的暂停决定优先。省略优先级按 0 处理。`includeDefaults: false` 可去掉随包规则。暂停记录包含工具、角色、调用身份、匹配规则和原因。
+
+```json
+{
+  "version": 1,
+  "toolErrors": {
+    "mode": "blacklist",
+    "rules": ["archive_commit", { "toolId": "archive_read", "errorType": "StorageError", "errorCode": "E_IO" }]
+  }
+}
+```
+
 ## 注册协议
 
-提供 Cordis 服务 `dynamicContextToolErrors`，以及导出 `dsh-dynamic-context/tool-error-policy`。注册接口仅供宿主插件使用，不开放为 Agent 工具。
+插件通过 Cordis 服务 `dynamicContextToolPolicies` 查询当前策略和登记规则。底层 `dynamicContextToolErrors` 仍提供兼容接口与规则快照。
 
 ```js
 export const name = 'my-storage-plugin-policy'
-export const inject = ['dynamicContextToolErrors']
+export const inject = ['tools', 'dynamicContextToolPolicies']
 export function apply(ctx) {
-  ctx.effect(() => ctx.get('dynamicContextToolErrors').register({
+  const toolId = ctx.tools.get('my_storage_read').name
+  const target = ctx.get('dynamicContextToolPolicies').forTool(toolId).getStrategy({ target: 'toolErrors' })
+  if (target.mode === 'blacklist') ctx.effect(() => target.register({
     pluginId: 'my-storage-plugin',
-    ruleId: 'unrecoverable-store-error',
-    toolId: 'my_storage_read',
+    registrationId: 'unrecoverable-store-error',
+    priority: 20,
     when: {
       '/isError': true,
       '/error/info/code': 'STORE_CORRUPTED',
@@ -25,8 +43,8 @@ export function apply(ctx) {
 ```
 
 - `toolId` 为 DSH 工具注册表中的内部 `definition.name`，不是界面标题、单次 `callId` 或执行 token。Direct 另行固定并核对实际工具定义与执行身份。
-- `(pluginId, ruleId)` 唯一，重复注册报错；`register()` 返回只撤销本条注册的幂等函数。其他插件通过 `ctx.effect` 关联其生命周期。
-- `when` 是参数键值表，键为 JSON Pointer，只能指向原生结果的 `isError`、`error`、`value`、`meta`。所有条件必须同时按类型和值精确匹配。一个条件的多个候选值应分别登记多条规则；任一规则命中即阻塞。
+- `(pluginId, registrationId)` 标识一条联动声明，底层错误快照将其记作 `ruleId`。`register()` 返回只撤销本条声明的幂等函数，插件可用 `ctx.effect` 管理其生命周期。
+- `when` 以 JSON Pointer 精确匹配工具结果的 `isError`、`error`、`value`、`meta` 字段。一个对象内的条件须同时满足。多个候选值可登记在同一优先级的多条规则中。
 - 支持字符串、有限数字、布尔、null；缺失字段不等于 null。不支持通配工具名、前缀、子串、正则、任意回调或按渲染文本猜测错误代码。禁止原型链路径。原生异常若没有结构化 code，可用精确 `/error/message`；稳定的错误 code 更适合长期维护。
 - 工具也可能以成功封装返回故障状态，例如 `/value/sandbox/runnerFailed`。因此规则不隐式要求 `isError=true`；需要时显式填写该条件。
 - `pluginId` 是可信宿主插件的归属标签，不是对插件包身份的安全认证。保留的原生规则命名空间不能被外部注册覆盖。
@@ -40,7 +58,7 @@ export function apply(ctx) {
 
 以下属于宿主控制或执行完整性故障，仍独立停止：用户取消，执行身份/工具定义被替换，嵌套派发，借工具绕过独立模型通道，运行中权限与指令发生变化，隔离完整性失效，以及可信检查点、证据哈希、日志写入故障。这些由实际宿主校验点裁定；第三方工具只是返回同名字串，不会因此升级为宿主故障。普通工具错误也不会获得权限放行。
 
-本服务作用于 Direct 委托的原生和注册工具。规划器、报告编辑/证据工具及旧 `native-guarded` 对照通道保留各自的协议校验；本服务不将这些不同协议的校验伪装为普通执行工具结果，也不改写模型审计结论。
+控制器、预规划、执行、返工、辅助角色与压缩均按实际工具回执执行错误策略。各入口继续独立校验宿主权限、角色输出与状态转换。
 
 ## 命中后的状态与恢复
 

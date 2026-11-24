@@ -125,3 +125,26 @@ test('hierarchical roles and their compaction participate in the same native per
   assert.equal(state.view.stats.decodeTokens/(state.view.stats.decodeMs/1000),20)
   assert.equal(performanceProjection('contextPressure',null,state.view).contextWindow,1000000)
 })
+
+test('a direct request without a native request header gets the exact model window only once', async () => {
+  let lookups = 0
+  const session = Session.create('direct-without-native-model-header')
+  const monitor = new RequestPerformance({
+    sessions: { get: () => session, flush: async () => {} },
+    llm: { resolveModelInfo: async (provider, model) => {
+      assert.deepEqual([provider, model], ['fixture', 'exact'])
+      lookups++
+      return { context: { contextWindow: 32768 } }
+    } }
+  })
+  const meta = { config: { provider: 'fixture', model: 'exact', direct: {} }, payload: { messages: [] } }
+  for (let i=0;i<2;i++) monitor.direct({session}, 'request-'+i, meta).end('complete')
+  await new Promise(resolve => setImmediate(resolve))
+  const samples = session.snapshotEvents().filter(event => event.type === PERFORMANCE_EVENT).map(event => event.data.sample)
+  for (let i=0;i<2;i++) {
+    const last = samples.findLast(row => row.id === 'request-'+i)
+    assert.equal(last.contextWindow, 32768)
+    assert.equal(last.state,'complete')
+  }
+  assert.equal(lookups,1)
+})

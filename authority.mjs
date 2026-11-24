@@ -26,6 +26,21 @@ export function matchesHistoricalAuthority(session, expected, current, hash) {
   if (hash(current) === expected) return true
   for (const input of guidanceInputVariants(session, current.input ?? [])) if (hash({ ...current, input }) === expected) return true
   const events = session.snapshotEvents(), retained = digest(authorityInputs(session))
+  // A command may start a worker before DSH materializes its mirrored human message and first generated system prompt.
+  // Only the exact recorded echo and that first assembled system message can be absent at the saved boundary.
+  for (const delivery of events.filter(row => row.ignorable && row.type === 'plugin:dynamic-context/command-delivery-v2')) {
+    const stamp = delivery.data
+    const command = events.find(row => row.type === 'command/run' && row.data.commandId === stamp.commandId && row.data.name === 'task-graph' && row.data.source?.kind === 'user')
+    if (!command) continue
+    const input = current.input ?? [], echo = input.find(row => row.id === stamp.messageId && row.role === 'user' && row.source?.kind === 'user')
+    if (echo && (digest(echo.content) !== stamp.contentHash || digest([{ type: 'text', text: command.data.args.trim() }]) !== stamp.contentHash)) continue
+    const delivered = input.filter(row => row !== echo)
+    if (hash({ ...current, input: delivered }) === expected) return true
+    if (!stamp.hasSystem) {
+      const firstSystem = delivered.find(row => row.role === 'system' && row.source?.kind === 'system-prompt')
+      if (firstSystem && hash({ ...current, input: delivered.filter(row => row !== firstSystem) }) === expected) return true
+    }
+  }
   for (let count = events.length; count >= 0; count--) {
     const prefix = Session.create(session.id, events.slice(0, count), session.header, Math.min(session.inheritedEventCount ?? 0, count))
     if (digest(authorityInputs(prefix)) !== retained) continue

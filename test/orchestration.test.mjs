@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { withBlockageReports } from '../testing/blockage-reports.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -12,24 +13,66 @@ import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { appendPluginRecord } from '@deepseek-ai/dsh-session'
+import TaskGraph from 'dsh-better-task-grapth'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
+import { rootTask, unitBackend, enterPlan, reviewRoot } from '../testing/unit-proposal.mjs'
 import { MODE_OPTIONS } from '../interaction.mjs'
 import { EXECUTION_OPTIONS, LIFECYCLE_RECORD } from '../orchestration.mjs'
-import { PLANNING_TOOLS } from '../preplanning.mjs'
+import { PLANNING_TOOLS, plannerAnswerSnapshot, plannerSubmissionReceipt } from '../preplanning.mjs'
+import { readSnapshot } from '../context-budget.mjs'
 import { guidanceRecords } from '../guidance-state.mjs'
+import { monitorHotPath } from '../testing/hot-path-probe.mjs'
+import { watchValidation } from '../testing/validation-probe.mjs'
+import BasicCompaction from '@deepseek-ai/dsh-compaction-basic'
+import { startFakeLlama } from '../testing/fake-llama.mjs'
 
 const names = payload => (payload.tools ?? []).map(row => row.function.name)
+
+test('controller handoff carries only answered planning questions before commit, with a paged original when large', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'planner-clarifications-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const runner = { config: { directory } }
+  const call = (seq, callId, name, questions) => ({ seq, type: 'tool/call', data: { callId, name, arguments: JSON.stringify({ questions }) } })
+  const result = (seq, callId, value, isError = false) => ({ seq, type: 'tool/result', data: {
+    message: { source: { callId }, isError, content: [{ type: 'text', text: JSON.stringify(value) }] } } })
+  const questions = [{ id: 'units', question: 'Which units?' }, { id: 'colour', question: 'Which colour?' }]
+  const answer = { answers: [{ id: 'units', selected: ['boxes'], custom: 'Use full boxes' }, { id: 'colour', selected: [] },
+    { id: 'unknown', selected: ['unrelated'] }] }
+  const events = [call(1, 'shell', 'bash', questions), result(2, 'shell', answer),
+    call(3, 'waiting', 'ask_user_question', questions), result(4, 'waiting', { pending: true }),
+    call(5, 'error', 'ask_user_question', questions), result(6, 'error', answer, true),
+    call(7, 'asked', 'ask_user_question', questions), result(8, 'asked', answer),
+    call(11, 'late', 'ask_user_question', questions), result(12, 'late', answer)]
+  assert.equal(plannerSubmissionReceipt(runner, 'planner', events, 7).clarifications, undefined)
+  assert.deepEqual(plannerAnswerSnapshot(runner, events.slice(0, 8)), plannerSubmissionReceipt(runner, 'planner', events, 10).clarifications)
+  const receipt = plannerSubmissionReceipt(runner, 'planner', events, 10)
+  assert.deepEqual(receipt.clarifications, { answers: [{ callId: 'asked', questionId: 'units', question: 'Which units?',
+    selected: ['boxes'], custom: 'Use full boxes' }] })
+  answer.answers[0].custom = '甲乙'.repeat(6000)
+  events[7] = result(8, 'asked', answer)
+  runner.config.dynamicContextMaxBytes = 1024
+  const paged = plannerSubmissionReceipt(runner, 'planner', events, 10).clarifications
+  assert.equal(paged.answers, undefined)
+  const reader = paged.materialSummary.reader
+  assert.equal(reader.tool, 'dynamic_context_status')
+  const original = readSnapshot(runner, 'controller', { ...reader.arguments, length: 20000 })
+  assert.equal(JSON.parse(original.text).answers[0].custom, answer.answers[0].custom)
+})
 const isPlanner = payload => payload.messages.some(row => row.role === 'system' && row.content.includes('DYNAMIC_CONTEXT_PREPLANNER_V1'))
 const isController = payload => names(payload).includes('dynamic_context_graph_status')
 const tool = (name, args) => ({ tools: [{ name, arguments: args }] })
 const user = text => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
-// Existing scenarios exercise the legacy protocol deliberately; new acceptance
-// cases override preplanningAcceptance=true and submit an explicit v1 plan.
-async function fixture(t, { respond, choice = 'full', after = 'auto_start', setup, config = {}, outsideTemp = false } = {}) {
+const nativeProfile = (backend, id) => ({ displayName: id, api: 'openai-completions', baseURL: backend.origin + '/v1',
+  apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY', defaultContextWindow: 8192, defaultMaxTokens: 512,
+  models: [{ id, name: id, contextWindow: 8192, maxTokens: 512 }] })
+const nativeSummary = (ctx, agent) => ctx.compaction.summarize({ messages: [user('Fixture evidence for a checkpoint.')] }, agent, new AbortController().signal)
+const nativeCompactor = ctx => ctx.plugin(BasicCompaction, { auto: false, summarizationProvider: 'dynamic-context-fake', summarizationModel: 'fake-llama' })
+// Lifecycle fixtures drive the role under test and supply independent replies for routine v2 reviews.
+async function fixture(t, { respond, choice = 'full', after = 'auto_start', setup, providers, config = {}, outsideTemp = false, autoDecisions = true, plan } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(outsideTemp ? os.homedir() : os.tmpdir(), 'managed-workflow-')))
   const projectRoot = path.join(root, 'project'); fs.mkdirSync(projectRoot)
   const handles = [], questions = []
-  const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), respond,
+  const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), respond: respond && autoDecisions ? unitBackend(respond, { supervise: config.supervision, plan }) : respond, providers,
     config: { interaction: { mode: 'interactive' }, storageRoot: root, exposeControlTools: true, preplanningAcceptance: false, ...config },
     setup: async ctx => {
       await ctx.plugin(UserQuestions); await ctx.plugin(Commands)
@@ -69,7 +112,12 @@ test('ordinary discussion keeps native tools and cannot activate graphs through 
     if (step === 1) return tool('dynamic_context_select_mode', { reason: 'A large project.' })
     if (step === 2) return tool('dynamic_context_route_task', { route: 'project', reason: 'A large project.' })
     if (step === 3) {
-      assert.match(JSON.stringify(payload.messages), /DYNAMIC_CONTEXT_COMMAND_REQUIRED/)
+      const refusals = payload.messages.filter(row => row.role === 'tool')
+      assert.equal(refusals.length, 2)
+      for (const message of refusals) {
+        assert.match(message.content, /DYNAMIC_CONTEXT_COMMAND_REQUIRED/)
+        assert.match(message.content, /开发中暂不可用/)
+      }
       return tool('bash', { command: 'pwd', description: 'Inspect for discussion' })
     }
     return { text: 'Only discussion and the requested inspection.' }
@@ -79,6 +127,14 @@ test('ordinary discussion keeps native tools and cannot activate graphs through 
     for (const name of ['bash', 'todo_write']) agentCtx.tools.register(defineTool({ name, description: 'Mock native tool',
       parameters: { command: { type: 'string' } }, output: { schema: { type: 'string' }, render: (_a, value) => [{ type: 'text', text: value }] }, execute: () => { effects++; return 'OK' } }))
   })
+  for (const [name, args] of [
+    ['dynamic_context_route_task', { route: 'native', reason: 'local check' }],
+    ['dynamic_context_route_task', { route: 'project', reason: 'project work' }],
+    ['dynamic_context_select_mode', { reason: 'project work' }],
+  ]) {
+    assert.match(f.h.ctx.tools.get(name, agent).description, /开发中暂不可用/)
+    await assert.rejects(async () => f.call(agent, name, args), { code: 'DYNAMIC_CONTEXT_COMMAND_REQUIRED', message: /开发中暂不可用/ })
+  }
   agent.followup(user('这是一个大型项目；先讨论，暂不规划。')); await agent.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
   assert.equal(effects, 1); assert.equal(f.questions.length, 0)
@@ -96,7 +152,7 @@ test('delayed human activation carries earlier discussion into the planner as ev
       assert.ok(names(payload).includes('dynamic_context_planning_history'))
       if (++planning === 1) return tool('dynamic_context_planning_history', { action: 'search', query: 'VISIBLE_EARLIER_PROPOSAL' })
       assert.match(payload.messages.findLast(row => row.role === 'tool').content, /assistant/)
-      return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      return tool('dynamic_context_submit', { proposal: rootTask() })
     }
     return { text: 'VISIBLE_EARLIER_PROPOSAL: a staged blueprint, pending user agreement.' }
   } })
@@ -109,26 +165,52 @@ test('delayed human activation carries earlier discussion into the planner as ev
   assert.equal(planning, 2); assert.equal(f.status(agent).phase, 'WAITING_PLAN_APPROVAL')
 })
 
+test('one status call shares the verified graph and cannot publish a prepared witness', async t => {
+  const f = await fixture(t, { after: 'await_approval', respond: ({ payload }) => isPlanner(payload)
+    ? tool('dynamic_context_submit', { proposal: rootTask() }) : { text: 'Waiting for approval.' } })
+  const agent = await f.agent('matched-graph-status')
+  await f.h.ctx.commands.execute(agent, '/task-graph Prepare a scoped report.', [], new AbortController().signal)
+  await agent.whenIdle()
+  const service = f.h.ctx.transactionGraph, graph = f.runner(agent).graph
+  const status = () => TaskGraph.prototype.status.call({
+    ctx: { get: () => ({ resolveAgent: async () => ({ agent }) }) },
+    host: service.host, workflows: service.workflows,
+  }, { sessionId: agent.session.id })
+  const stop = watchValidation(t, graph.store, 'inspect', { label: 'Web task graph status snapshot', maxCalls: 1 })
+  const {value:current}=await monitorHotPath('poll linked graph and workflow activity',status,{diagnostic:t.diagnostic.bind(t)})
+  assert.equal(stop(), 1)
+  assert.equal(current.status, 'ready')
+  assert.equal(current.graph.revision, 1)
+  assert.equal(current.execution.phase, 'WAITING_PLAN_APPROVAL')
+
+  const state = graph.read()
+  graph.store.writeWitness(graph.store.witness.read(), 'PREPARED', state, state.checksum)
+  const witness = graph.store.witness
+  const readWitnessBytes = () => witness.db ? witness.db.read('graph/witness') : fs.readFileSync(witness.file)
+  const evidence = readWitnessBytes()
+  const unavailable = await status()
+  assert.equal(unavailable.status, 'unavailable')
+  assert.equal(unavailable.execution.state, 'blocked')
+  assert.deepEqual(readWitnessBytes(), evidence)
+})
+
 test('independent preplanning opens real Bash, repairs a proposal in-place, ends at commit and program-dispatches two leaves', async t => {
   let planning = 0, workers = 0, rootRequests = 0
   const extension = 'scoped_media'
-  const proposal = runtimeProposal(['read_image', extension])
-  proposal.taskGraph.nodes.push({ key: 'second', kind: 'leaf', label: 'Second stage', parent: 'root' })
-  proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'task', to: 'second' })
-  proposal.contextGraph.bindings.push({ task: 'second', instruction: 'Check the preceding result.', contexts: [], tools: [], inheritReports: ['task'] })
-  const f = await fixture(t, { setup: ctx => ctx.plugin(LocalAttachmentStore, { dshHome: ctx.workingDirectory.defaultDirectory }), respond: ({ payload }) => {
+  const proposal = rootTask()
+  const f = await fixture(t, { plan: { keys: ['task','second'], rules: [{ id: 'inherit', when: { node: 'task', in: ['PASS'] } }], bindings: { task: { tools: ['read_image', extension] }, second: { inheritReports: ['task'] } } }, setup: ctx => ctx.plugin(LocalAttachmentStore, { dshHome: ctx.workingDirectory.defaultDirectory }), respond: ({ payload }) => {
     if (isPlanner(payload)) {
       planning++
       assert.ok(names(payload).includes('bash'))
       assert.ok(names(payload).every(name => PLANNING_TOOLS.has(name)))
-      assert.match(payload.messages.find(row => row.role === 'system').content, /"leafAllowedTools":\[[^\]]*"read_image"/)
-      assert.match(payload.messages.find(row => row.role === 'system').content, /"leafAllowedTools":\[[^\]]*"scoped_media"/)
+      assert.match(payload.messages.find(row => row.role === 'system').content, /"unitAllowedTools":\[[^\]]*"read_image"/)
+      assert.match(payload.messages.find(row => row.role === 'system').content, /"unitAllowedTools":\[[^\]]*"scoped_media"/)
       assert.match(payload.tools.find(row => row.function.name === 'dynamic_context_submit').function.description,
-        /Leaf tool allowlist for this workflow: \[[^\]]*"scoped_media"/)
+        /Unit tool allowlist for this workflow: \[[^\]]*"scoped_media"/)
       assert.doesNotMatch(JSON.stringify(payload.messages), /UNRELATED_GLOBAL_CONTEXT_MUST_NOT_LEAK|PARENT_TOOL_NOISE/)
       assert.match(JSON.stringify(payload.messages), /USER_EXACT_TASK/)
       assert.match(payload.messages.find(row => row.role === 'system').content, /DYNAMIC_CONTEXT_PLANNING_EXPLORATION_V1/)
-      assert.match(payload.messages.find(row => row.role === 'system').content, /不同可行方案/)
+      assert.match(payload.messages.find(row => row.role === 'system').content, /根单元/)
       if (planning === 1) return tool('bash', { command: 'pwd', description: 'Inspect basic task location' })
       if (planning === 2) { assert.match(payload.messages.findLast(row => row.role === 'tool').content, /project/); return tool('dynamic_context_submit', { proposal: {} }) }
       assert.equal(planning, 3)
@@ -158,7 +240,7 @@ test('independent preplanning opens real Bash, repairs a proposal in-place, ends
   assert.deepEqual({ planning, workers, rootRequests }, { planning: 3, workers: 2, rootRequests: 1 }, JSON.stringify(f.status(agent)))
   assert.equal(f.status(agent).phase, 'COMPLETE')
   assert.equal(f.runner(agent).graph.read().reports.length, 2)
-  assert.equal(f.questions.length, 2)
+  assert.deepEqual(f.questions.map(q => q.questions[0].id), ['dynamic-context-execution'])
   assert.equal(fs.existsSync(path.join(f.projectRoot, 'should-not-exist')), false)
   const human = agent.session.deriveMessages().filter(row => row.source?.kind === 'user')
   assert.deepEqual(human.map(row => row.content.map(b => b.text).join('')), ['USER_EXACT_TASK'])
@@ -168,7 +250,7 @@ test('independent preplanning opens real Bash, repairs a proposal in-place, ends
 test('await-approval performs no leaf request until the current committed graph is approved', async t => {
   let workers = 0
   const f = await fixture(t, { after: 'await_approval', respond: ({ payload }) => isPlanner(payload)
-    ? tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+    ? tool('dynamic_context_submit', { proposal: rootTask() })
     : isController(payload) ? { text: 'Current phase observed.' } : (workers++, { text: 'A worker report.' }) })
   const agent = await f.agent('approval-flow')
   await f.h.ctx.commands.execute(agent, '/task-graph Plan a staged task', [], new AbortController().signal)
@@ -196,7 +278,7 @@ test('an unanswered execution preference never schedules planning or workers', a
 
 test('the human command selects the standalone graph workflow before the model turn', async t => {
   let step = 0
-  const f = await fixture(t, { choice: 'task-graph', respond: ({ payload }) => {
+  const f = await fixture(t, { choice: 'task-graph', config: { interaction: { mode: 'interactive', commandMode: 'ask' } }, respond: ({ payload }) => {
     assert.ok(names(payload).includes('transaction_graph_create'))
     assert.ok(!names(payload).includes('dynamic_context_submit'))
     return { text: 'The selected standalone workflow is available.' }
@@ -218,7 +300,7 @@ test('native Plan mode allows foundational Bash in its read-only policy and prev
       if (++planning === 1) return tool('bash', { command: 'touch forbidden-in-plan', description: 'Exercise native write confinement' })
       if (planning === 2) {
         assert.match(payload.messages.findLast(row => row.role === 'tool').content, /[Rr]ead-only|[Pp]ermission|denied/)
-        return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+        return tool('dynamic_context_submit', { proposal: rootTask() })
       }
     }
     if (isController(payload)) return { text: 'Observed native plan boundary.' }
@@ -245,7 +327,7 @@ test('an incomplete planning conversation resumes its existing observations with
       if (planning === 1) return tool('bash', { command: 'pwd', description: 'Observe workspace once' })
       if (planning === 2) return { text: 'I have not submitted a graph yet. PLANNING_OBSERVATION_RETAINED' }
       assert.match(JSON.stringify(payload.messages), /PLANNING_OBSERVATION_RETAINED/)
-      return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      return tool('dynamic_context_submit', { proposal: rootTask() })
     }
     if (isController(payload)) return { text: 'Planning phase observed.' }
     workers++; return { text: 'Recorded worker result.' }
@@ -269,7 +351,7 @@ test('parent cancellation stops the planner and never dispatches a leaf', async 
   const entered = new Promise(resolve => { ready = resolve })
   const release = new Promise(resolve => { finish = resolve })
   const f = await fixture(t, { respond: async ({ payload }) => {
-    if (isPlanner(payload)) { ready(); await release; return tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) }
+    if (isPlanner(payload)) { ready(); await release; return tool('dynamic_context_submit', { proposal: rootTask() }) }
     if (isController(payload)) return { text: 'Cancelled state observed.' }
     workers++; return { text: 'Must not run.' }
   } })
@@ -289,7 +371,7 @@ test('a steering pause is classified and routed before planning can submit or st
   const f = await fixture(t, { respond: async ({ payload }) => {
     if (payload.messages[0].content.includes('DYNAMIC_CONTEXT_GUIDANCE_INTAKE_V1')) return { text: JSON.stringify({ level: 'control', intent: 'Pause to clarify the new condition', targets: [], conditions: [], changes: ['pause'], needsClarification: false }) }
     if (payload.messages[0].content.includes('DYNAMIC_CONTEXT_GUIDANCE_ROUTER_V1')) return { text: JSON.stringify({ action: 'pause', summary: 'Paused as the user requested', jobs: [] }) }
-    if (isPlanner(payload)) { ready(); await release; return tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) }
+    if (isPlanner(payload)) { ready(); await release; return tool('dynamic_context_submit', { proposal: rootTask() }) }
     if (isController(payload)) return { text: 'The user update needs consideration.' }
     workers++; return { text: 'Must not run.' }
   } })
@@ -306,12 +388,12 @@ test('a steering pause is classified and routed before planning can submit or st
 test('persisted queued planning does not replay on remount; an explicit continuation is required', async t => {
   let planners = 0
   const f = await fixture(t, { respond: ({ payload }) => {
-    if (isPlanner(payload)) { planners++; return tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) }
+    if (isPlanner(payload)) { planners++; return tool('dynamic_context_submit', { proposal: rootTask() }) }
     return { text: 'Observed only.' }
   } })
   const agent = await f.agent('reloaded-queue')
   agent.session.append('user/message', user('Prepare and execute this task.'), { surfaceOp: 'append' })
-  await f.call(agent, 'dynamic_context_select_mode', { reason: 'A staged task.' })
+  await f.h.runner.interaction.select(agent, { reason: 'A staged task.' }, new AbortController().signal)
   assert.equal(f.status(agent).scheduled, true)
   await f.h.ctx.sessions.flush(agent.session)
   await f.handles[0].dispose()
@@ -331,7 +413,7 @@ test('persisted queued planning does not replay on remount; an explicit continua
 test('loss of the controller handoff receipt can be recovered from the durable planner result without a model replay', async t => {
   let planners = 0, workers = 0
   const f = await fixture(t, { after: 'await_approval', respond: ({ payload }) => {
-    if (isPlanner(payload)) { planners++; return tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) }
+    if (isPlanner(payload)) { planners++; return tool('dynamic_context_submit', { proposal: rootTask() }) }
     if (isController(payload)) return { text: 'Observed phase.' }
     workers++; return { text: 'Verified recorded result.' }
   } })
@@ -355,7 +437,7 @@ test('two root conversations keep their task contracts and independent planners 
       const content = JSON.stringify(payload.messages)
       assert.notEqual(content.includes('ONLY_ALPHA_TASK'), content.includes('ONLY_BETA_TASK'))
       tasks.push(content.includes('ONLY_ALPHA_TASK') ? 'alpha' : 'beta')
-      return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      return tool('dynamic_context_submit', { proposal: rootTask() })
     }
     return { text: 'Only observe the selected conversation.' }
   } })
@@ -371,13 +453,8 @@ test('two root conversations keep their task contracts and independent planners 
 })
 
 for (const interruptReview of [false, true]) test(`program scheduling retains the report/acceptance/plan-review pipeline (interruptReview=${interruptReview})`, async t => {
-  const order = [], proposal = runtimeProposal([])
-  proposal.planningReport = { understanding: 'Prepare two serial reports.', assumptions: [], design: 'One report then a dependent check.', acceptanceStrategy: 'Check each submitted result.' }
-  proposal.contextGraph.bindings[0].completion = { kind: 'report' }
-  proposal.taskGraph.nodes.push({ key: 'second', kind: 'leaf', label: 'Dependent check', parent: 'root' })
-  proposal.taskGraph.edges.push({ kind: 'prerequisite', from: 'task', to: 'second' })
-  proposal.contextGraph.bindings.push({ task: 'second', instruction: 'Check the previous report.', contexts: [], tools: [], inheritReports: ['task'], completion: { kind: 'report' } })
-  const f = await fixture(t, { config: { supervision: true, supervisionContext: 'reports', direct: { durable: true },
+  const order = [], proposal = rootTask()
+  const f = await fixture(t, { plan: { keys: ['task','second'] }, config: { supervision: true, supervisionContext: 'reports', direct: { durable: true },
     revision: { policy: { objective: 'Fixture template replaced by the real user task.', requirements: [{ id: 'fixture', text: 'Follow current task.' }] } } },
   respond: ({ payload }) => {
     if (isPlanner(payload)) { order.push('planning'); return tool('dynamic_context_submit', { proposal }) }
@@ -391,7 +468,7 @@ for (const interruptReview of [false, true]) test(`program scheduling retains th
       order.push('plan-review'); return { text: '{"verdict":"CURRENT"}' }
     }
     order.push('worker')
-    return { text: JSON.stringify({ outcome: 'COMPLETE', summary: 'Prepared a scoped report.', artifacts: [], executionReport: {
+    return { text: JSON.stringify({ outcome: 'PASS', summary: 'Prepared a scoped report.', artifacts: [], executionReport: {
       workHistory: ['Considered the active local criterion.'], results: [{ criterion: 'Prepare a scoped report', result: 'The local result is recorded.', artifactRefs: [], testIds: [] }],
       directories: [], tests: [], limitations: ['This is a synthetic protocol exercise.'],
     } }) }
@@ -401,7 +478,7 @@ for (const interruptReview of [false, true]) test(`program scheduling retains th
   await agent.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
   assert.deepEqual(order, interruptReview ? ['planning', 'worker', 'acceptance', 'controller']
-    : ['planning', 'worker', 'acceptance', 'plan-review', 'worker', 'acceptance', 'plan-review', 'controller'], JSON.stringify(f.status(agent)))
+    : ['planning', 'worker', 'acceptance', 'plan-review', 'worker', 'acceptance', 'controller'], JSON.stringify(f.status(agent)))
   assert.equal(f.status(agent).phase, interruptReview ? 'NEEDS_ATTENTION' : 'COMPLETE')
   if (interruptReview) {
     assert.equal(f.runner(agent).status().supervision.phase, 'CHECK_RESULT')
@@ -412,13 +489,13 @@ for (const interruptReview of [false, true]) test(`program scheduling retains th
 test('a committed graph without a successful planner tool receipt never starts execution', async t => {
   let planning = 0, workers = 0
   const f = await fixture(t, { respond: ({ payload }) => {
-    if (isPlanner(payload)) return ++planning === 1 ? tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) : { text: 'Submission failed at the receipt boundary.' }
+    if (isPlanner(payload)) return ++planning === 1 ? tool('dynamic_context_submit', { proposal: rootTask() }) : { text: 'Submission failed at the receipt boundary.' }
     if (isController(payload)) return { text: 'Requires handoff investigation.' }
     workers++; return { text: 'Must not execute.' }
   } })
   const agent = await f.agent('submit-fault')
   agent.session.append('user/message', user('A task with a controlled fault.'), { surfaceOp: 'append' })
-  await f.call(agent, 'dynamic_context_select_mode', { reason: 'Staged task.' })
+  await f.h.runner.interaction.select(agent, { reason: 'Staged task.' }, new AbortController().signal)
   const runner = f.runner(agent), submit = runner.submit.bind(runner)
   runner.submit = (...args) => { submit(...args); throw new Error('INJECTED_POST_COMMIT_FAILURE') }
   agent.followup(createUserMessage({ source: { kind: 'dynamic-context' }, content: [{ type: 'text', text: 'Drive queued plan.' }] }))
@@ -436,7 +513,7 @@ test('planning inherits the currently admitted model route after the parent swit
   let rootSteps = 0, planning = 0
   const f = await fixture(t, { after: 'await_approval', respond: ({ payload }) => {
     assert.equal(payload.model, 'fake-llama')
-    if (isPlanner(payload)) { planning++; return tool('dynamic_context_submit', { proposal: runtimeProposal([]) }) }
+    if (isPlanner(payload)) { planning++; return tool('dynamic_context_submit', { proposal: rootTask() }) }
     return { text: 'The committed graph is waiting as selected.' }
   } })
   const handle = await f.h.ctx.agents.create({ sessionId: 'changed-model', meta: { cwd: f.projectRoot },
@@ -451,14 +528,14 @@ test('planning inherits the currently admitted model route after the parent swit
   assert.equal(f.status(handle.agent).phase, 'WAITING_PLAN_APPROVAL')
 })
 
-const validDisposition = () => ({ outcome: 'COMPLETE', summary: 'Delivered the local report.', artifacts: [], executionReport: {
+const validDisposition = () => ({ outcome: 'PASS', summary: 'Delivered the local report.', artifacts: [], executionReport: {
   workHistory: ['Performed this local step.'], results: [{ criterion: 'Local report', result: 'Scoped result prepared.', artifactRefs: [], testIds: [] }],
   directories: [], tests: [], limitations: [],
 } })
 const supervisedConfig = { supervision: true, supervisionContext: 'reports', direct: { durable: true },
   revision: { policy: { objective: 'Fixture', requirements: [{ id: 'scope', text: 'Follow the task.' }] } } }
 function supervisedProposal() {
-  const proposal = runtimeProposal([])
+  const proposal = rootTask()
   proposal.planningReport = { understanding: 'One local report.', assumptions: [], design: 'One leaf with result review.', acceptanceStrategy: 'Inspect the result.' }
   proposal.contextGraph.bindings[0].completion = { kind: 'report' }
   return proposal
@@ -466,16 +543,16 @@ function supervisedProposal() {
 
 for (const auditedPause of [false, true]) test(`no-ready exception runs only after acceptance and plan review, then serially reopens work (auditedPause=${auditedPause})`, async t => {
   const order = []; let workers = 0, handlers = 0
-  const f = await fixture(t, { config: supervisedConfig, respond: ({ payload }) => {
+  const f = await fixture(t, { plan: { keys: ['check','finish'], rules: [{ id: 'pass', when: { node: 'check', in: ['PASS'] } }], bindings: { check: { tools: ['read'] } } }, config: supervisedConfig, respond: ({ payload }) => {
     if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: supervisedProposal() })
     if (isController(payload)) { order.push('controller'); return { text: 'State observed.' } }
     const instruction = payload.messages[0].content
     if (instruction.includes('DYNAMIC_CONTEXT_BLOCKAGE_PAUSE_AUDIT_V1')) {
       order.push('pause-audit'); return { text: JSON.stringify({ verdict: 'APPROVE', reason: 'The requested wait is supported.', issues: [] }) }
     }
-    if (instruction.includes('DYNAMIC_CONTEXT_BLOCKAGE_HANDLER_V1')) {
+    if (instruction.includes('DYNAMIC_CONTEXT_SCOPED_BLOCKAGE')) {
+      const input = JSON.parse(payload.messages[1].content), report = input.reports.find(row => row.value?.attemptId)
       order.push('blockage'); handlers++
-      const input = JSON.parse(payload.messages[1].content), report = input.affectedReports[0]
       const evidence = [{ source: report.source, sha256: report.sha256, path: '/result/summary', quote: report.value.result.summary }]
       return { text: JSON.stringify(auditedPause && handlers === 1 ? { action: 'PAUSE', report: { version: 1,
         summary: 'Required input unavailable.', constraints: [{ description: 'The input must be provided.', affectedTasks: input.situation.causes, evidence }],
@@ -488,10 +565,11 @@ for (const auditedPause of [false, true]) test(`no-ready exception runs only aft
       if (instruction.includes('受理当前叶')) { order.push('accept'); return { text: '{"verdict":"ACCEPT","reason":"The disposition matches the report."}' } }
       order.push('plan'); return { text: '{"verdict":"CURRENT"}' }
     }
+    if (workers === 0 && !payload.messages.some(row => row.tool_call_id === 'observed-missing')) return { tools: [{ name: 'read', id: 'observed-missing', arguments: { file_path: 'missing-fixture.txt' } }] }
     order.push('worker'); workers++
     const result = validDisposition()
-    if (workers === 1) { result.outcome = 'BLOCKED'; result.summary = 'A required input was not inspected.' }
-    else assert.match(JSON.stringify(payload.messages), /reworkRequest/)
+    if (workers === 1) { result.outcome = 'FAILED'; result.failedCallId = 'observed-missing'; result.summary = 'A required input was not inspected.' }
+    else if (workers === 2) assert.match(JSON.stringify(payload.messages), /reworkRequest/)
     return { text: JSON.stringify(result) }
   } })
   const agent = await f.agent('blockage-lifecycle-' + auditedPause)
@@ -499,16 +577,16 @@ for (const auditedPause of [false, true]) test(`no-ready exception runs only aft
   await agent.whenIdle()
   if (auditedPause) {
     assert.deepEqual(order, ['worker', 'accept', 'plan', 'blockage', 'pause-audit'], JSON.stringify(f.status(agent)))
-    assert.equal(f.status(agent).phase, 'PAUSED'); assert.equal(f.status(agent).reason, 'BLOCKAGE_REVIEWED_WAIT')
+    assert.equal(f.status(agent).phase, 'PAUSED'); assert.equal(f.status(agent).reason, 'SCOPE_REVIEWED_WAIT')
     assert.equal(f.h.runner.interaction.orchestrator.executionView(agent).canResume, true)
     await f.h.runner.interaction.orchestrator.fromView(agent, 'resume', new AbortController().signal)
     await agent.whenIdle()
   }
   assert.deepEqual(f.h.backend.errors, [])
   assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
-  assert.equal(workers, 2); assert.equal(f.runner(agent).graph.read().supervision.outcomes.length, 2)
+  assert.equal(workers, 3); assert.equal(f.runner(agent).graph.read().supervision.outcomes.length, 3)
   assert.equal(f.runner(agent).graph.read().graph.events.filter(e => e.type === 'REOPENED').length, 1)
-  assert.deepEqual(order.slice(-5), ['blockage', 'worker', 'accept', 'plan', 'controller'])
+  assert.ok(order.indexOf('blockage') > order.indexOf('accept')); assert.equal(order.filter(role => role === 'accept').length, 3)
 })
 
 test('report return automatically enters repair, acceptance and plan review without a controller request', async t => {
@@ -525,7 +603,7 @@ test('report return automatically enters repair, acceptance and plan review with
   await f.h.ctx.commands.execute(agent, '/task-graph Produce and validate a report.', [], new AbortController().signal)
   await agent.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
-  assert.deepEqual(order, ['worker', 'repair', 'accept', 'plan', 'controller'], JSON.stringify(f.status(agent)))
+  assert.deepEqual(order, ['worker', 'repair', 'accept', 'controller'], JSON.stringify(f.status(agent)))
   assert.equal(f.status(agent).phase, 'COMPLETE')
 })
 
@@ -568,7 +646,7 @@ test('UI classifies a crash during pause admission as unexpected, and lost graph
   const f = await fixture(t, { respond: () => ({ text: 'No model work expected.' }) })
   const agent = await f.agent('interrupted-pause')
   agent.session.append('user/message', user('Prepare the staged task.'), { surfaceOp: 'append' })
-  await f.call(agent, 'dynamic_context_select_mode', { reason: 'A project task.' })
+  await f.h.runner.interaction.select(agent, { reason: 'A project task.' }, new AbortController().signal)
   // Persist the exact lifecycle shape written while a request is still running.
   appendPluginRecord(agent.session, LIFECYCLE_RECORD, { ...f.status(agent), phase: 'PAUSE_REQUESTED', pauseKind: 'normal' })
   await f.h.ctx.sessions.flush(agent.session); await f.handles[0].dispose()
@@ -592,7 +670,8 @@ test('the graph control shows planning before a graph exists and pauses before t
     if (isPlanner(payload)) {
       if (++planning === 1) { entered.resolve(); await release.promise; return tool('read', { file_path: 'probe.txt' }) }
       assert.match(JSON.stringify(payload.messages), /probe receipt/)
-      return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      assert.doesNotMatch(JSON.stringify(payload.messages), /用户点击继续|从正常暂停|执行意外中断/)
+      return tool('dynamic_context_submit', { proposal: rootTask() })
     }
     if (isController(payload)) return { text: 'Finished.' }
     workers++; return { text: 'Scoped report.' }
@@ -615,6 +694,7 @@ test('the graph control shows planning before a graph exists and pauses before t
   await agent.whenIdle()
   assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
   assert.equal(planning, 2); assert.equal(workers, 1)
+  assert.equal(f.h.backend.requests.filter(({ payload }) => isController(payload)).length, 0)
   assert.deepEqual(f.h.backend.errors, [])
 })
 
@@ -623,7 +703,7 @@ test('UI pause completes the current tool batch once and resumes the same leaf; 
   const f = await fixture(t, { config: { direct: { durable: true } }, setup: ctx => {
     ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
   }, respond: async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (isController(payload)) return { text: 'Finished.' }
     if (++workers === 1) { entered.resolve(); await release.promise; return { tools: ['a', 'b'].map(name => ({ name: 'write', arguments: { file_path: name + '.txt', content: name } })) } }
     return { text: 'Both files delivered.' }
@@ -648,10 +728,15 @@ test('UI pause completes the current tool batch once and resumes the same leaf; 
     assert.equal(registry.executionView(agent).activity.stage, 'EXECUTING')
     assert.equal(f.h.backend.requests.length, requestsBefore, 'an interrupted leaf must not start a native conversation request')
   } finally { runner.resumeActive = resume }
-  await registry.controlExecution(agent, { workflowId: view.workflowId, action: 'resume' }); await agent.whenIdle()
+  const response = new AbortController()
+  await registry.controlExecution(agent, { workflowId: view.workflowId, action: 'resume' }, response.signal)
+  response.abort()
+  await agent.whenIdle()
   assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
   assert.equal(workers, 2); assert.equal(writes, 2)
   assert.equal(f.runner(agent).graph.read().reports[0].attemptId, attempt)
+  assert.equal(f.h.backend.requests.length, requestsBefore + 3)
+  assert.doesNotMatch(JSON.stringify(agent.session.deriveMessages()), /用户点击继续|程序按已保存状态接续工作流/)
   assert.deepEqual(f.h.backend.errors, [])
 })
 
@@ -674,16 +759,13 @@ test('pausing during acceptance stops the following plan-review request and resu
   assert.deepEqual(order, ['worker', 'accept'])
   await api.controlExecution(agent, { workflowId: view.workflowId, action: 'resume' }); await agent.whenIdle()
   assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
-  assert.deepEqual(order, ['worker', 'accept', 'plan', 'controller'])
+  assert.deepEqual(order, ['worker', 'accept'])
 })
 
 
 test('new preplanner rejects only the missing verification declaration, then commits v1 without an extra execution request', async t => {
   let planning = 0
-  const proposal = runtimeProposal([])
-  proposal.taskGraph.hierarchy = { version: 1 }
-  Object.assign(proposal.taskGraph.nodes[0], { terminal: 'task', acceptance: 'The local user goal' })
-  proposal.contextGraph.bindings[0].completion = { kind: 'report' }
+  const proposal = rootTask()
   proposal.planningReport = { understanding: 'Prepare local work', assumptions: [], design: 'One terminal', acceptanceStrategy: 'Review result evidence' }
   const f = await fixture(t, { after: 'await_approval', config: { ...supervisedConfig, preplanningAcceptance: true }, respond: ({ payload }) => {
     if (isPlanner(payload)) {
@@ -695,6 +777,8 @@ test('new preplanner rejects only the missing verification declaration, then com
       }
       return tool('dynamic_context_submit', { proposal })
     }
+    if (payload.messages[0].content.includes('DYNAMIC_CONTEXT_UNIT_ROUTER_V1')) return {text:JSON.stringify({action:'EXECUTE',reason:'The plan is sufficient.'})}
+    if (payload.messages[0].content.includes('RULE_BLUEPRINT_AUDIT_V1')) return {text:JSON.stringify({verdict:'APPROVE',reason:'The declared terminal covers the verified user goal.'})}
     assert.ok(isController(payload), 'No worker starts before the user-selected approval boundary')
     return { text: 'Plan is ready for the selected approval boundary.' }
   } })
@@ -707,6 +791,34 @@ test('new preplanner rejects only the missing verification declaration, then com
   assert.equal(f.runner(agent).graph.read().planningRecord.report.verification.version, 1)
 })
 
+test('the scoped planner authors a rule, reads its mnemonic and confirms it before plan approval', async t => {
+  let step = 0, audits = 0
+  const f = await fixture(t, { after: 'await_approval', autoDecisions: false, respond: ({ payload }) => {
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask() })
+    const system = payload.messages[0].content
+    if (system.includes('DYNAMIC_CONTEXT_UNIT_ROUTER_V1')) return { text: JSON.stringify({ action: 'PLAN', reason: 'Plan the two units.' }) }
+    if (system.includes('DYNAMIC_CONTEXT_SCOPE_AUDIT_V1')) { audits++; return { text: JSON.stringify({ verdict: 'APPROVE', reason: 'Validated plan and rule.', issues: [] }) } }
+    if (system.includes('DYNAMIC_CONTEXT_SCOPE_UPDATE_V1')) {
+      const target = 'finish'
+      if (++step === 1) return tool('dynamic_context_set_rule', { target, expected_revision: 0, id: 'checked', when: { node: 'check', in: ['PASS'] } })
+      if (step === 2) return tool('dynamic_context_read_rules', { target, format: 'mnemonic' })
+      if (step === 3) {
+        assert.match(JSON.stringify(payload.messages), /check 通过/)
+        return tool('dynamic_context_manage_rules', { target, expected_revision: 1, action: 'confirm' })
+      }
+      return { text: JSON.stringify(enterPlan(JSON.parse(payload.messages[1].content), ['check','finish'])) }
+    }
+    return reviewRoot(payload) ?? { text: 'Ready for human plan approval.' }
+  } })
+  const agent = await f.agent('rules-layer-planner')
+  await f.h.ctx.commands.execute(agent, '/task-graph Check then deliver.', [], new AbortController().signal)
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(f.status(agent).phase, 'WAITING_PLAN_APPROVAL', JSON.stringify(f.status(agent)))
+  assert.equal(step, 4); assert.equal(audits, 1)
+  assert.deepEqual(f.runner(agent).graph.read().graph.state.plan.nodes.find(row => row.key === 'finish').rules[0].when, { node: 'check', in: ['PASS'] })
+})
+
 test('registered tool blockage survives controller retry and reload, then UI continuation consumes receipts without replay', async t => {
   let workers = 0, writes = 0
   const f = await fixture(t, { config: { direct: { durable: true } }, setup: ctx => {
@@ -716,7 +828,7 @@ test('registered tool blockage survives controller retry and reload, then UI con
       return { isError: true, content: [{ type: 'text', text: 'Fixture store requires repair' }], error: { message: 'Fixture store requires repair' } }
     })
   }, respond: ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: runtimeProposal(['write']) })
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(['write']) })
     if (isController(payload)) return { text: 'Waiting for the human continuation control.' }
     if (++workers === 1) return tool('write', { file_path: 'blocked.txt', content: 'not written' })
     assert.match(JSON.stringify(payload.messages), /Fixture store requires repair/)
@@ -795,7 +907,7 @@ for (const role of ['controller', 'preplanning']) test(`${role} uses the shared 
     if (isPlanner(payload)) {
       if (role === 'preplanning' && ++seen === 1) return tool(name, { command: 'pwd', description: 'Check fixture directory' })
       if (role === 'preplanning') assert.match(JSON.stringify(payload.messages), /Fixture input needs repair/)
-      return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      return tool('dynamic_context_submit', { proposal: rootTask() })
     }
     if (role === 'controller' && ++seen === 1) return tool(name, {})
     return { text: 'Waiting for plan approval.' }
@@ -818,6 +930,132 @@ for (const role of ['controller', 'preplanning']) test(`${role} uses the shared 
   assert.deepEqual(f.h.backend.errors, [])
 })
 
+test('controller adopts an already registered DSH ID on the next prompt and enforces its selected operation', async t => {
+  const id = 'records_lookup', effects = []
+  let step = 0
+  const f = await fixture(t, { config: { interaction: { mode: 'interactive', orchestration: false } },
+    setup(ctx) { ctx.tools.register({ name: id, description: 'Records', parameters: { type: 'object', properties: { action: { type: 'string' } },
+      required: ['action'], additionalProperties: false }, output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute({ action }) { effects.push(action); return action } }) },
+    respond({ payload }) {
+      step++
+      if (step === 1) { assert.ok(!names(payload).includes(id)); return { text: 'Ready.' } }
+      assert.ok(names(payload).includes(id), names(payload).join(', '))
+      if (step === 2) return tool(id, { action: 'edit' })
+      if (step === 3) { assert.match(JSON.stringify(payload.messages), /ROLE_TOOL_DENIED/); return tool(id, { action: 'read' }) }
+      return { text: 'Read complete.' }
+    } })
+  const agent = await f.agent('controller-dsh-policy')
+  await f.h.ctx.commands.execute(agent, '/task-graph Inspect records.', [], new AbortController().signal)
+  await agent.whenIdle()
+  const target = f.h.ctx.get('dynamicContextToolPolicies').forTool(f.h.ctx.tools.get(id).name)
+    .getStrategy({ target: 'roleTools', role: 'controller' })
+  assert.equal(target.mode, 'whitelist')
+  target.register({ pluginId: 'records', registrationId: 'inspect', priority: 20, when: { '/action': 'read' } })
+  agent.followup(user('Read the records.'))
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.deepEqual(effects, ['read'])
+})
+
+test('native controller and its DSH compactor use the scoped registered API until the override is disposed', async t => {
+  const selected = await startFakeLlama({ respond: () => ({ text: 'Controller reply on its own API.' }) })
+  t.after(() => selected.close())
+  const f = await fixture(t, { config: { interaction: { mode: 'interactive', orchestration: false } },
+    providers: { 'controller-api': nativeProfile(selected, 'controller-model') }, setup: nativeCompactor,
+    respond: () => ({ text: 'Ordinary reply.' }) })
+  const ordinary = await f.agent('ordinary-model'), agent = await f.agent('controller-model-owner')
+  const remove = f.h.ctx.get('dynamicContextRoleModels').register({ pluginId: 'example', registrationId: 'controller',
+    role: 'controller', backend: { provider: 'controller-api', model: 'controller-model' } })
+  ordinary.followup(user('Ordinary chat')); await ordinary.whenIdle()
+  assert.equal(f.h.backend.requests.length, 1)
+  await f.h.ctx.commands.execute(agent, '/task-graph Choose a controller route.', [], new AbortController().signal)
+  await agent.whenIdle()
+  assert.equal(agent.session.requestHeader().config.provider, 'controller-api')
+  const before = selected.requests.length
+  assert.ok(before > 0)
+  const receipt = await nativeSummary(f.h.ctx, agent)
+  assert.deepEqual([receipt.provider, receipt.model], ['controller-api', 'controller-model'])
+  assert.equal(selected.requests.length, before + 1)
+  assert.ok(selected.requests.every(row => row.payload.model === 'controller-model'))
+  remove()
+  let stepSummary, restore
+  const off = f.h.ctx.on('agent/pre-step', async ({ agent: current }, next) => {
+    if (current === agent && !stepSummary) {
+      stepSummary = await nativeSummary(f.h.ctx, current)
+      restore = f.h.ctx.get('dynamicContextRoleModels').register({ pluginId: 'example', registrationId: 'next-controller',
+        role: 'controller', backend: { provider: 'controller-api', model: 'controller-model' } })
+    }
+    return next()
+  })
+  agent.followup(user('Continue with the current route.')); await agent.whenIdle()
+  off()
+  assert.deepEqual([stepSummary.provider, stepSummary.model], ['dynamic-context-fake', 'fake-llama'])
+  assert.equal(agent.session.requestHeader().config.provider, 'dynamic-context-fake')
+  assert.equal(selected.requests.length, before + 1)
+  assert.equal(f.h.backend.requests.length, 3)
+  agent.followup(user('Run the next step.')); await agent.whenIdle()
+  assert.equal(agent.session.requestHeader().config.provider, 'controller-api')
+  restore()
+  assert.deepEqual(selected.errors, [])
+})
+
+test('resumed native planning and its DSH compaction use the original independent planner API', async t => {
+  let f, owner, receipt, steps = 0
+  const selected = await startFakeLlama({ respond: async ({ payload }) => {
+    if (!isPlanner(payload)) return { text: 'Planning evidence checkpoint.' }
+    if (++steps === 1) return { text: 'First planning pass is complete.' }
+    const planner = f.h.ctx.agents.get(f.status(owner).plannerSessionId)
+    receipt = await nativeSummary(f.h.ctx, planner)
+    return tool('dynamic_context_submit', { proposal: rootTask() })
+  } })
+  t.after(() => selected.close())
+  f = await fixture(t, { after: 'await_approval', providers: { 'planner-api': nativeProfile(selected, 'planner-model') },
+    setup: nativeCompactor, respond: () => ({ text: 'Waiting for planning.' }) })
+  owner = await f.agent('planner-model-owner')
+  const remove = f.h.ctx.get('dynamicContextRoleModels').register({ pluginId: 'example', registrationId: 'planner',
+    role: 'preplanning', scope: { sessionId: owner.id }, backend: { provider: 'planner-api', model: 'planner-model' } })
+  await f.h.ctx.commands.execute(owner, '/task-graph Draft the local plan.', [], new AbortController().signal)
+  await owner.whenIdle()
+  assert.equal(f.status(owner).phase, 'PLANNING_INCOMPLETE')
+  remove()
+  await f.call(owner, 'dynamic_context_workflow', { action: 'continue' })
+  owner.followup(createUserMessage({ source: { kind: 'dynamic-context' }, content: [{ type: 'text', text: 'Continue this plan.' }] }))
+  await owner.whenIdle()
+  assert.equal(f.status(owner).phase, 'WAITING_PLAN_APPROVAL', JSON.stringify(f.status(owner)))
+  assert.deepEqual([receipt.provider, receipt.model], ['planner-api', 'planner-model'])
+  assert.equal(steps, 2)
+  assert.equal(selected.requests.length, 3)
+  assert.ok(selected.requests.every(row => row.payload.model === 'planner-model'))
+  assert.deepEqual(selected.errors, [])
+})
+
+test('manual controller pauses on a whole-tool error and human resume does not schedule planning or replay', async t => {
+  const name = 'dynamic_context_graph_status'
+  let calls = 0
+  const f = await fixture(t, { config: { interaction: { mode: 'interactive', orchestration: false } },
+    setup(ctx) { ctx.on('tools/execute', (exec, next) => {
+      if (exec.name !== name) return next()
+      calls++
+      return { isError: true, error: { message: 'Status unavailable.' }, content: [{ type: 'text', text: 'Status unavailable.' }] }
+    }) }, respond: () => tool(name, {}) })
+  f.h.ctx.get('dynamicContextToolErrors').register({ pluginId: 'manual', ruleId: 'all-status-errors', toolId: name })
+  const agent = await f.agent('manual-status-error'), signal = new AbortController().signal
+  await f.h.ctx.commands.execute(agent, '/task-graph Inspect current status.', [], signal)
+  await agent.whenIdle()
+  const lifecycle = f.h.runner.interaction.lifecycle
+  await lifecycle.nativeToolBlocks.get(agent)
+  const blocked = lifecycle.record(agent)?.toolErrorBlock
+  assert.equal(blocked?.toolId, name)
+  assert.equal(lifecycle.executionView(agent).canResume, true)
+  await lifecycle.fromView(agent, 'resume', signal)
+  assert.equal(lifecycle.record(agent).phase, 'MANUAL_READY')
+  assert.equal(lifecycle.record(agent).toolErrorAcknowledgement.block.id, blocked.id)
+  assert.equal(lifecycle.queued.has(agent), false)
+  assert.equal(calls, 1)
+  assert.equal(f.h.backend.requests.length, 1)
+})
+
 test('preplanning follows main permission changes and still commits through its existing boundary', async t => {
   let owner, steps = 0
   const f = await fixture(t, { after: 'await_approval', respond: ({ payload }) => {
@@ -828,11 +1066,113 @@ test('preplanning follows main permission changes and still commits through its 
     }
     assert.match(JSON.stringify(payload.messages), /main conversation permissions/)
     assert.match(JSON.stringify(payload.messages), /read-only/)
-    return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+    return tool('dynamic_context_submit', { proposal: rootTask() })
   } })
   owner = await f.agent('hot-planner-permissions')
   await f.h.ctx.commands.execute(owner, '/task-graph Plan this task', [], new AbortController().signal)
   await owner.whenIdle()
   assert.deepEqual(f.h.backend.errors, [])
   assert.equal(steps, 2); assert.equal(f.status(owner).phase, 'WAITING_PLAN_APPROVAL')
+})
+
+test('a pre-existing interrupted boundary without a step is readable and only new records are normalized', async t => {
+  const f=await fixture(t), agent=await f.agent('legacy-boundary-without-step')
+  f.h.runner.interaction.mount(agent,{mode:'full'})
+  const orch=f.h.runner.interaction.orchestrator, runner=f.runner(agent)
+  const boundary={stage:'EXECUTING',kind:'boundary',at:new Date().toISOString(),sessionId:null,tool:null}
+  const legacy={version:1,workflowId:runner.workflowId,sessionId:agent.session.id,phase:'PAUSED',pauseKind:'normal',activity:boundary}
+  appendPluginRecord(agent.session,LIFECYCLE_RECORD,legacy)
+  const length=agent.session.snapshotEvents().length
+  assert.equal(orch.executionView(agent).activity.step,0)
+  assert.equal(agent.session.snapshotEvents().length,length)
+  assert.equal(Object.hasOwn(orch.record(agent).activity,'step'),false)
+  assert.equal((await orch.save(agent,{phase:'PAUSED',activity:boundary})).activity.step,0)
+  runner.activity={...boundary,step:17}
+  assert.equal(orch.executionView(agent).activity.step,17)
+  runner.activity={...boundary,kind:'tool'}
+  assert.equal(orch.executionView(agent).activity.step,undefined)
+})
+
+for (const outcome of ['PASS', 'FAILED']) test('unit v2 command rejects legacy proposals, waits for human approval and settles ' + outcome, async t => {
+  const { rootTask, unitReport, reviewRoot } = await import('../testing/unit-proposal.mjs')
+  const roles = [], expected = outcome === 'PASS' ? 'Successful verification.' : 'Observed failure.'
+  let submittedLegacy = false
+  const f = await fixture(t, { after: 'await_approval', autoDecisions: false, respond: ({ payload }) => {
+    if (isPlanner(payload)) {
+      if (!submittedLegacy) {
+        submittedLegacy = true
+        return tool('dynamic_context_submit', { proposal: runtimeProposal([]) })
+      }
+      assert.match(JSON.stringify(payload.messages), /UNIT_ROOT_SEED_REQUIRED/)
+      return tool('dynamic_context_submit', { proposal: rootTask(outcome === 'FAILED' ? ['read'] : []) })
+    }
+    const review = reviewRoot(payload)
+    if (review) { roles.push(JSON.parse(review.text).action ?? JSON.parse(review.text).verdict ?? 'report'); return review }
+    if (isController(payload)) return { text: 'Ready.' }
+    if (outcome === 'FAILED' && !payload.messages.some(row => row.tool_call_id === 'criterion-missing'))
+      return { tools: [{ id: 'criterion-missing', name: 'read', arguments: { file_path: 'absent-fixture.txt' } }] }
+    roles.push('work')
+    return { text: JSON.stringify({ ...unitReport(expected, outcome), ...(outcome === 'FAILED' ? { failedCallId: 'criterion-missing' } : {}) }) }
+  } })
+  const agent = await f.agent('unit-command-' + outcome)
+  await f.h.ctx.commands.execute(agent, '/task-graph Verify one source.', [], new AbortController().signal)
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(f.status(agent).phase, 'WAITING_PLAN_APPROVAL', JSON.stringify(f.status(agent)))
+  assert.deepEqual(roles, ['APPROVE', 'EXECUTE'])
+  await f.call(agent, 'dynamic_context_workflow', { action: 'approve' })
+  agent.followup(createUserMessage({ source: { kind: 'dynamic-context' }, content: [{ type: 'text', text: 'Approved state ready.' }] }))
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
+  assert.equal(f.runner(agent).graph.status().rootOutcome, outcome)
+  assert.deepEqual(roles, ['APPROVE', 'EXECUTE', 'work', 'ACCEPT', 'report'])
+})
+
+test('v2 refuses an existing unversioned complete-mode ledger before any model call or graph mutation', async t => {
+  const { MODE_RECORD } = await import('../interaction.mjs')
+  const f = await fixture(t, { respond: () => { throw new Error('Legacy ledger started a model.') } })
+  const agent = await f.agent('historic-graph')
+  agent.session.append('user/message', user('Inspect the historic workflow.'), { surfaceOp: 'append' })
+  const i = f.h.runner.interaction, signal = new AbortController().signal
+  await i.select(agent, { reason: 'Inspect historical records' }, signal)
+  const runner = f.runner(agent), old = runtimeProposal([])
+  old.planningReport = rootTask().planningReport
+  old.contextGraph.bindings[0].completion = { kind: 'report' }
+  const archive = runner.graph.submit(old)
+  const { unitWorkflowVersion, ...oldMode } = i.record(agent)
+  appendPluginRecord(agent.session, MODE_RECORD, oldMode)
+  await assert.rejects(runner.runNext({ expectedRevision: archive.revision, sourceAgent: agent }), { code: 'LEGACY_WORKFLOW_UNSUPPORTED' })
+  await i.orchestrator.drive(agent, signal)
+  assert.equal(f.status(agent).reason, 'LEGACY_WORKFLOW_UNSUPPORTED')
+  assert.equal(runner.graph.read().checksum, archive.checksum)
+  assert.equal(f.h.backend.requests.length, 0)
+})
+
+test('v2 keeps oversized project instructions out of the native executor system prompt and pages their original', async t => {
+  const marker = 'PROJECT_SOURCE_END_731', body = 'Check the recorded unit evidence. '.repeat(2500) + marker
+  let paged = false
+  const f = await fixture(t, { config: { dynamicContextMaxBytes: 2048, unitFinalReport: false }, respond: ({ payload }) => {
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask() })
+    if (isController(payload)) return { text: 'Complete.' }
+    const system = payload.messages[0].content
+    const page = payload.messages.findLast(row => row.role === 'tool')
+    if (page) {
+      assert.match(page.content, /PROJECT_SOURCE_END_731/)
+      paged = true
+      return { text: 'Inspected the original.' }
+    }
+    assert.ok(!system.includes(marker))
+    const facts = JSON.parse(system.match(/<direct_host_facts>\s*([\s\S]*?)\s*<\/direct_host_facts>/)[1])
+    assert.ok(facts.materialSummary.fields.some(field => field.field === 'instructions'))
+    const reader = facts.materialSummary.reader
+    return tool(reader.tool, { ...reader.arguments, length: body.length + 8192 })
+  } })
+  fs.writeFileSync(path.join(f.projectRoot, 'AGENTS.md'), body)
+  const agent = await f.agent('large-project-instructions')
+  await f.h.ctx.commands.execute(agent, '/task-graph Check project instructions.', [], new AbortController().signal)
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(f.status(agent).phase, 'COMPLETE', JSON.stringify(f.status(agent)))
+  assert.equal(paged, true)
 })

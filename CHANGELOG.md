@@ -1,3 +1,8 @@
+# 0.1.2-rc.3
+
+- 单元工作流 v2，Linux 与 WSL，工作流兼容周期 1。全新版本基数从 rc.0 重新编号。
+- 本包与官方 Timeline 不兼容。包内新增离线 HTML 运行图谱、逐角色上下文、工具名单和联动指南。
+
 # 0.1.1-rc.62
 
 - Visual inspection: each role chooses up to 5 new images per turn. The model sees the most recent 10 image occurrences; references and original tool records remain available for a fresh read.

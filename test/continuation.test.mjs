@@ -6,11 +6,15 @@ import path from 'node:path'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { startFakeLlama } from '../testing/fake-llama.mjs'
 import { DirectJournal, acquireDirectLease } from '../durable-store.mjs'
+import { namesStored, readStored, writeStored } from '../workflow-io.mjs'
 import { checkpointData } from '../checkpoints.mjs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { durableConfigHash } from '../index.mjs'
+import { readPluginVersionsSync } from '../recovery-versions.mjs'
+import { watchValidation } from '../testing/validation-probe.mjs'
+import { createHash } from 'node:crypto'
 
 async function location(t, respond) {
   const storageRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-continuation-')))
@@ -25,6 +29,216 @@ async function location(t, respond) {
     } }
 }
 const writeResponse = { tools: [{ name: 'write', arguments: { file_path: 'effect.txt', content: 'written once\n' } }] }
+function appendToReceipt(file, text) {
+  const bytes = Buffer.concat([readStored(file), Buffer.from(text)])
+  if (!writeStored(file, bytes)) fs.appendFileSync(file, text)
+}
+
+// Source-hash checkpoints must first be opened by their recorded transition build.
+function simulateSourceTransitionBuild(t) {
+  const { pluginVersions } = JSON.parse(fs.readFileSync(new URL('../recovery-compatibility.json', import.meta.url))).versionTransition
+  const paths = new Map([
+    [new URL('../package.json', import.meta.url).href, 'dsh-dynamic-context'],
+    [new URL('./package.json', import.meta.resolve('dsh-better-task-grapth')).href, 'dsh-better-task-grapth'],
+  ])
+  const versioned = (file, data) => paths.has(file?.href)
+    ? JSON.stringify({ ...JSON.parse(data), version: pluginVersions[paths.get(file.href)] }) : data
+  const sync = fs.readFileSync.bind(fs), read = fs.promises.readFile.bind(fs.promises)
+  t.mock.method(fs, 'readFileSync', (file, ...args) => versioned(file, sync(file, ...args)))
+  t.mock.method(fs.promises, 'readFile', async (file, ...args) => versioned(file, await read(file, ...args)))
+}
+
+test('downgrading either plugin pauses recovery before dispatch and leaves the checkpoint intact', async t => {
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Continued on the same declared versions.' })
+  let writes = 0
+  const setup = ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
+  const first = await where.open({}, setup)
+  first.runner.submit(runtimeProposal(['write']))
+  const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const options = { expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum }
+  const journal = DirectJournal.open(paused.runDirectory, {})
+  const original = journal.loadCheckpoint(journal.latest()).pluginVersions
+  assert.deepEqual(original, readPluginVersionsSync())
+  await first.close()
+  const second = await where.open({}, setup)
+  const read = fs.promises.readFile.bind(fs.promises)
+  for (const name of Object.keys(original)) {
+    const manifest = new URL(name === 'dsh-dynamic-context' ? '../package.json' : './package.json',
+      name === 'dsh-dynamic-context' ? import.meta.url : import.meta.resolve('dsh-better-task-grapth'))
+    const changed = '0.0.0'
+    const override = t.mock.method(fs.promises, 'readFile', (file, ...args) => file?.href === manifest.href
+      ? Promise.resolve(JSON.stringify({ name, version: changed, workflowCompatibilityEpoch: 1 })) : read(file, ...args))
+    for (const recover of [false, true]) {
+      await assert.rejects(second.runner.resumeActive({ ...options, recover }), error =>
+        error.code === 'WORKFLOW_PLUGIN_DOWNGRADE' && error.message.includes(name)
+        && error.message.includes(changed))
+      assert.equal(second.runner.checkpointStatus().checksum, options.checkpointChecksum)
+    }
+    override.mock.restore()
+  }
+  assert.equal(where.backend.requests.length, 1)
+  assert.equal(writes, 1)
+  const result = await second.runner.resumeActive(options)
+  assert.equal(result.report.text, 'Continued on the same declared versions.')
+  assert.equal(writes, 1)
+  assert.equal(where.backend.requests.length, 2)
+})
+
+test('opening an idle workflow with a newer installation raises the floor before another command or model request', async t => {
+  const where = await location(t, () => { throw Error('unexpected model call') })
+  const first = await where.open({ storageFormat: 'sqlite' })
+  first.runner.submit(runtimeProposal(['write']))
+  await first.close()
+  const url = new URL('../package.json', import.meta.url).href, read = fs.readFileSync.bind(fs)
+  const mock = t.mock.method(fs, 'readFileSync', (file, ...args) => file?.href === url
+    ? JSON.stringify({ name: 'dsh-dynamic-context', version: '99.0.0', workflowCompatibilityEpoch: 1 }) : read(file, ...args))
+  const upgraded = await where.open({ storageFormat: 'sqlite' })
+  assert.equal(JSON.parse(upgraded.runner.storage.db.q('SELECT workflow_release FROM instance WHERE id=1').get().workflow_release).pluginVersions['dsh-dynamic-context'], '99.0.0')
+  assert.equal(upgraded.runner.graph.read().revision, 1)
+  await upgraded.close()
+  mock.mock.restore()
+  const older = await where.open({ storageFormat: 'sqlite' })
+  assert.equal(older.runner.status().code, 'WORKFLOW_PLUGIN_DOWNGRADE')
+  await assert.rejects(older.runner.runNext({ expectedRevision: 1 }), { code: 'WORKFLOW_PLUGIN_DOWNGRADE' })
+  assert.equal(older.runner.graph.read().revision, 1)
+  assert.equal(where.backend.requests.length, 0)
+})
+
+test('untagged checkpoints require exact admission, then an upgrade advances the graph before dispatch and fences rollback', async t => {
+  const graphRelease = runner => JSON.parse(runner.storage.db.q('SELECT workflow_release FROM instance WHERE id=1').get().workflow_release)
+  let running, expected, writes = 0
+  const where = await location(t, ({ index }) => {
+    if (expected) assert.deepEqual(graphRelease(running).pluginVersions, expected)
+    return index === 1 ? writeResponse : index < 4 ? { tools: [{ name: 'read', arguments: { file_path: 'effect.txt' } }] } : { text: 'Finished once.' }
+  })
+  const setup = ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
+  const first = await where.open({ storageFormat: 'sqlite' }, setup)
+  first.runner.submit(runtimeProposal(['write', 'read']))
+  const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const j = DirectJournal.open(paused.runDirectory, {})
+  const old = j.loadCheckpoint(j.latest(), { hydratePayloads: false })
+  const original = old.pluginVersions, bumped = { ...original, 'dsh-dynamic-context': original['dsh-dynamic-context'].replace(/-rc\.\d+$/, '') }
+  assert.equal(old.workflowCompatibilityEpoch, 1)
+  delete old.workflowCompatibilityEpoch
+  let checksum = j.checkpoint('PAUSED', old).checksum
+  const url = new URL('../package.json', import.meta.url).href, read = fs.promises.readFile.bind(fs.promises)
+  let version = bumped['dsh-dynamic-context'], epoch = 1
+  t.mock.method(fs.promises, 'readFile', (file, ...args) => file?.href === url
+    ? Promise.resolve(JSON.stringify({ name: 'dsh-dynamic-context', version, workflowCompatibilityEpoch: epoch })) : read(file, ...args))
+  const resume = runner => runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, pauseAfterRequests: 1 })
+  // Reconstruct the pre-epoch storage schema along with its untagged checkpoint.
+  const db = first.runner.storage.db
+  db.db.exec('ALTER TABLE instance DROP COLUMN workflow_release; PRAGMA user_version=1')
+  assert.throws(() => first.runner.admitWorkflowRelease({ workflowCompatibilityEpoch: 1, pluginVersions: bumped }),
+    { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  await assert.rejects(resume(first.runner), { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  assert.equal(db.q('PRAGMA user_version').get().user_version, 1)
+  version = original['dsh-dynamic-context']
+  const adopted = await resume(first.runner)
+  checksum = adopted.checkpoint.checksum
+  assert.equal(j.loadCheckpoint(j.latest()).workflowCompatibilityEpoch, 1)
+  await first.close()
+
+  version = bumped['dsh-dynamic-context']
+  const changed = await where.open({ storageFormat: 'sqlite', systemPrompt: 'Changed execution instructions' }, setup)
+  await assert.rejects(resume(changed.runner), { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  assert.equal(changed.runner.checkpointStatus().checksum, checksum)
+  assert.deepEqual(graphRelease(changed.runner).pluginVersions, original)
+  await changed.close()
+  const second = await where.open({ storageFormat: 'sqlite' }, setup)
+  running = second.runner; expected = bumped
+  epoch = 2
+  await assert.rejects(resume(running), { code: 'WORKFLOW_COMPATIBILITY_EPOCH_MISMATCH' })
+  epoch = 1
+  const updated = await resume(running)
+  checksum = updated.checkpoint.checksum
+  const updatedJournal = DirectJournal.open(updated.runDirectory, {})
+  const after = updatedJournal.loadCheckpoint(updatedJournal.latest())
+  assert.deepEqual(after.pluginVersions, bumped)
+  assert.equal(after.workflowCompatibilityEpoch, 1)
+  assert.deepEqual(after.trace.events.findLast(row => row.type === 'task/code-migration').data.previousPluginVersions, original)
+  await second.close()
+  const third = await where.open({ storageFormat: 'sqlite' }, setup)
+  running = third.runner
+  version = original['dsh-dynamic-context']
+  await assert.rejects(resume(running), { code: 'WORKFLOW_PLUGIN_DOWNGRADE' })
+  assert.equal(running.checkpointStatus().checksum, checksum)
+  assert.equal(where.backend.requests.length, 3)
+  version = bumped['dsh-dynamic-context']
+  const final = await resume(running)
+  assert.equal(final.report.text, 'Finished once.')
+  assert.equal(writes, 1)
+  assert.equal(where.backend.requests.length, 4)
+})
+
+test('the last source-based build resumes normally, writes a versioned checkpoint and commits the tool effect once', async t => {
+  simulateSourceTransitionBuild(t)
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : index === 2
+    ? { tools: [{ name: 'read', arguments: { file_path: 'effect.txt' } }] } : { text: 'Migrated and finished.' })
+  let writes = 0
+  const setup = ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
+  const first = await where.open({}, setup)
+  first.runner.submit(runtimeProposal(['write','read']))
+  const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const journal = DirectJournal.open(paused.runDirectory, {})
+  const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  const { versionTransition } = JSON.parse(fs.readFileSync(new URL('../recovery-compatibility.json', import.meta.url)))
+  delete saved.workflowCompatibilityEpoch
+  delete saved.pluginVersions
+  saved.configHash = durableConfigHash(first.runner.config, first.runner.inputMeter, [['local-only.mjs', '0'.repeat(64)]])
+  const unrecognized = journal.checkpoint('PAUSED', saved).checksum
+  await assert.rejects(first.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: unrecognized, recover: true }),
+    { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  assert.equal(first.runner.checkpointStatus().checksum, unrecognized)
+  saved.configHash = durableConfigHash(first.runner.config, first.runner.inputMeter, versionTransition.previousCode)
+  const checksum = journal.checkpoint('PAUSED', saved).checksum
+  await first.close()
+  const changed = await where.open({ systemPrompt: 'Different execution instructions' }, setup)
+  await assert.rejects(changed.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true }),
+    { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  assert.equal(changed.runner.checkpointStatus().checksum, checksum)
+  await changed.close()
+  const second = await where.open({}, setup)
+  const migrated = await second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, pauseAfterRequests: 1 })
+  assert.equal(migrated.paused, true)
+  const next = DirectJournal.open(migrated.runDirectory, {})
+  assert.deepEqual(next.loadCheckpoint(next.latest()).pluginVersions, versionTransition.pluginVersions)
+  const final = await second.runner.resumeActive({ expectedRevision: migrated.revision, checkpointChecksum: migrated.checkpoint.checksum })
+  assert.equal(final.report.text, 'Migrated and finished.')
+  assert.equal(final.trace.events.filter(row => row.type === 'task/code-migration').length, 1)
+  assert.equal(writes, 1)
+  assert.equal(where.backend.requests.length, 3)
+})
+
+test('a pre-role-model checkpoint explicitly recovers on its original API despite a newly registered executor', async t => {
+  simulateSourceTransitionBuild(t)
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Original backend resumed.' })
+  const first = await where.open()
+  first.runner.submit(runtimeProposal(['write']))
+  await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  const state = first.runner.graph.read(), active = state.graph.state.active
+  const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId,
+    attemptId: active.attemptId, contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
+  const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  const legacy = JSON.parse(fs.readFileSync(new URL('../recovery-compatibility.json', import.meta.url))).previousCode
+    .find(code => new Map(code).get('index.mjs') === 'ab5028498336ef36340324603d8b14323450c916850ed5e4c594aaecf9aad841')
+  assert.ok(legacy)
+  delete saved.trace.modelRoute
+  delete saved.workflowCompatibilityEpoch
+  delete saved.pluginVersions
+  saved.configHash = durableConfigHash(first.runner.config, undefined, legacy)
+  journal.checkpoint('PAUSED', saved)
+  const checksum = journal.latest().checksum
+  await first.close()
+  const second = await where.open()
+  second.ctx.get('dynamicContextRoleModels').register({ pluginId: 'later', registrationId: 'new-route', role: 'executor',
+    backend: { model: 'new-model', direct: { endpoint: 'http://127.0.0.1:1/v1/chat/completions' } } })
+  const result = await second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: checksum, recover: true })
+  assert.equal(result.report.text, 'Original backend resumed.')
+  assert.equal(where.backend.requests.length, 2)
+  assert.ok(where.backend.requests.every(row => row.payload.model === 'fake-llama'))
+  assert.equal(result.trace.events.filter(row => row.type === 'tool/call').length, 1)
+})
 
 for (const migration of [
   { label: 'hot permissions with unchanged config', file: 'index.mjs', sha: '2b3b07e8d9b5f111ed49ed6a11173cd5979402d8cbb31695767ba46bcc1aeef4' },
@@ -33,6 +247,7 @@ for (const migration of [
   { label: 'command-entry with unchanged leaf inputs', file: 'index.mjs', sha: '4c7b3e55c77226136c4924697527663eda3c3f24f24d2f19965cb6dddd5db2c2' },
 ]) {
 test(`approved ${migration.label} build migration resumes a normal pause without repeating prior effects`, async t => {
+  simulateSourceTransitionBuild(t)
   const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Continued after the display update.' })
   let writes = 0
   const setup = ctx => ctx.on('tools/execute', (exec, next) => { if (exec.name === 'write') writes++; return next() })
@@ -45,6 +260,8 @@ test(`approved ${migration.label} build migration resumes a normal pause without
   const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
     contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
   const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  delete saved.workflowCompatibilityEpoch
+  delete saved.pluginVersions
   saved.configHash = durableConfigHash(first.runner.config, undefined, code)
   journal.checkpoint('PAUSED', saved)
   const checksum = journal.latest().checksum
@@ -75,6 +292,8 @@ test(`approved ${migration.label} old code cannot authorize a changed execution 
   const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
     contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
   const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  delete saved.workflowCompatibilityEpoch
+  delete saved.pluginVersions
   saved.configHash = durableConfigHash(first.runner.config, undefined, code)
   journal.checkpoint('PAUSED', saved)
   const checksum = journal.latest().checksum
@@ -109,12 +328,21 @@ test('a paused real write resumes after restart without repeating either the wri
   const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
   assert.equal(paused.paused, true)
   assert.equal(first.runner.graph.read().reports.length, 0)
-  assert.equal(first.runner.checkpointStatus().phase, 'PAUSED')
+  const journalDirectory = path.join(paused.runDirectory, 'continuation')
+  const head = JSON.parse(readStored(path.join(journalDirectory, 'head.json'), 'utf8'))
+  const journalReads = watchValidation(t, fs, 'openSync', { label: 'checkpoint status journal chain', maxCalls: head.sequence + 1,
+    matches: file => typeof file === 'string' && path.dirname(file) === journalDirectory && /^record-/.test(path.basename(file)) })
+  const graphReads = watchValidation(t, first.runner.graph.store, 'inspect', { label: 'workflow status graph verification', maxCalls: 1 })
+  assert.equal(first.runner.status().continuation.phase, 'PAUSED')
+  journalReads()
+  graphReads()
   assert.equal(writes, 1)
   assert.equal(where.backend.requests.length, 1)
   await first.close()
   const second = await where.open({}, setup)
+  const checkpointReads = watchValidation(t, DirectJournal.prototype, 'readCheckpoint', { label: 'normal resume snapshot verification', maxCalls: 1 })
   const result = await second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum })
+  assert.equal(checkpointReads(), 1)
   assert.equal(result.report.text, 'Recovered report, still unverified.')
   assert.equal(writes, 1)
   assert.equal(where.backend.requests.length, 2)
@@ -178,12 +406,32 @@ test('a tampered saved wire body cannot enter a resumed history even with an unc
   first.runner.submit(runtimeProposal(['write']))
   const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
   const directory = path.join(first.runner.config.directory, first.runner.graph.status().active.attemptId, 'continuation')
-  const file = fs.readdirSync(directory).find(f => /^request-/.test(f))
+  const file = namesStored(directory).find(f => /^request-/.test(f))
   await first.close()
-  fs.appendFileSync(path.join(directory, file), 'tampered')
   const second = await where.open()
+  appendToReceipt(path.join(directory, file), 'tampered')
   await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum }), /DIRECT_REQUEST_PAYLOAD_HASH_OR_SCOPE_MISMATCH/)
   assert.equal(where.backend.requests.length, 1)
+})
+
+test('resume detects a previously checked request changed between asynchronous validation slices', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-resume-evidence-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const identity = { taskId: 'fixture', attemptId: 'fixture' }
+  const writer = new DirectJournal(root, identity)
+  const requests = [1, 2].map(index => {
+    const payload = { messages: [{ role: 'user', content: 'request ' + index }] }
+    return { payload, bodySha256: createHash('sha256').update(JSON.stringify(payload)).digest('hex') }
+  })
+  const checkpoint = writer.checkpoint('PAUSED', { trace: { requests } })
+  const reader = DirectJournal.open(root, identity)
+  const load = reader.loadPayload
+  t.mock.method(reader, 'loadPayload', function (reference, checksum) {
+    const payload = load.call(this, reference, checksum)
+    if (checksum === requests[0].bodySha256) setImmediate(() => fs.appendFileSync(reference.ref, 'changed'))
+    return payload
+  })
+  await assert.rejects(reader.loadResumeCheckpoint(checkpoint, { hydratePayloads: false }), /DIRECT_REQUEST_PAYLOAD_CHANGED/)
 })
 
 test('a changed resume ticket cannot poison the valid paused checkpoint', async t => {
@@ -204,8 +452,8 @@ test('configuration changes and altered checkpoint bytes stop recovery before HT
   const changed = await where.open({ direct: { generation: { seed: 7 } } })
   await assert.rejects(changed.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum }), /DIRECT_RESUME_CONFIGURATION_CHANGED/)
   await changed.close()
-  fs.appendFileSync(paused.checkpoint.snapshot.ref, '\n')
   const corrupted = await where.open()
+  appendToReceipt(paused.checkpoint.snapshot.ref, '\n')
   await assert.rejects(corrupted.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum }), /DIRECT_CHECKPOINT_HASH_MISMATCH/)
   assert.equal(where.backend.requests.length, 1)
 })
@@ -382,8 +630,8 @@ test('corrupted archive bytes cannot be carried into a resumed checkpoint', asyn
   snapshot.archives.push(archive)
   const archived = journal.checkpoint('PAUSED', snapshot)
   await first.close()
-  fs.appendFileSync(archive.ref, '\n')
   const second = await where.open(compactionConfig)
+  appendToReceipt(archive.ref, '\n')
   await assert.rejects(second.runner.resumeActive({ expectedRevision: 2, checkpointChecksum: archived.checksum }), /DIRECT_ARCHIVE_HASH_OR_SCOPE_MISMATCH/)
   assert.equal(where.backend.requests.length, 1)
 })
@@ -554,7 +802,9 @@ test('cooperative pause waits for the complete native tool batch before sealing 
   const work = first.runner.runNext({ expectedRevision: 1 })
   await entered
   assert.equal(first.runner.checkpointStatus().phase, 'TOOL_PENDING')
+  const pauseReads = watchValidation(t, first.runner.graph.store, 'inspect', { label: 'pause admission graph verification', maxCalls: 1 })
   const receipt = first.runner.pauseActive({ expectedRevision: 2 })
+  pauseReads()
   assert.equal(receipt.status, 'PAUSE_REQUESTED')
   assert.equal(fs.existsSync(path.join(where.projectRoot, 'effect.txt')), false)
   release()
@@ -608,7 +858,9 @@ test('explicit recovery of a crashed tool submits its saved log and UNKNOWN noti
   const worker = crashWorker(t, where, 'tool-pending'); await worker.exited
   const h = await where.open(), status = h.runner.checkpointStatus()
   assert.equal(status.recoverable, true)
+  const recoverReads = watchValidation(t, DirectJournal.prototype, 'readCheckpoint', { label: 'unexpected resume snapshot verification', maxCalls: 1 })
   const result = await resumeAfterLeaseRelease(h, { expectedRevision: 2, checkpointChecksum: status.checksum, recover: true })
+  assert.equal(recoverReads(), 1)
   assert.equal(where.backend.requests.length, 2)
   assert.equal(fs.readFileSync(path.join(where.projectRoot, 'effect.txt'), 'utf8'), 'written once\n')
   const recovery = result.trace.events.find(row => row.type === 'task/interruption-recovered')
@@ -625,6 +877,7 @@ test('explicit recovery of an interrupted model resends the same request without
 })
 
 test('exact installed permission defaults may migrate to auto without permitting unrelated configuration changes', async t => {
+  simulateSourceTransitionBuild(t)
   const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Continued with live inherited permissions.' })
   const first = await where.open({ direct: { runtime: { sandboxMode: 'workspace-write', approvalPolicy: 'ask' } } })
   first.runner.submit(runtimeProposal(['write']))
@@ -634,6 +887,8 @@ test('exact installed permission defaults may migrate to auto without permitting
   const journal = DirectJournal.open(first.runner.activeRunDirectory(state), { taskId: active.nodeId, attemptId: active.attemptId,
     contextVersion: state.contexts.version, owner: active.owner, graphRevision: state.revision })
   const saved = journal.loadCheckpoint(journal.latest(), { hydratePayloads: false })
+  delete saved.workflowCompatibilityEpoch
+  delete saved.pluginVersions
   saved.configHash = durableConfigHash(first.runner.config, undefined, code)
   journal.checkpoint('PAUSED', saved); const checksum = journal.latest().checksum
   await first.close()

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { readStored, statStored, hasStored } from './workflow-io.mjs'
 // Read-only import of known old receipts. Missing historical timings stay absent.
 import fs from 'node:fs'
 import path from 'node:path'
@@ -40,8 +41,8 @@ export async function importWorkflowPerformance(runner, cutoff = Date.now()) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     if (!entry.isDirectory() || !/^attempt_[\w-]+$/.test(entry.name)) continue
     const file = path.join(directory, entry.name, 'trace.json')
-    if (!fs.existsSync(file) || fs.statSync(file).mtimeMs >= cutoff) continue
-    const trace = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (!hasStored(file) || statStored(file).mtimeMs >= cutoff) continue
+    const trace = JSON.parse(readStored(file, 'utf8'))
     for (const request of trace.requests ?? []) {
       if (['PREPARED', 'NOT_SENT'].includes(request.status)) continue
       const group = 'direct:' + (trace.assembly?.task.attemptId ?? entry.name) + (trace.executionSegment ? ':' + trace.executionSegment : '')
@@ -63,8 +64,8 @@ export async function importWorkflowPerformance(runner, cutoff = Date.now()) {
   if (fs.existsSync(revisions)) for (const entry of fs.readdirSync(revisions, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const file = path.join(revisions, entry.name, 'role.json')
-    if (!fs.existsSync(file) || fs.statSync(file).mtimeMs >= cutoff) continue
-    const role = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (!hasStored(file) || statStored(file).mtimeMs >= cutoff) continue
+    const role = JSON.parse(readStored(file, 'utf8'))
     for (const call of role.calls ?? []) {
       if (['PREPARED', 'NOT_SENT'].includes(call.phase)) continue
       const group = 'role:' + (role.runId ?? entry.name)

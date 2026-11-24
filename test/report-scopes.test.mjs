@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { readStored, writeStored } from '../workflow-io.mjs'
 import path from 'node:path'
 import os from 'node:os'
 import { createHash } from 'node:crypto'
@@ -107,7 +108,7 @@ test('updater explains each actual change with an original report citation; revi
     if (index === 5) return { text: '{"verdict":"REVIEW_REQUIRED"}' }
     if (index === 6) {
       const templates = examples(payload.messages[0].content).map(value => revisionProposalSchema.parse(value))
-      assert.deepEqual(templates.map(value => value.disposition), ['REVISE', 'NO_CHANGE', 'NEEDS_USER'])
+      assert.deepEqual(templates.map(value => value.disposition), ['REVISE', 'NO_CHANGE', 'ESCALATE'])
       assert.equal(templates[0].modificationReport.changes[0].path, '/contextGraph/bindings/deliver/instruction')
       assert.doesNotMatch(JSON.stringify(input), /RECOVERED_PROCESS_ERROR_NOISE|1 check passed/)
       assert.ok(input.evidenceCatalog.find(fact => fact.factId === 'fact_0').fields.some(field => field.pointer === '/summary'))
@@ -292,7 +293,9 @@ for (const change of ['modified', 'missing']) test(`historical report inheritanc
   }
   assert.equal(state.reports[0].currentArtifactChecks, undefined, 'Historical report is not rewritten')
   const trace = state.reports[0].evidence[0].ref
-  fs.appendFileSync(path.resolve(h.root, trace), '\nTAMPERED')
+  const file = path.resolve(h.root, trace)
+  const changed = Buffer.concat([readStored(file), Buffer.from('\nTAMPERED')])
+  if (!writeStored(file, changed)) fs.writeFileSync(file, changed)
   assert.throws(() => h.runner.graph.checkInputs(state, later.id), /ARTIFACT_CHANGED_OR_HASH_MISMATCH/)
   assert.throws(() => h.runner.graph.checkInputs(state, later.id, pinned), /ARTIFACT_CHANGED_OR_HASH_MISMATCH/)
 })

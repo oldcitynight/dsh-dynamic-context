@@ -25,7 +25,58 @@ export const deliverySchema = z.object({
     consumerCheck: z.object({ root: text, testId: id, isolation: text }).strict().optional(),
   }).strict()).min(1),
 }).strict()
-export const acceptancePlan = state => state?.planningRecord?.report?.verification
+// The initial planning evidence stays immutable. A separately approved root
+// revision may supersede its acceptance criteria with an attributable source.
+const revisions = new WeakMap()
+export function currentCriteria(state) {
+  const events = state?.graph?.events
+  if (!events) return null
+  const cached = revisions.get(events)
+  if (cached && cached.tip === events.at(-1)) return cached.value
+  let value = null
+  const bindings = new Map(), sources = new Map()
+  for (const event of events) {
+    if (event.type !== 'REVISED' || !event.data.review?.proposal?.criteriaAmendment) continue
+    value = event.data.review.proposal.criteriaAmendment
+    for (const row of value.bindings) {
+      bindings.set(row.taskId, row)
+      if (row.reportSources) sources.set(row.taskId, row.reportSources)
+    }
+  }
+  revisions.set(events, { tip: events.at(-1), value, bindings, sources })
+  return value
+}
+export function currentPlanningRecord(state) {
+  const amendment = currentCriteria(state)
+  return amendment ? { ...state.planningRecord, report: amendment.report } : state?.planningRecord
+}
+export const acceptancePlan = state => currentPlanningRecord(state)?.report?.verification
+// Resume authenticates the seed against the plan in effect when the attempt began.
+export function verificationAtStart(state, attemptId) {
+  const events = state.graph.events
+  const begin = events.findLast(row => row.type === 'BEGUN' && row.data.attemptId === attemptId)
+  if (!begin || !currentCriteria(state)) return acceptancePlan(state)
+  return (events.findLast(row => row.seq <= begin.seq && row.type === 'REVISED' && row.data.review?.proposal?.criteriaAmendment)
+    ?.data.review.proposal.criteriaAmendment.report ?? state.planningRecord.report).verification
+}
+export function criteriaInstruction(state, binding) {
+  if (!currentCriteria(state)) return binding.instruction
+  const entry = revisions.get(state.graph.events).bindings.get(binding.taskId)
+  return entry && digest(binding.instruction) === entry.base ? entry.instruction : binding.instruction
+}
+// Keep an active journal pinned while an approved root revision redirects reports for unopened work.
+export function criteriaReportSources(state, binding) {
+  if (!currentCriteria(state)) return binding.inheritReports
+  const update = revisions.get(state.graph.events).sources.get(binding.taskId)
+  return update && digest(binding.inheritReports) === update.base ? update.sources : binding.inheritReports
+}
+export function criteriaNotice(state, messageId) {
+  const amendment = currentCriteria(state)
+  if (!amendment || amendment.sourceMessageId !== messageId) return {}
+  return { reviewedCriteria: { authority: 'APPROVED_GRAPH_REVISION', sourceMessageId: messageId,
+    qualification: '当前生效的验收索引由获批修订同步；此前种子、旧报告或工具回显中的原始规格按其原版本解释。',
+    verificationPlan: amendment.report.verification } }
+}
 export const acceptanceEnabled = state => acceptancePlan(state)?.version === 1
 
 // Working corrections read their own authenticated evidence through the existing
@@ -76,8 +127,8 @@ export function scopedCurrentFacts(state, taskIds) {
   const visit = id => { if (wanted.has(id)) return; wanted.add(id); nodes.find(row => row.id === id)?.parents.forEach(visit) }
   state.contexts.bindings.filter(row => taskIds.includes(row.taskId)).flatMap(row => row.contexts).forEach(visit)
   return nodes.filter(node => wanted.has(node.id)).map(node => {
-    const latest = node.mutable && (state.sharedContextHistory ?? []).findLast(row => row.id === node.id)
-    return { ...structuredClone(node), ...(node.mutable ? { content: latest?.content ?? node.content, revision: latest?.revision ?? 1 } : {}),
+    const latest = (state.sharedContextHistory ?? []).findLast(row => row.id === node.id && (node.mutable || row.authority))
+    return { ...structuredClone(node), ...(node.mutable || latest ? { content: latest?.content ?? node.content, revision: latest?.revision ?? 1 } : {}),
       contentSha256: digest(latest?.content ?? node.content) }
   })
 }
@@ -89,8 +140,8 @@ export function acceptanceSnapshot(state, report, facts) {
     qualification: 'Current bound facts at submission. startContext is immutable historical provenance, not the current value. Shared updates apply directly without approval.' }
   return { startContext: facts.localContext, submissionContext: snapshot, snapshotHash: digest(snapshot) }
 }
-export const ACCEPTANCE_PLANNING = `DYNAMIC_CONTEXT_ACCEPTANCE_V1\n新建联动规划的 planningReport 增加 verification：{"version":1,"requirements":[{"id":"user_goal","origin":"USER","statement":"原始用户目标","source":"对应的原始请求原文或明确出处","verification":"与使用目标相称的检查方法和证据边界","required":true}],"deliveryRequired":true}。逐项保留用户目标，并将自主设计指标标为 DESIGN、未证实条件标为 ASSUMPTION；不把数量、文件规模或自写断言等同于用户体验。deliveryRequired 按任务是否交付可使用成果决定。终点叶需汇总所有相关目标的实际证据；代表性真实接口和从交付物开始的用户路径应在适用时验证，无法验证则明确限制，不能用共享错误假设的替身测试证明真实接口。不要强求与任务无关的昂贵测试。工具权限和原生请求控制不变。` 
-export const ACCEPTANCE_WORK = `DYNAMIC_CONTEXT_ACCEPTANCE_V1\nverificationPlan 是初始需求索引，不取代 taskContract。executionReport 可增加 verification 数组，每项 {"requirementId":"user_goal","status":"VERIFIED","method":"REAL_INTERFACE","target":"实际接口或用户路径","environment":"真实版本及运行环境","testIds":["check"],"limits":[],"conclusion":"证据支持的结论"}。method 也可为 STATIC、SIMULATED、CONSUMER_PATH、ANALYSIS，status 可为 LIMITED/NOT_VERIFIED；如实注明范围，不把模拟通过写成真实验证。普通叶只覆盖本叶；最终交付叶覆盖整个目标。verificationPlan.deliveryRequired 时最终交付叶必须有 executionReport.delivery：{"items":[{"id":"delivery","path":"dist/product","kind":"directory","sha256":"宿主目录摘要","entrypoints":["README.md"],"requiredFiles":["bin/start"],"externalRequirements":[],"userSteps":["阅读 README 后启动"],"testIds":["consumer"],"consumerCheck":{"root":"consumer-check","testId":"consumer","isolation":"从交付物复制/解包到独立目录后按用户入口验证"}}]}。entrypoints/requiredFiles 均相对交付根；文件交付如 ZIP 必须先解包到 consumerCheck.root，目录成员与测试由宿主核对。testIds 引用真实回执；隔离性与业务正确性仍由验收者核对。不是安装型交付时可以省略 consumerCheck 并在 limitations 解释。禁止在验收补正角色中执行实际工作。`
+export const ACCEPTANCE_PLANNING = `DYNAMIC_CONTEXT_ACCEPTANCE_V1\n新建联动规划的 planningReport 增加 verification：{"version":1,"requirements":[{"id":"user_goal","origin":"USER","statement":"原始用户目标","source":"对应的原始请求原文或明确出处","verification":"与使用目标相称的检查方法和证据边界","required":true}],"deliveryRequired":true}。逐项保留用户目标，并将自主设计指标标为 DESIGN、未证实条件标为 ASSUMPTION；不把数量、文件规模或自写断言等同于用户体验。deliveryRequired 只表示需要在工作区交付文件或目录。只读核实、文字答复、说明检查失败的任务填 false；答复中的具体值在 summary 给出。终点叶需汇总所有相关目标的实际证据；代表性真实接口和从交付物开始的用户路径应在适用时验证，无法验证则明确限制，不能用共享错误假设的替身测试证明真实接口。不要强求与任务无关的昂贵测试。工具权限和原生请求控制不变。`
+export const ACCEPTANCE_WORK = `DYNAMIC_CONTEXT_ACCEPTANCE_V1\nverificationPlan 是初始需求索引，不取代 taskContract。executionReport 可增加 verification 数组，每项 {"requirementId":"user_goal","status":"VERIFIED","method":"REAL_INTERFACE","target":"实际接口或用户路径","environment":"真实版本及运行环境","testIds":["check"],"limits":[],"conclusion":"证据支持的结论"}。method 也可为 STATIC、SIMULATED、CONSUMER_PATH、ANALYSIS，status 可为 LIMITED/NOT_VERIFIED；如实注明范围，不把模拟通过写成真实验证。普通叶只覆盖本叶；最终交付叶覆盖整个目标。verificationPlan.deliveryRequired 时最终交付叶必须有 executionReport.delivery：{"items":[{"id":"delivery","path":"dist/product","kind":"directory","sha256":"宿主目录摘要","entrypoints":["README.md"],"requiredFiles":["bin/start"],"externalRequirements":[],"userSteps":["阅读 README 后启动"],"testIds":["consumer"],"consumerCheck":{"root":"consumer-check","testId":"consumer","isolation":"从交付物复制/解包到独立目录后按用户入口验证"}}]}。entrypoints/requiredFiles 均相对交付根；文件交付如 ZIP 必须先解包到 consumerCheck.root，目录成员与测试由宿主核对。testIds 引用真实回执；隔离性与业务正确性仍由验收者核对。单个普通文本文件的 item 填 kind:file 和相对工作目录的文件名，entrypoints 和 requiredFiles 均填 []，使用方式写在 userSteps。不是安装型交付时可以省略 consumerCheck 并在 limitations 解释。若只是报告结果且 deliveryRequired 为 false，省略 delivery。实测不合格时，tests 中该项填 FAIL、expected、observed、实际 callId 与返回内容中的逐字 quote；该不合格要求在 verification 用 LIMITED 或 NOT_VERIFIED，limits 写明未达条件。成功读取数据的调用可证明实测不合格，只有工具本身报错才用 failedCallId。禁止在验收补正角色中执行实际工作。`
 export const ACCEPTANCE_REVIEW = `DYNAMIC_CONTEXT_ACCEPTANCE_V1\nacceptanceContext.submissionContext 是当前事实，startContext 仅表示起点；不得拿初始共享事实否定已生效修正。依据固定用户目标检查证据覆盖，区分 USER/DESIGN/ASSUMPTION；模拟只能证明模拟范围。不能要求执行者用报告补正修复真实成果。RETURN 的每个 issue 必须增加 correction 字段：REPORT 为声明/引用错误，WORK 为当前叶范围内真实工作缺陷，PLAN 为必须变更蓝图才能解决的缺口；expected 与 observed 必填，observed 必须具体指向提供的证据。混合问题先修真实成果再补报告；PLAN 不直接解锁改图，执行者先根据事实提交真实 BLOCKED/FAILED 或修复后的处置，再按原审查流程处理。报告不足以判定真实成果错误时用 REPORT 要求澄清证据，不能臆测 WORK。`
 
 export function planningAcceptanceVersion(config, previous) {

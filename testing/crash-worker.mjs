@@ -16,6 +16,9 @@ const h = await createRuntimeHarness({ projectRoot: path.join(storageRoot, 'work
 const checkpoint = DirectJournal.prototype.checkpoint
 DirectJournal.prototype.checkpoint = function (phase, state) {
   const result = checkpoint.call(this, phase, state)
+  // SQLite calls checkpoint again inside its transaction. Only the outer
+  // return is a durable READY/REPORT_READY boundary, visible to a new reader.
+  if (this.db?.inTransaction) return result
   if (phase === 'READY' && state.nextStep === 1 && ['safe-ready', 'hold-ready'].includes(mode)) {
     if (mode === 'safe-ready') process.kill(process.pid, 'SIGKILL')
     else {

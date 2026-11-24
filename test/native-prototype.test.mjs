@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto'
 import { DynamicContextGraph, validateState } from '../core.mjs'
 import { createHarness, GLOBAL_PRIVATE } from '../testing/harness.mjs'
 import { proposal, scenarioResponse } from '../testing/scenario.mjs'
+import { startFakeLlama } from '../testing/fake-llama.mjs'
 
 function location(t) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dynamic-context-')))
@@ -20,6 +21,26 @@ async function harness(t, options = {}) {
 }
 const payloadText = request => JSON.stringify(request.payload.messages)
 const code = expected => error => error.code === expected
+
+test('guarded native executor binds the role provider before DSH selects the adapter and validates the wire model', async t => {
+  const backend = await startFakeLlama({ respond: scenarioResponse })
+  t.after(() => backend.close())
+  const h = await harness(t, { providers: { 'worker-native': { displayName: 'Native worker', api: 'openai-completions',
+    baseURL: backend.origin + '/v1', apiKeyEnv: 'DYNAMIC_CONTEXT_FAKE_LLAMA_KEY', defaultContextWindow: 8192, defaultMaxTokens: 512,
+    models: [{ id: 'worker-native-model', name: 'Worker', contextWindow: 8192, maxTokens: 512 }] } } })
+  h.runner.submit(proposal())
+  const remove = h.ctx.get('dynamicContextRoleModels').register({ pluginId: 'fixture', registrationId: 'worker', role: 'executor',
+    backend: { provider: 'worker-native', model: 'worker-native-model' } })
+  const task = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(task.trace.contract.provider, 'worker-native')
+  assert.equal(backend.requests.length, 2)
+  assert.ok(backend.requests.every(row => row.payload.model === 'worker-native-model'))
+  assert.equal(h.backend.requests.length, 0)
+  remove()
+  await h.runner.runNext({ expectedRevision: h.runner.graph.read().revision })
+  assert.equal(h.backend.requests.length, 2)
+  assert.deepEqual(backend.errors, [])
+})
 
 test('real DSH -> shipped pi-ai -> fake llama: task boundaries, inheritance, tools and meter agree', async t => {
   const h = await harness(t); h.runner.submit(proposal())
@@ -126,11 +147,11 @@ for (const [name, response, expectedRequests] of [
   assert.equal(h.backend.requests.length, expectedRequests)
 })
 
-test('over-budget managed context is rejected before any backend request', async t => {
+test('the retired character limit permits a full managed context', async t => {
   const h = await harness(t, { config: { maxContextCharacters: 100 } }); h.runner.submit(proposal())
-  await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), code('ASSEMBLED_CONTEXT_BUDGET_EXCEEDED'))
-  assert.equal(h.backend.requests.length, 0)
-  assert.equal(h.runner.graph.read().reports.length, 0)
+  assert.ok((await h.runner.runNext({ expectedRevision: 1 })).report.text)
+  assert.ok(h.backend.requests.length > 0)
+  assert.equal(h.runner.graph.read().reports.length, 1)
 })
 
 test('request loop cap preserves ACTIVE instead of repeatedly calling the backend', async t => {

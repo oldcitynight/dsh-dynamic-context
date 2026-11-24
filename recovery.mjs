@@ -78,10 +78,12 @@ export function pendingResponseData(state, journal) {
  * Completed effects remain observations; pending effects become UNKNOWN, never
  * a replay queue. A lost model answer is the only operation retried as-is.
  */
-export async function recoverDirectCheckpoint({ journal, ctx }) {
-  const base = journal.latestCheckpoint()
+export async function recoverDirectCheckpoint({ journal, ctx, signal, boundary = journal.inspectHead() }) {
+  const { checkpoint: base, head } = boundary
   if (!base) fail('DIRECT_NO_SAFE_CHECKPOINT')
-  const state = journal.loadCheckpoint(base, { hydratePayloads: false }), trace = journal.readTrace()
+  const state = await journal.loadResumeCheckpoint(base, { hydratePayloads: false, signal })
+  journal.assertHeadUnchanged(head)
+  const trace = journal.readTrace()
   if (digest(trace.assembly) !== digest(state.assembly) || trace.contract?.hash !== state.contractHash
       || trace.events.length < state.trace.events.length
       || digest(trace.events.slice(0, state.trace.events.length)) !== digest(state.trace.events)) fail('DIRECT_RECOVERY_TRACE_DIVERGED')
@@ -98,7 +100,7 @@ export async function recoverDirectCheckpoint({ journal, ctx }) {
   if (pending && tasks.length) fail('DIRECT_RECOVERY_MULTIPLE_UNCOMMITTED_EXCHANGES')
   const response = pending?.completed ?? events.findLast(row => row.type === 'assistant/response')?.data
   const task = pending?.request ?? tasks[0]
-  const recovery = { version: 1, baseChecksum: base.checksum, fromChecksum: journal.latest().checksum,
+  const recovery = { version: 1, baseChecksum: base.checksum, fromChecksum: head.checksum,
     kind: response ? 'tools' : 'model', calls: [], repeatedTools: false, financialStatus: 'UNCHANGED' }
   if (task) {
     verifyRecoveryRequest(task, state, journal, trace.imageFailures)

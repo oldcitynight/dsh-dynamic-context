@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+import { readStored, hasStored } from './workflow-io.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { z } from 'zod'
@@ -17,7 +18,8 @@ export const progressReportSchema = z.object({ kind: z.literal('interim'), summa
   verification: z.array(z.object({ summary: text, evidence }).strict()), limitations: z.array(text) }).strict()
 export const PROGRESS_REPORT_PROMPT = `DYNAMIC_CONTEXT_PROGRESS_REPORTER_V1
 你是途中总体执行报告者。用户是在询问现状，不是在宣告完成或要求改图。只根据本次冻结快照总结：已验收成果、正在推进且尚未验收的成果、阻塞/失败、剩余工作、已经运行的验证及尚未验证的限制。默认只展开根层的直接子项；只有单组时下钻该组，私有细节可经只读证据工具核实。不得执行工作、改图、验收、重写历史报告、估造完成比例或把模型自述当作测试通过。
-completed 只列程序状态 COMPLETE 的节点；未验收的部分成果放 inProgress 并说明边界。每项附实际 source/sha256/path/quote。引用 snapshot 中的现态与 reports/trace 中的实际结果，区分已确认、合理推断和未知。kind 必须为 interim；此报告不设置任何完成状态。用户未要求停工时，报告完成后程序继续之前的工作；原本暂停则保持暂停。
+按冻结时刻逐一归类 displayScope 中的节点，同一个 nodeId 在 completed、inProgress、blocked、remaining 四栏中只出现一次。用 snapshot 的 topLevelNodes、taskGraph.active 和当前阻断原因确定现态，再用报告或轨迹补充已做的事。completed 只列 COMPLETE。inProgress 列当前实际正在执行的节点；合法重开并已执行的节点按本次活动尝试归类。blocked 列本次受阻、失败未恢复或必须等外部介入才能继续的节点；已有部分产出写在这条 blocked 摘要内。remaining 列尚未开始、正常等待依赖或排队的工作。全图暂停本身不会把每个排队节点都变成受阻；历史尝试的停顿也不能覆盖当前执行。已跳过的分支如需说明，在限制中交代。提交前按 nodeId 核对四栏与当前快照。
+每项附实际 source/sha256/path/quote。引用 snapshot 中的现态与 reports/trace 中的实际结果，区分已确认、合理推断和未知。kind 必须为 interim；此报告不设置任何完成状态。用户未要求停工时，报告完成后程序继续之前的工作；原本暂停则保持暂停。
 标准模板：{"kind":"interim","summary":"目前完成的阶段和当前工作重点","completed":[],"inProgress":[{"nodeId":"实际节点ID","summary":"该叶已有部分结果，尚未验收","evidence":[{"source":"snapshot","sha256":"实际摘要","path":"/taskGraph/active/nodeId","quote":"实际节点ID"}]}],"blocked":[],"remaining":[],"verification":[],"limitations":["尚未完成最终审查"]}。`
 
 export async function runProgressReport(runner, { runId, sourceAgent, signal }) {
@@ -42,8 +44,8 @@ export async function runProgressReport(runner, { runId, sourceAgent, signal }) 
     qualification: 'Current workflow state at a safe tool boundary; incomplete work is not acceptance.' }
   catalog.set('snapshot', { kind: 'snapshot', load: () => structuredClone(snapshot) })
   const activeDirectory = runner.activeRunDirectory(state)
-  if (activeDirectory && fs.existsSync(path.join(activeDirectory, 'trace.json'))) {
-    const trace = JSON.parse(fs.readFileSync(path.join(activeDirectory, 'trace.json'), 'utf8'))
+  if (activeDirectory && hasStored(path.join(activeDirectory, 'trace.json'))) {
+    const trace = JSON.parse(readStored(path.join(activeDirectory, 'trace.json'), 'utf8'))
     catalog.set('active-trace', { kind: 'trace', taskId: state.graph.state.active.nodeId, load: () => structuredClone(trace) })
   }
   const input = { protocol: 'interim-progress-report-v1', snapshot: sourceValue(catalog, 'snapshot'),

@@ -1126,6 +1126,28 @@ for (const outcome of ['PASS', 'FAILED']) test('unit v2 command rejects legacy p
   assert.deepEqual(roles, ['APPROVE', 'EXECUTE', 'work', 'ACCEPT', 'report'])
 })
 
+test('unit v2 pauses a tool-free root with no failure evidence for plan review', async t => {
+  const { unitReport } = await import('../testing/unit-proposal.mjs')
+  let work = 0
+  const f = await fixture(t, { respond: ({ payload }) => {
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask([]) })
+    if (isController(payload)) return { text: 'Ready.' }
+    const reviewed = reviewRoot(payload)
+    if (reviewed) return reviewed
+    work++
+    return tool('dynamic_context_generate_report', { report: unitReport('The plan provides no way to check this condition.', 'FAILED') })
+  } })
+  const agent = await f.agent('unit-plan-review')
+  await f.h.ctx.commands.execute(agent, '/task-graph Inspect the condition.', [], new AbortController().signal)
+  await agent.whenIdle()
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(work, 1)
+  assert.equal(f.status(agent).phase, 'PAUSED', JSON.stringify(f.status(agent)))
+  assert.equal(f.status(agent).reason, 'WORKFLOW_PLAN_REVIEW_REQUIRED')
+  assert.equal(f.runner(agent).graph.status().rootOutcome, null)
+  assert.equal(f.runner(agent).checkpointStatus().phase, 'PAUSED')
+})
+
 test('v2 refuses an existing unversioned complete-mode ledger before any model call or graph mutation', async t => {
   const { MODE_RECORD } = await import('../interaction.mjs')
   const f = await fixture(t, { respond: () => { throw new Error('Legacy ledger started a model.') } })

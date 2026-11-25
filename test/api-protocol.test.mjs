@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { fixtureTrace } from '../testing/harness.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -58,7 +59,7 @@ test('a rejected completed stream retains accounting metadata without allowing t
   const h = await where.open(); h.runner.submit(runtimeProposal(['write']))
   await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /DIRECT_REPORT_DID_NOT_STOP_NORMALLY/)
   assert.equal(fs.existsSync(path.join(where.projectRoot, 'never.txt')), false)
-  const trace = JSON.parse(fs.readFileSync(path.join(h.runner.config.directory, h.runner.graph.read().graph.state.active.attemptId, 'trace.json')))
+  const trace = fixtureTrace(h.runner)
   assert.equal(trace.requests[0].transportReceipt.usage.prompt_tokens, 100)
   assert.equal(trace.requests[0].transportReceipt.terminated, true)
   assert.equal(trace.requests[0].status, 'UNKNOWN_OR_FAILED')
@@ -214,8 +215,7 @@ test('a configured 32-request window exposes remaining calls and still stops bef
   const h = await where.open(); h.runner.submit(runtimeProposal(['dynamic_task_status']))
   await assert.rejects(h.runner.runNext({ expectedRevision: 1 }), /TASK_REQUEST_LIMIT/)
   assert.equal(where.backend.requests.length, 32)
-  const active = h.runner.graph.read().graph.state.active
-  const trace = JSON.parse(fs.readFileSync(path.join(h.runner.config.directory, active.attemptId, 'trace.json')))
+  const trace = fixtureTrace(h.runner)
   const last = trace.events.filter(row => row.type === 'tool/result' && row.data.name === 'dynamic_task_status').at(-1)
   assert.deepEqual(last.data.value.requestBudget, { limit: 32, used: 32, remaining: 0, includesCurrentRequest: true, reservedReportOnlyRequest: null })
   assert.equal(h.runner.graph.read().reports.length, 0)

@@ -25,6 +25,16 @@ const source = effort => ({ session: { id: 'main', requestHeader: () => ({ confi
 const parse = (raw, options = {}) => readCompletion(new Response(raw, { headers: { 'content-type': 'text/event-stream' } }), {
   signal: signal(), model: 'fake-llama', direct, maxResponseBytes: 100000, ...options })
 
+test('Messages budgets bytes across arbitrary tool batches and complete Unicode arguments', async () => {
+  const args = { text: '样'.repeat(33000) }
+  const tools = Array.from({ length: 17 }, (_, index) => ({ name: 'write', arguments: index === 16 ? args : {} }))
+  const raw = messagesSSE({ tools })
+  const accepted = await parse(raw, { maxResponseBytes: Buffer.byteLength(raw) })
+  assert.equal(accepted.message.tool_calls.length, 17)
+  assert.deepEqual(JSON.parse(accepted.message.tool_calls[16].function.arguments), args)
+  await assert.rejects(parse(raw, { maxResponseBytes: Buffer.byteLength(raw) - 1 }), { code: 'DIRECT_RESPONSE_BYTE_LIMIT' })
+})
+
 test('default protocol, official endpoint migration and legacy opt-out are explicit', () => {
   assert.equal(directProtocol(direct), 'messages')
   assert.equal(directProtocol({ api: 'openai-compatible', protocol: 'auto' }), 'chat-completions')

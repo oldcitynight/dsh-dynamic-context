@@ -1,4 +1,6 @@
 import test from 'node:test'
+import { fixtureState, fixtureTrace } from '../testing/harness.mjs'
+import { readStored } from '../workflow-io.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -43,13 +45,13 @@ function payloadHook(h) {
   })
 }
 function failedTrace(h) {
-  const attempt = h.runner.graph.status().active.attemptId
-  return JSON.parse(fs.readFileSync(path.join(h.runner.config.directory, attempt, 'trace.json')))
+  return fixtureTrace(h.runner)
 }
 function assertBlocked(h, count) {
   assert.equal(h.backend.requests.length, count)
-  assert.equal(h.runner.graph.read().reports.length, 0)
-  assert.ok(h.runner.graph.status().active)
+  const state = fixtureState(h.runner)
+  assert.equal(state.reports.length, 0)
+  assert.ok(state.graph.state.active)
 }
 
 test('direct route bypasses all prompt, Agent-loop and LLM-hook injection paths', async t => {
@@ -99,8 +101,8 @@ test('direct request is persisted before its first HTTP effect and credentials s
   const result = await h.runner.runNext({ expectedRevision: 1 })
   assert.ok(observed)
   assert.equal(JSON.stringify(result.trace).includes('fake-llama-only'), false)
-  assert.equal(fs.readFileSync(result.report.evidence[0].ref, 'utf8').includes('fake-llama-only'), false)
-  assert.equal(createHash('sha256').update(fs.readFileSync(result.report.evidence[0].ref)).digest('hex'), result.report.evidence[0].sha256)
+  assert.equal(readStored(result.report.evidence[0].ref, 'utf8').includes('fake-llama-only'), false)
+  assert.equal(createHash('sha256').update(readStored(result.report.evidence[0].ref)).digest('hex'), result.report.evidence[0].sha256)
 })
 
 test('direct mode requires an explicit agentless permission for every tool', async t => {

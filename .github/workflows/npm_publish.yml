@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: Publish to npm with OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: npm-publish-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.3'
+          registry-url: https://registry.npmjs.org/
+          package-manager-cache: false
+
+      - name: Verify the signed GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          package="$(jq -er .name package.json)"
+          version="$(jq -er .version package.json)"
+          channel="$(jq -er .publishConfig.tag package.json)"
+          host="$(jq -er .host DSH-COMPATIBILITY.json)"
+          case "$package" in
+            dsh-better-task-grapth|dsh-dynamic-context) ;;
+            *) exit 1 ;;
+          esac
+          [[ "$GITHUB_REPOSITORY" == "oldcitynight/$package" ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]]
+          [[ "$channel" == latest || "$channel" == next || "$channel" == "dsh-$host" ]]
+          [[ "$channel" == "$(jq -er .channel DSH-COMPATIBILITY.json)" ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+
+          bundle="$package-$version.tgz"
+          release_dir="$(mktemp -d "$RUNNER_TEMP/npm-release.XXXXXX")"
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft \
+            | jq -e --arg tag "$GITHUB_REF_NAME" '.tagName == $tag and (.isDraft | not)' >/dev/null
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$release_dir" \
+            --pattern "$bundle" --pattern RELEASE.json --pattern RELEASE-NOTES.md --pattern INSTALL.md \
+            --pattern SIGNING-KEY.asc --pattern SHA256SUMS --pattern SHA256SUMS.asc
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d "$RUNNER_TEMP/npm-gnupg.XXXXXX")"
+          fingerprint=3E26B48CFC287BD613E4FD644C5EAF55F10F0C51
+          check_signer() {
+            awk -v key="$fingerprint" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && $3 == key { valid = 1 } END { exit !valid }'
+          }
+          gpg --batch --import "$release_dir/SIGNING-KEY.asc"
+          git -c gpg.program=gpg verify-tag --raw "$GITHUB_REF" 2>&1 | check_signer
+          git -c gpg.program=gpg verify-commit --raw "$GITHUB_SHA" 2>&1 | check_signer
+          [[ "$(git rev-parse "$GITHUB_REF^{commit}")" == "$GITHUB_SHA" ]]
+          (
+            cd "$release_dir"
+            gpg --batch --status-fd=1 --verify SHA256SUMS.asc SHA256SUMS | check_signer
+            sha256sum --strict --check SHA256SUMS
+          )
+          sha256="$(sha256sum "$release_dir/$bundle" | cut -d ' ' -f 1)"
+          integrity="sha512-$(openssl dgst -sha512 -binary "$release_dir/$bundle" | openssl base64 -A)"
+          jq -e --arg name "$package" --arg version "$version" --arg channel "$channel" \
+            --arg repository "$GITHUB_REPOSITORY" --arg commit "$GITHUB_SHA" \
+            --arg tag "$GITHUB_REF_NAME" --arg bundle "$bundle" --arg sha256 "$sha256" --arg integrity "$integrity" \
+            '.name == $name and .version == $version and .channel == $channel and
+             .repository == $repository and .commit == $commit and .tag == $tag and
+             .tarball == $bundle and .sha256 == $sha256 and .integrity == $integrity' \
+            "$release_dir/RELEASE.json" >/dev/null
+          cmp package.json <(tar -xOzf "$release_dir/$bundle" package/package.json)
+          {
+            printf 'name=%s\nversion=%s\nchannel=%s\n' "$package" "$version" "$channel"
+            printf 'bundle=%s\nintegrity=%s\n' "$release_dir/$bundle" "$integrity"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the verified tarball and check the registry
+        env:
+          PACKAGE: ${{ steps.release.outputs.name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          BUNDLE: ${{ steps.release.outputs.bundle }}
+          INTEGRITY: ${{ steps.release.outputs.integrity }}
+        shell: bash
+        run: |
+          registry=https://registry.npmjs.org
+          metadata="$(mktemp "$RUNNER_TEMP/npm-version.XXXXXX")"
+          read_version() {
+            curl --silent --show-error --retry 3 --max-time 30 --header 'Cache-Control: no-cache' \
+              --output "$metadata" --write-out '%{http_code}' "$registry/$PACKAGE/$VERSION"
+          }
+          case "$(read_version)" in
+            200) jq -e --arg expected "$INTEGRITY" '.dist.integrity == $expected' "$metadata" >/dev/null ;;
+            404) npm publish "$BUNDLE" --registry "$registry/" --access public --tag "$CHANNEL" --ignore-scripts --provenance ;;
+            *) exit 1 ;;
+          esac
+          for delay in 0 2 4 8 16 30; do
+            sleep "$delay"
+            if [[ "$(read_version)" == 200 ]] &&
+              jq -e --arg expected "$INTEGRITY" '.dist.integrity == $expected' "$metadata" >/dev/null &&
+              curl --fail --silent --show-error --max-time 20 --header 'Cache-Control: no-cache' \
+                "$registry/-/package/$PACKAGE/dist-tags" \
+                | jq -e --arg tag "$CHANNEL" --arg version "$VERSION" '.[$tag] == $version' >/dev/null; then
+              printf '%s@%s verified on npm with tag %s\n' "$PACKAGE" "$VERSION" "$CHANNEL"
+              exit 0
+            fi
+          done
+          exit 1

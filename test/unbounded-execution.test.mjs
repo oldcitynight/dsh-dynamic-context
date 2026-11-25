@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { readStored, writeStored } from '../workflow-io.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -16,9 +17,9 @@ import { startFakeLlama } from '../testing/fake-llama.mjs'
 const limits = { maxRequestsPerTask: null, timeoutMs: null, maxContextCharacters: null,
   maxStateBytes: null, maxReportCharacters: null, maxOutputTokens: 256000,
   direct: { maxRequestBytes: null, maxResponseBytes: null, maxJournalBytes: null } }
-function temporary(t) {
+function temporary(t, removeAfter = true) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-native-limits-')))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  if (removeAfter) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   return root
 }
 const proposal = () => runtimeProposal(['fixture_read_a'])
@@ -34,12 +35,12 @@ test('explicit null removes added limits while finite defaults and native output
 })
 
 test('the real direct loop crosses the former 256-call ceiling and preserves a long final report', { timeout: 180000 }, async t => {
-  const root = temporary(t)
+  const root = temporary(t, false)
   const report = 'Completed synthetic observation. '.repeat(560)
   const backend = await startFakeLlama({ maxRequests: 270, maxRequestBytes: 8388608,
     respond: ({ index }) => index <= 256 ? { tools: [{ name: 'fixture_read_a' }] } : { text: report } })
   let h
-  t.after(async () => { await h?.close(); await backend.close() })
+  t.after(async () => { try { await h?.close() } finally { await backend.close(); fs.rmSync(root, { recursive: true, force: true }) } })
   h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'), backend,
     config: { transport: 'direct', ...limits, direct: { ...limits.direct, durable: true, tracePayloads: 'references' } } })
   h.runner.submit(proposal())
@@ -50,19 +51,19 @@ test('the real direct loop crosses the former 256-call ceiling and preserves a l
   assert.ok(report.length > 16000)
   assert.ok(backend.requests.every(r => r.payload.max_tokens === 256000))
   assert.equal(result.trace.requests.filter(r => r.payload).length, 1)
-  const saved = JSON.parse(fs.readFileSync(result.report.evidence[0].ref))
+  const saved = JSON.parse(readStored(result.report.evidence[0].ref))
   assert.equal(saved.payloadEncoding, 'request-files-v1')
   assert.ok(saved.requests.every(r => !r.payload && r.savedPayload))
   for (const [index, request] of saved.requests.entries()) {
-    assert.deepEqual(JSON.parse(fs.readFileSync(request.savedPayload.ref)).payload, backend.requests[index].payload)
+    assert.deepEqual(JSON.parse(readStored(request.savedPayload.ref)).payload, backend.requests[index].payload)
   }
 })
 
 test('referenced request bodies survive pause/restart and keep complete byte-checked history without replay', async t => {
-  const root = temporary(t), directory = path.join(root, 'state')
+  const root = temporary(t, false), directory = path.join(root, 'state')
   const backend = await startFakeLlama({ respond: ({ index }) => index < 3 ? { tools: [{ name: 'fixture_read_a' }] } : { text: 'Resumed correctly.' } })
   let h
-  t.after(async () => { await h?.close(); await backend.close() })
+  t.after(async () => { try { await h?.close() } finally { await backend.close(); fs.rmSync(root, { recursive: true, force: true }) } })
   const config = { transport: 'direct', ...limits, direct: { ...limits.direct, durable: true, tracePayloads: 'references' } }
   h = await createHarness({ projectRoot: root, directory, backend, config })
   h.runner.submit(proposal())
@@ -78,17 +79,18 @@ test('referenced request bodies survive pause/restart and keep complete byte-che
   assert.deepEqual(backend.requests[1].payload.messages.slice(0, 2), backend.requests[0].payload.messages)
   const journal = new DirectJournal(result.runDirectory, {}, { maxBytes: null })
   const first = result.trace.requests[0]
-  const record = JSON.parse(fs.readFileSync(first.savedPayload.ref))
+  const record = JSON.parse(readStored(first.savedPayload.ref))
   record.payload.messages[0].content = 'corrupt'
-  fs.writeFileSync(first.savedPayload.ref, JSON.stringify(record))
+  const tampered = JSON.stringify(record)
+  writeStored(first.savedPayload.ref, tampered) ?? fs.writeFileSync(first.savedPayload.ref, tampered)
   assert.throws(() => journal.referenceRequest(first), /HASH_OR_SCOPE_MISMATCH/)
 })
 
 test('an external total-money stop prevents the next HTTP request and does not replay completed effects', async t => {
-  const root = temporary(t)
+  const root = temporary(t, false)
   const h = await createHarness({ projectRoot: root, directory: path.join(root, 'state'),
     respond: () => ({ tools: [{ name: 'fixture_read_a' }] }), config: { transport: 'direct', ...limits } })
-  t.after(() => h.close())
+  t.after(async () => { try { await h.close() } finally { fs.rmSync(root, { recursive: true, force: true }) } })
   let requests = 0
   h.runner.registerInputMeter({ version: 'synthetic-total-money-only', measure: () => {
     if (++requests === 8) throw Object.assign(Error('TOTAL_MONEY_EXHAUSTED'), { code: 'TOTAL_MONEY_EXHAUSTED' })
@@ -104,13 +106,13 @@ test('an external total-money stop prevents the next HTTP request and does not r
 })
 
 test('unbounded task status and instructions do not tell the model to reserve a last request', async t => {
-  const root = temporary(t), projectRoot = path.join(root, 'work')
+  const root = temporary(t, false), projectRoot = path.join(root, 'work')
   fs.mkdirSync(projectRoot)
   const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'),
     respond: ({ index }) => index === 1 ? { tools: [{ name: 'dynamic_task_status' }] } : { text: 'Status inspected.' },
     config: { storageRoot: root, ...limits, allowedTools: ['dynamic_task_status'],
       direct: { ...limits.direct, runtime: { modules: ['state'], maxToolOutputCharacters: null } } } })
-  t.after(() => h.close())
+  t.after(async () => { try { await h.close() } finally { fs.rmSync(root, { recursive: true, force: true }) } })
   h.runner.submit(runtimeProposal(['dynamic_task_status']))
   await h.runner.runNext({ expectedRevision: 1 })
   const messages = h.backend.requests[1].payload.messages

@@ -8,12 +8,10 @@ import { auditEvidence, isAuditReference } from './audit-artifacts.mjs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import { symbols } from '@deepseek-ai/cordis'
-import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { digest } from 'dsh-better-task-grapth/core'
 import { diagnostic, located, parseModelJSON } from 'dsh-better-task-grapth/validation'
 import { realProjectPath } from './artifacts.mjs'
-import { createPrivatePathGuard } from './execution-privacy.mjs'
+import { createPrivatePathGuard, workflowCredentialFiles } from './execution-privacy.mjs'
 import { readBlockage, saveBlockage } from './blockage-evidence.mjs'
 import { zipInventoryFile } from './zip-stream.mjs'
 import { fail } from './core.mjs'
@@ -60,11 +58,7 @@ export function workspaceAuditTools(runner, directory, catalog, signal, { images
   const configuredRoots = [config.directory, config.storageRoot, path.join(config.storageRoot ?? root, '.dsh', 'workflow-witnesses-v1'), ...(config.direct.runtime?.privateReadRoots ?? [])].filter(Boolean)
   const privateRoots = [config.directory, path.join(config.storageRoot ?? root, '.dsh', 'workflow-witnesses-v1'), ...(config.direct.runtime?.privateReadRoots ?? [])].filter(Boolean)
   const protectedRoots = configuredRoots.filter(p => fs.existsSync(p) && fs.realpathSync(p) !== root)
-  const credentials = runner.ctx?.get?.('credentials'), original = credentials?.[symbols.original] ?? credentials
-  const guard = createPrivatePathGuard({ workspaceRoot: root, protectedRoots, credentialFiles: [original?.spec?.filename,
-    path.join(resolveDshHome(), '.credentials.yaml'), path.join(root, '.dsh', '.credentials.yaml'),
-    config.direct.runtime?.instructionHomes?.dshHome && path.join(config.direct.runtime.instructionHomes.dshHome, '.credentials.yaml')]
-    .filter(p => typeof p === 'string' && path.isAbsolute(p)) })
+  const guard = createPrivatePathGuard({ workspaceRoot: root, protectedRoots, credentialFiles: workflowCredentialFiles(config, runner.ctx?.get?.('credentials')) })
   let ordinal = 0
   const observations = new Map()
   const ensurePublic = requested => {
@@ -259,7 +253,8 @@ export function workspaceAuditTools(runner, directory, catalog, signal, { images
     // explicitly reread page is historical, never silently updated in place.
     const latest = new Map(), checks = new Map()
     for (const [source, observation] of observations) latest.set(observation.path, { source, observation, at: '/workspaceObservations' })
-    if (result.action === 'COMPLETE') for (const row of latest.values()) checks.set(row.source, row)
+    if (result.action === 'PASS' || result.action === 'COMPLETE')
+      for (const row of latest.values()) checks.set(row.source, row)
     const visit = (value, at = '') => {
       if (!value || typeof value !== 'object') return
       if (typeof value.source === 'string' && observations.has(value.source)) checks.set(value.source, { source: value.source, observation: observations.get(value.source), at })

@@ -6,8 +6,8 @@
     "0.2.1-alpha.2"
   ],
   "schema": 1,
-  "updateRound": 0,
+  "updateRound": 1,
   "channel": "dsh-0.2.1-alpha.2",
-  "taskgraph": "0.3.2-rc.6",
-  "dynamicContext": "0.1.2-rc.6"
+  "taskgraph": "0.3.2-rc.16",
+  "dynamicContext": "0.1.2-rc.16"
 }

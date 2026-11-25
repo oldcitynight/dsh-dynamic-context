@@ -9,6 +9,7 @@ import { KNOWN_SESSION_EVENT_TYPES, Session } from '@deepseek-ai/dsh-session'
 import { createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { assertReleasedV4Relationships } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
+import { fixtureTrace } from '../testing/harness.mjs'
 import { repairPrematureNativeClose } from '../native-recovery.mjs'
 import { recoverDirectCheckpoint } from '../recovery.mjs'
 import { digest } from 'dsh-better-task-grapth/core'
@@ -19,8 +20,7 @@ async function fixture(t, options = {}) {
   const h = await createRuntimeHarness({ projectRoot, directory: path.join(root, 'state'), ...options,
     config: { storageRoot: root, ...options.config } })
   t.after(async () => { await h.close(); fs.rmSync(root, { recursive: true, force: true }) })
-  return { ...h, projectRoot, trace: () => JSON.parse(fs.readFileSync(path.join(h.runner.config.directory,
-    h.runner.graph.read().graph.state.active.attemptId, 'trace.json'), 'utf8')) }
+  return { ...h, projectRoot, trace: () => fixtureTrace(h.runner) }
 }
 function validate(trace) {
   assertReleasedV4Relationships({ header: { version: 4, id: trace.sessionId, isSeeded: false },

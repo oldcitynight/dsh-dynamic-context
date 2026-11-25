@@ -325,9 +325,9 @@ export class WorkflowOrchestrator {
       if (this.guidancePending(agent)) fail('WORKFLOW_GUIDANCE_REQUESTED')
     }
     const guidanceBoundary = () => { if (this.guidancePending(agent)) fail('WORKFLOW_GUIDANCE_REQUESTED') }
-    const paused = async () => {
+    const paused = async (reason = 'USER_PAUSE') => {
       if (this.guidancePending(agent) && !control.pauseRequested) fail('WORKFLOW_GUIDANCE_REQUESTED')
-      return this.save(agent, { phase: 'PAUSED', reason: 'USER_PAUSE', pauseKind: 'normal' })
+      return this.save(agent, { phase: 'PAUSED', reason, pauseKind: 'normal' })
     }
     runner.workflowControl = {
       recoverModel: continuing,
@@ -431,7 +431,7 @@ export class WorkflowOrchestrator {
           const before = snapshot.state.supervision
           const continuationResult = await runner.continueSupervision({ expectedRevision: status.revision,
             checkpointChecksum: status.supervision.checkpointChecksum, sourceAgent: agent, signal: combined })
-          if (continuationResult?.paused) return await paused()
+          if (continuationResult?.paused) return await paused(continuationResult.reason)
           // A resume authorizes the saved boundary, not a later independently
           // audited request to wait for new user input.
           if (status.taskGraph?.hierarchyPolicy) continuing = false
@@ -453,7 +453,7 @@ export class WorkflowOrchestrator {
           const result = await runner.resumeActive({ expectedRevision: status.revision,
             checkpointChecksum: status.continuation.checksum, recover: true, sourceAgent: agent, signal: combined,
             acknowledgeToolError: this.record(agent)?.toolErrorResumeChecksum })
-          if (result.paused) return await paused()
+          if (result.paused) return await paused(result.reason)
           continue
         }
         if (status.busy || status.taskGraph?.active || status.supervision && status.supervision.phase !== 'READY')
@@ -489,7 +489,7 @@ export class WorkflowOrchestrator {
         runner.activity = { stage: 'EXECUTING', kind: 'boundary', sessionId: null, step: 0, tool: null, at: new Date().toISOString() }
         if (status.taskGraph?.hierarchyPolicy) continuing = false
         const result = await runner.runNext({ expectedRevision: status.revision, choice: next.choice, sourceAgent: agent, signal: combined })
-        if (result.paused) return await paused()
+        if (result.paused) return await paused(result.reason)
         if (!await this.ctx.sessions.flush(agent.session)) fail('DYNAMIC_CONTEXT_EXECUTION_RECEIPT_NOT_DURABLE')
       }
     } catch (error) {
@@ -503,9 +503,10 @@ export class WorkflowOrchestrator {
         handover = true
         await this.save(agent, { phase: 'GUIDANCE_HANDOVER', reason: 'USER_GUIDANCE', pauseKind: null })
       } else {
-        const normal = error.code === 'WORKFLOW_PAUSE_REQUESTED' || control.pauseRequested && error.code === 'WORKFLOW_GUIDANCE_REQUESTED'
+        const plannedPause = ['WORKFLOW_NO_PROGRESS', 'WORKFLOW_PLAN_REVIEW_REQUIRED'].includes(error.code)
+        const normal = plannedPause || error.code === 'WORKFLOW_PAUSE_REQUESTED' || control.pauseRequested && error.code === 'WORKFLOW_GUIDANCE_REQUESTED'
         await this.save(agent, { phase: normal || combined.aborted ? 'PAUSED' : 'NEEDS_ATTENTION', pauseKind: normal ? 'normal' : 'unexpected',
-          reason: normal ? 'USER_PAUSE' : control.reason ?? error.code ?? error.message ?? 'WORKFLOW_FAILED' })
+          reason: plannedPause ? error.code : normal ? 'USER_PAUSE' : control.reason ?? error.code ?? error.message ?? 'WORKFLOW_FAILED' })
       }
       if (signal.aborted) throw error
     } finally { this.running.delete(agent); runner.workflowControl = null }

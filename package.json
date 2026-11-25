@@ -1,6 +1,6 @@
 {
   "name": "dsh-dynamic-context",
-  "version": "0.1.2-rc.6",
+  "version": "0.1.2-rc.16",
   "workflowCompatibilityEpoch": 1,
   "os": [
     "linux"
@@ -158,6 +158,7 @@
     "workflow-format.mjs",
     "workflow-backup.mjs",
     "workflow-io.mjs",
+    "workflow-record-paths.mjs",
     "workflow-backup-worker.mjs",
     "WORKFLOW-STORAGE.md",
     "rule-editor.mjs",
@@ -195,7 +196,7 @@
     "@deepseek-ai/dsh-credentials-local": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-authorization": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-deepseek-account-platform": "0.2.1-alpha.2",
-    "dsh-better-task-grapth": "0.3.2-rc.6",
+    "dsh-better-task-grapth": "0.3.2-rc.16",
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-agent-instructions": "0.2.1-alpha.2",
@@ -252,8 +253,9 @@
   },
   "devDependencies": {
     "@deepseek-ai/dsh": "0.2.1-alpha.2",
-    "dsh-better-task-grapth": "0.3.2-rc.6",
-    "@deepseek-ai/dsh-util-values": "0.2.1-alpha.2"
+    "dsh-better-task-grapth": "0.3.2-rc.16",
+    "@deepseek-ai/dsh-util-values": "0.2.1-alpha.2",
+    "acorn": "8.19.0"
   },
   "homepage": "https://github.com/oldcitynight/dsh-dynamic-context#readme",
   "repository": {

@@ -74,6 +74,25 @@ test('a narrowed execution workspace cannot be widened by the auditor', t => {
   assert.equal(h.read({ path: 'permitted/allowed.txt' }).value.text, 'allowed')
 })
 
+test('v2 PASS rechecks uncited latest observations and its child observation can be read by another role', t => {
+  const h = fixture(t), parent = path.dirname(h.run), runId = 'revision_unit_audit_' + randomUUID()
+  const reader = workspaceAuditTools(h.runner, path.join(parent, runId), new Map(), signal())
+  t.after(() => reader.close())
+  const file = path.join(h.projectRoot, 'guide.txt')
+  fs.writeFileSync(file, 'Observed content')
+  const first = reader.execute(h.call(WORKSPACE_TOOLS.read, { path: 'guide.txt' }))
+  const catalog = new Map()
+  registerGroupObservations(h.runner, { graph: { state: { hierarchy: { groups: {
+    fixture_child: { runId, workspaceInspection: reader.index() },
+  } } } } }, catalog, signal())
+  assert.equal(catalog.get(first.source).load().text, 'Observed content')
+  fs.appendFileSync(file, ' (updated)')
+  assert.throws(() => reader.checkCurrent({ action: 'PASS' }), { code: 'WORKSPACE_OBSERVATION_STALE' })
+  const second = reader.execute(h.call(WORKSPACE_TOOLS.read, { path: 'guide.txt' }))
+  reader.checkCurrent({ action: 'PASS' })
+  assert.throws(() => reader.checkCurrent({ action: 'PASS', evidence: [citation(first), citation(second)] }), { code: 'WORKSPACE_OBSERVATION_STALE' })
+})
+
 test('listing is paginated, excludes private stores and never claims a recursive content identity', t => {
   const h = fixture(t)
   fs.mkdirSync(path.join(h.projectRoot, 'deliverable'))
@@ -241,3 +260,4 @@ test('ZIP auditor accepts stored and deflated members beyond 128 MiB without ext
     assert.equal(fs.existsSync(path.join(h.projectRoot, 'large.bin')), false)
   }
 })
+import { registerGroupObservations } from '../blockage-evidence.mjs'

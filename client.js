@@ -924,8 +924,9 @@ var WeakMapWithValues = class {
 	}
 };
 //#endregion
+;
 
-
+;
 // SPDX-License-Identifier: GPL-3.0-only
 // The native staged form addresses flat field names. Keep nested profile operations
 // on their individual paths so a save cannot replace an unrelated sibling.
@@ -1045,6 +1046,7 @@ const unitLimitFields = [
   configField('workflowLimits.dynamicMaterialBytes', '动态材料转摘要的字节数', 'integer', { min: 0 }),
 ]
 
+;
 // SPDX-License-Identifier: GPL-3.0-only
 const PERFORMANCE_EVENT = 'plugin:dsh-dynamic-context/performance-v1'
 const PERFORMANCE_KEY = 'dynamicContextPerformance'
@@ -1110,7 +1112,9 @@ function performanceProjection(key, native, extra) {
   return native
 }
 
+;
 // SPDX-License-Identifier: GPL-3.0-only
+;
 
 function structuredLabel(text) {
   const raw = text.trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, '$1').trim()
@@ -1348,7 +1352,9 @@ function completedLeafFlow(ctx, React, primitives, Base) {
   }
 }
 
+;
 // SPDX-License-Identifier: GPL-3.0-only
+;
 const preferenceFields = [
   { key: 'permissionMode', label: '执行权限', hint: '继承主会话；选定的上限不会扩大主会话授权。', choices: [['configured', '按配置'], ['auto', '继承'], ['read-only', '只读'], ['workspace-write', '工作区'], ['danger-full-access', '完整访问']] },
   { key: 'approvalPolicy', label: '工具批准', hint: '主会话的批准策略始终生效。', choices: [['configured', '按配置'], ['auto', '继承'], ['ask', '可询问'], ['never', '不询问']] },
@@ -1434,6 +1440,7 @@ function installPreferenceSettings(ctx, React, primitives) {
     description:'新会话使用 /task-graph 进入完整单元流程。单元总数和新任务偏好可以即时保存。修改后端、策略或存储等部署项时，DSH 会重新装载插件。' })
 }
 
+;
 // SPDX-License-Identifier: GPL-3.0-only
 // Keys are the original wire IDs, including historical tools shown in replay.
 const dynamicToolNames = {
@@ -1482,9 +1489,13 @@ const dynamicToolNames = {
   dynamic_context_workspace_zip: ['检查工作区 ZIP 归档', 'Inspect workspace ZIP archive'],
 }
 
+;
 // SPDX-License-Identifier: GPL-3.0-only
 // Project log-only observations into existing DSH Chat node kinds. Native Chat
 // owns Markdown, reasoning disclosures, tool cards, terminal output and settings.
+;
+;
+;
 const DISPLAY_EVENT = 'plugin:dsh-dynamic-context/execution-display-v1'
 const stages = { PREPLANNING: '预规划', EXECUTING: '叶执行', result_check: '结果验收', result_repair: '报告补正', result_work: '成果返工',
   plan_check: '计划复查', updater: '图更新', reviewer: '修改审计', compaction: '上下文压缩',

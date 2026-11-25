@@ -3,9 +3,9 @@ import { workflowLocation, storedEntry, writeStored, hasStored, namesStored, sta
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { canonical, digest } from 'dsh-better-task-grapth/core'
+import { acquireFileLease } from 'dsh-better-task-grapth/store'
 import { fail } from './core.mjs'
 import { searchEvidence } from './evidence-search.mjs'
 
@@ -36,8 +36,11 @@ function decode(bytes) {
   if (value.schema !== 1 || checksum !== digest(body)) fail('DIRECT_JOURNAL_CHECKSUM')
   return value
 }
-function writeFile(file, value, { replace = false } = {}) {
-  const bytes = Buffer.from(JSON.stringify(seal(value)) + '\n')
+const encode = value => Buffer.from(JSON.stringify(seal(value)) + '\n')
+function writeFile(file, value, options) {
+  return writeBytes(file, encode(value), options)
+}
+function writeBytes(file, bytes, { replace = false } = {}) {
   const saved = writeStored(file,bytes,{exclusive:!replace})
   if(saved) return saved
   const target = replace ? path.join(path.dirname(file), `.journal-${randomUUID()}.tmp`) : file
@@ -51,28 +54,9 @@ function writeFile(file, value, { replace = false } = {}) {
 /** Kernel lock: crashes release ownership; a stale PID file is never a lease. */
 export async function acquireDirectLease(directory) {
   if (process.platform !== 'linux') fail('DIRECT_DURABLE_LEASE_PLATFORM_UNSUPPORTED')
-  const file = path.join(directory, '.direct-execution.lock')
-  const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600)
-  let child, timer
-  try {
-    const info = fs.fstatSync(fd)
-    if (!info.isFile() || info.nlink !== 1) fail('DIRECT_DURABLE_LEASE_PATH_INVALID')
-    // flock's numeric-FD form locks the shared open-file description. The
-    // helper exits after acquisition; this runner keeps its own FD open, so
-    // no helper process can accidentally release a live runner's lease.
-    child = spawn('/usr/bin/flock', ['--exclusive', '--nonblock', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] })
-    await new Promise((resolve, reject) => {
-      child.once('error', () => reject(Object.assign(new Error('DIRECT_DURABLE_LEASE_UNAVAILABLE'), { code: 'DIRECT_DURABLE_LEASE_UNAVAILABLE' })))
-      child.once('exit', code => {
-        if (code === 0) resolve()
-        else { const codeName = code === 1 ? 'DIRECT_EXECUTION_LEASE_HELD' : 'DIRECT_DURABLE_LEASE_UNAVAILABLE'; reject(Object.assign(new Error(codeName), { code: codeName })) }
-      })
-      timer = setTimeout(() => reject(Object.assign(new Error('DIRECT_DURABLE_LEASE_TIMEOUT'), { code: 'DIRECT_DURABLE_LEASE_TIMEOUT' })), 5000)
-    })
-  } catch (error) { child?.kill(); fs.closeSync(fd); throw error }
-  finally { clearTimeout(timer) }
-  let released = false
-  return { async release() { if (released) return; released = true; fs.closeSync(fd) } }
+  return acquireFileLease(path.join(directory, '.direct-execution.lock'), {
+    busy: 'DIRECT_EXECUTION_LEASE_HELD', invalid: 'DIRECT_DURABLE_LEASE_PATH_INVALID', unavailable: 'DIRECT_DURABLE_LEASE_UNAVAILABLE',
+  })
 }
 
 /** Immutable records + atomic head. Effects begin only after their intent is durable. */
@@ -263,10 +247,16 @@ export class DirectJournal {
         || !pattern.test(path.basename(reference.ref)) || !/^[a-f0-9]{64}$/.test(reference.sha256)) fail('DIRECT_JOURNAL_REFERENCE_INVALID')
     return reference.ref
   }
-  archive(messages) {
+  archive(messages, admit) {
     this.check()
-    const body = { schema: 1, identity: this.identity, messages }
-    const reference = writeFile(path.join(this.directory, `archive-${randomUUID()}.json`), body)
+    const bytes = encode({ schema: 1, identity: this.identity, messages })
+    if (admit) {
+      const id = sha(bytes)
+      if (!admit(id)) return null
+      const saved = this.archives.get(id)
+      if (saved) return { id, ...saved }
+    }
+    const reference = writeBytes(path.join(this.directory, `archive-${randomUUID()}.json`), bytes)
     this.archives.set(reference.sha256, reference)
     return { id: reference.sha256, ...reference }
   }

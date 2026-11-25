@@ -2,26 +2,26 @@
 import { z } from 'zod'
 
 const scalar = z.union([z.string().max(4096), z.number().finite(), z.boolean(), z.null()])
-const pointer = z.string().min(1).max(512).refine(value =>
+export const argumentPointer = z.string().min(1).max(512).refine(value =>
   /^(?:\/(?:[^~/]|~[01])*)+$/.test(value) && !parts(value).some(key => ['__proto__', 'prototype', 'constructor'].includes(key)),
   'Expected a JSON Pointer to an own field.')
 function parts(pointer) { return pointer.slice(1).split('/').map(part => part.replace(/~1/g, '/').replace(/~0/g, '~')) }
-export const conditions = z.record(pointer, scalar).refine(value => Object.keys(value).length > 0 && Object.keys(value).length <= 32)
+export const conditions = z.record(argumentPointer, scalar).refine(value => Object.keys(value).length > 0 && Object.keys(value).length <= 32)
 // Match the raw DSH registry key. Provider-specific wire name limits apply
 // at transport time, independently of registering an exact policy reference.
 export const toolName = z.string().min(1).refine(value => value.trim().length > 0 && !/[\u0000-\u001f\u007f*]/u.test(value), 'Use an exact DSH tool ID.')
 export const policyPriority = z.number().int().safe()
 export const toolSelector = z.union([toolName, z.object({ toolId: toolName, when: conditions }).strict()])
 
+export function argumentValue(value, pointer) {
+  for (const key of parts(pointer)) {
+    if (value === null || typeof value !== 'object' || !Object.hasOwn(value, key)) return undefined
+    value = value[key]
+  }
+  return value
+}
 export function matchesConditions(value, when) {
-  return Object.entries(when).every(([path, expected]) => {
-    let current = value
-    for (const key of parts(path)) {
-      if (current === null || typeof current !== 'object' || !Object.hasOwn(current, key)) return false
-      current = current[key]
-    }
-    return current === expected
-  })
+  return Object.entries(when).every(([path, expected]) => argumentValue(value, path) === expected)
 }
 const named = (entry, name) => (typeof entry === 'string' ? entry : entry.toolId) === name
 const matches = (entry, args) => typeof entry === 'string' || matchesConditions(args, entry.when)

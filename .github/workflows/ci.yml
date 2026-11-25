@@ -11,7 +11,9 @@ jobs:
     strategy:
       matrix:
         node: ['24.x', '26.x']
+        storage: ['files', 'sqlite']
     env:
+      DSH_FIXTURE_STORAGE_FORMAT: ${{ matrix.storage }}
       TMPDIR: ${{ github.workspace }}/.test-tmp
       DSH_HOME: ${{ github.workspace }}/.test-home/dsh
       DSH_AGENTS_HOME: ${{ github.workspace }}/.test-home/agents
@@ -55,6 +57,8 @@ jobs:
           execFileSync('npm', ['cache', 'add', local], { stdio: 'inherit' })
           NODE
       - run: npm ci --prefer-offline
+      - name: Load the plugin with the locked task graph
+        run: node --input-type=module -e "await import('./index.mjs')"
       - name: Run the complete npm test entry point
         shell: bash
         timeout-minutes: 15

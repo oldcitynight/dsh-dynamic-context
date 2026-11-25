@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { flattenClientModules } from '../scripts/client-module.mjs'
 import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { DISPLAY_EVENT, executionChatDefinition } from '../client.source.mjs'
 import { structuredLabel, structuredParts } from '../client-enhancements.mjs'
@@ -53,6 +54,16 @@ test('shipped client reuses native components and has no duplicate stylesheet or
   const integration = fs.readFileSync(new URL('../client-enhancements.mjs', import.meta.url), 'utf8')
   assert.ok(!integration.includes('slots.register'))
   assert.ok(integration.includes('primitives.DisclosureRow')); assert.ok(integration.includes('withStatistics(entry.component)'))
+})
+test('bundled client modules flatten multiline named imports and reject unknown sources and bindings', () => {
+  const sources = [
+    ['./support.mjs', 'export const ready = true\n'],
+    ['./client.mjs', "import {\n  ready,\n} from './support.mjs'\nexport const view = ready\n"]
+  ]
+  assert.doesNotMatch(flattenClientModules(sources), /\b(?:import|export)\b/)
+  const invalid = (binding, module) => [sources[0], ['./client.mjs', `import { ${binding} } from '${module}'\n`]]
+  assert.throws(() => flattenClientModules(invalid('ready', './unknown.mjs')), /unsupported bundled dependency/)
+  assert.throws(() => flattenClientModules(invalid('missing', './support.mjs')), /unsupported bundled binding/)
 })
 test('JSON labels distinguish reports and decisions without collapsing ordinary prose', () => {
   assert.equal(structuredLabel('{"executionReport":{}}'), '执行报告 · JSON')

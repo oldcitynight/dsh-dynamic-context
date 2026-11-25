@@ -5,7 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { randomUUID, createHash } from 'node:crypto'
 import { zstdCompressSync, zstdDecompressSync } from 'node:zlib'
-import { privateFile, sha256, storageError, withStorageLock } from './workflow-database.mjs'
+import { privateFile, sha256, sqliteLockContention, storageError, withStorageLock } from './workflow-database.mjs'
+import { managedRecordDirectory } from './workflow-record-paths.mjs'
 
 const groupBytes = 64 * 1024,
   segmentBytes = 8 * 1024 * 1024
@@ -128,9 +129,14 @@ export function backupWorkflow(db) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   if (fs.realpathSync(dir) !== dir) storageError('WORKFLOW_BACKUP_DIRECTORY_INVALID')
   return withBackupLock(dir, () => {
-    const result = capture(db, dir)
-    reclaimPins(db, manifest(dir))
-    return result
+    try {
+      const result = capture(db, dir)
+      reclaimPins(db, manifest(dir))
+      return result
+    } catch (error) {
+      if (sqliteLockContention(error)) storageError('WORKFLOW_BACKUP_CHECKPOINT_BUSY')
+      throw error
+    }
   })
 }
 function withBackupLock(dir, operation) {
@@ -279,12 +285,7 @@ function restoreRecordDirectories(image, root, created) {
   try {
     const verified = new Set()
     for (const { parent } of snapshot.prepare('SELECT DISTINCT parent FROM files').iterate()) {
-      if (
-        !/^(?:attempt_[^/]+|revisions|execution-view-v1|planning-history|suspensions|directory-snapshots|blockage)(?:\/|$)/.test(
-          parent
-        )
-      )
-        continue
+      if (!managedRecordDirectory(parent)) continue
       let dir = root
       for (const part of parent.split('/')) {
         if (!part || part === '.' || part === '..' || part.includes('\0'))

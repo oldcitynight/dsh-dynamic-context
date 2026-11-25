@@ -10,7 +10,6 @@ import { HIERARCHY_PLANNING } from './hierarchy-protocol.mjs'
 import { ruleTools, RULE_GUIDE, RULE_HIERARCHY_GUIDE } from './rule-editor.mjs'
 import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
-import { symbols } from '@deepseek-ai/cordis'
 import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { createScope, bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -28,7 +27,7 @@ import { digest } from 'dsh-better-task-grapth/core'
 import { ROOT_SETUP } from './unit-baseline.mjs'
 import { boundedSnapshot, materialLimit } from './context-budget.mjs'
 import { proposalSchema } from './core.mjs'
-import { createPrivatePathGuard } from './execution-privacy.mjs'
+import { createPrivatePathGuard, workflowCredentialFiles } from './execution-privacy.mjs'
 import { submissionDescription } from './control-tools.mjs'
 import { GRAPH_COMMIT_RECORD } from './graph-presence.mjs'
 import { recoverNativeToolPairs, INTERRUPTION_NOTICE } from './native-recovery.mjs'
@@ -176,12 +175,10 @@ export async function runPreplanning({ orchestrator, agent: root, runner, signal
     // operation approval and sandboxing; no command-string allowlist is added.
     if (config.direct.runtime?.protectPrivatePaths !== false) {
       const roots = [config.directory, config.storageRoot, ...(config.direct.runtime?.privateReadRoots ?? [])].filter(Boolean)
-      const credentials = ctx.get('credentials'), original = credentials?.[symbols.original] ?? credentials
       privacy = createPrivatePathGuard({ sandbox: ctx.get('sandbox'), subprocess: ctx.get('subprocess'),
         workspaceRoot: config.projectRoot, protectedRoots: roots, maskRoot: config.directory,
-        credentialFiles: [original?.spec?.filename, path.join(resolveDshHome(), '.credentials.yaml'),
-          config.direct.runtime?.instructionHomes?.dshHome && path.join(config.direct.runtime.instructionHomes.dshHome, '.credentials.yaml'),
-          path.join(config.projectRoot, '.dsh', '.credentials.yaml')].filter(value => typeof value === 'string' && path.isAbsolute(value)),
+        credentialEnvironment: () => [config.direct.apiKeyEnv, ...runner.roleModels.credentialEnvironment()],
+        credentialFiles: workflowCredentialFiles(config, ctx.get('credentials')),
         mode: () => livePolicy.planOnly ? 'read-only' : livePolicy.sandbox })
     }
     const submit = ctx.tools.get('dynamic_context_submit', root)

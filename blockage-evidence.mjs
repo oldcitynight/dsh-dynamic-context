@@ -40,7 +40,7 @@ export function readBlockage(file) {
 // taskId keeps the existing hierarchy filter responsible for scope admission.
 export function registerGroupObservations(runner, state, catalog, signal) {
   for (const [taskId, group] of Object.entries(state.graph.state.hierarchy?.groups ?? {})) {
-    if (group.aliasOf || !/^revision_group_audit_[a-z0-9_-]+$/.test(group.runId ?? '')) continue
+    if (group.aliasOf || !/^revision_(?:group|unit)_audit_[a-z0-9_-]+$/.test(group.runId ?? '')) continue
     const admitted = new Map((group.workspaceInspection?.observations ?? []).map(row => [row.source, row]))
     // The observation index keeps the latest read per path. A report may also
     // cite an earlier page/read of that same unchanged file; retain its exact

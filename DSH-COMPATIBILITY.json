@@ -6,8 +6,8 @@
     "0.2.3-alpha.2"
   ],
   "schema": 1,
-  "updateRound": 0,
+  "updateRound": 1,
   "channel": "next",
-  "taskgraph": "0.3.2-rc.0",
-  "dynamicContext": "0.1.2-rc.0"
+  "taskgraph": "0.3.2-rc.10",
+  "dynamicContext": "0.1.2-rc.10"
 }

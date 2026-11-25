@@ -35,7 +35,16 @@ async function fixture(t, respond, config = {}, plan) {
       })
     } })
   const handle = await h.ctx.agents.create({ sessionId: 'guidance-owner', meta: { cwd: projectRoot }, agentOptions: { provider: 'dynamic-context-fake', model: 'fake-llama' } })
-  t.after(async () => { await handle.dispose(); await h.close(); fs.rmSync(root, { recursive: true, force: true }) })
+  t.after(async () => {
+    try {
+      // Disposing the host handle emits an event. Await the workflow's own
+      // release first so its final database backup has left the directory.
+      await h.runner.interaction.release(handle.agent)
+    } finally {
+      try { await handle.dispose() } finally { await h.close() }
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   const agent = handle.agent, orchestrator = h.runner.interaction.orchestrator
   return { h, agent, projectRoot, root, orchestrator, status: () => orchestrator.status(agent), runner: () => h.runner.interaction.entries.get(agent).runner,
     start: () => h.ctx.commands.execute(agent, '/task-graph Build and inspect a staged local artifact', [], new AbortController().signal) }
@@ -251,11 +260,16 @@ test('role routing excludes another leaf instructions and cancelled jobs while p
   assert.deepEqual(guidance[0].original, message.content)
 })
 
-test('unit v2 routes a real user correction to the exact scoped fact and persists the updated revision', async t => {
+for (const mode of ['inline', 'auto-inline', 'auto', 'auto-default', 'explicit', 'archive', 'revoked'])
+test('running executor receives a bound fact correction with ' + mode + ' access', async t => {
   const started = deferred(), release = deferred()
-  let calls = 0
-  const content = '修订后事实 2026', f = await fixture(t, async ({ payload }) => {
-    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask() })
+  const shared = 'dynamic_context_shared_read', source = 'dynamic_context_source_read'
+  const inline = mode === 'inline' || mode === 'auto-inline', defaults = mode === 'auto-default' || mode === 'auto-inline'
+  const content = inline ? '修订后事实 2026' : '实际校准后的修订内容。'.repeat(defaults ? 2100 : 240) + 'FACT_END_244'
+  const enabled = mode.startsWith('auto') || mode === 'explicit'
+  let calls = 0, delivered = false, recovered = ''
+  const f = await fixture(t, async ({ payload }) => {
+    if (isPlanner(payload)) return tool('dynamic_context_submit', { proposal: rootTask(mode === 'explicit' ? [shared] : []) })
     if (isController(payload)) return { text: 'Recorded.' }
     if (system(payload).includes('DYNAMIC_CONTEXT_GUIDANCE_INTAKE_V1')) return json({
       level: 'leaf', intent: 'Revise the current fact.', targets: [JSON.parse(payload.messages[1].content).graph.active.nodeId], conditions: [], changes: ['fact'], needsClarification: false,
@@ -267,10 +281,43 @@ test('unit v2 routes a real user correction to the exact scoped fact and persist
       } })
     }
     if (++calls === 1) { started.resolve(); await release.promise }
+    else {
+      const notice = payload.messages.filter(row => row.role === 'user').flatMap(row => {
+        try { return JSON.parse(row.content).guidance ?? [] } catch { return [] }
+      }).find(row => row.factUpdate)
+      assert.equal(notice?.factUpdate.revision, 2)
+      delivered = true
+      if (inline) {
+        assert.equal(notice.content, content)
+        assert.equal(notice.factUpdate.read?.tool, enabled ? shared : undefined)
+      } else {
+        const read = notice.factUpdate.read
+        assert.equal(notice.content, undefined)
+        assert.equal(read.tool, enabled ? shared : source)
+        assert.ok(names(payload).includes(read.tool))
+        const receipt = payload.messages.filter(row => row.role === 'tool').at(-1)
+        if (!receipt) return tool(read.tool, read.arguments)
+        if (enabled) {
+          assert.deepEqual(read.arguments, { id: notice.factUpdate.id, revision: 2 })
+          assert.ok(receipt.content.includes('FOUND') && receipt.content.includes(content))
+        } else {
+          const body = receipt.content.replace(/^<host-receipt>[^\n]*<\/host-receipt>\n/, '')
+          const page = JSON.parse(body)
+          assert.equal(page.offset, recovered.length)
+          recovered += page.text
+          if (page.nextOffset !== null) return tool(source, { ...read.arguments, offset: page.nextOffset })
+          assert.equal(recovered, content)
+        }
+      }
+    }
     return { text: JSON.stringify(unitReport('Checked current unit.')) }
-  })
+  }, { allowedTools: enabled ? ['read', shared] : ['read'], unitFinalReport: false, maxRequestsPerTask: 12,
+    ...(defaults ? {} : { workflowLimits: { dynamicMaterialBytes: 6144 } }) })
   await f.start()
   await Promise.race([started.promise, f.agent.whenIdle().then(() => assert.fail('Execution failed to start.'))])
+  const restoreAccess = mode === 'revoked' && f.h.ctx.get(ROLE_TOOLS_SERVICE).register({
+    role: 'executor', pluginId: 'fixture', registrationId: 'deny-fact-archive', mode: 'blacklist', toolIds: [source],
+  })
   f.agent.steer(user('把本单元共享事实 shared 改为「' + content + '」。'))
   await new Promise(resolve => setImmediate(resolve))
   release.resolve()
@@ -282,5 +329,18 @@ test('unit v2 routes a real user correction to the exact scoped fact and persist
   assert.equal(changes.length, 1)
   assert.equal(changes[0].content, content)
   assert.equal(changes[0].revision, 2)
-  assert.equal(f.status().phase, 'COMPLETE')
+  if (mode === 'revoked') {
+    assert.equal(delivered, false)
+    assert.equal(calls, 1)
+    assert.equal(f.status().phase, 'PAUSED')
+    assert.equal(f.status().reason, 'WORKFLOW_FACT_READER_REQUIRED')
+    assert.equal(f.runner().checkpointStatus().phase, 'PAUSED')
+    restoreAccess()
+    await f.orchestrator.control(f.agent, 'continue', new AbortController().signal)
+    await f.agent.runMaintenance(signal => f.orchestrator.drive(f.agent, signal))
+    await f.agent.whenIdle()
+  }
+  assert.deepEqual(f.h.backend.errors, [])
+  assert.equal(delivered, true)
+  assert.equal(f.status().phase, 'COMPLETE', JSON.stringify(f.status()))
 })

@@ -27,6 +27,11 @@ import { unitRouteSchema, UNIT_ROUTE_PROMPT, BASELINE_AUDIT_PROMPT, unitRouteInp
 
 const summary = (runner, status, extra = {}) => ({ status, revision: runner.graph.read().revision, supervision: runner.supervisionStatus(), ...extra })
 const pendingState = (state, flow) => ({ phase: 'HIERARCHY', outcomes: state.supervision.outcomes, ...(flow ? { hierarchy: flow } : {}) })
+function pendingBaselineChanges(state, flow, candidate) {
+  return changedUnitBaselines(state, flow.scopeId, candidate).filter(({ baseline, hash }) =>
+    !(flow.rebaseline?.auditRunId && baseline.unitId === flow.scopeId && baseline.field === 'baseline') &&
+    !flow.baselineReviews?.some(review => review.hash === hash))
+}
 function update(runner, state, flow) {
   const authority = state.supervision.hierarchy?.routeAuthority
   const next = authority && flow ? { routeAuthority: authority, ...flow } : flow
@@ -138,20 +143,24 @@ async function role(runner, state, name, instruction, input, catalog, validateRe
   if (prior?.phase === 'PAUSED' && prior.role === name && roleInputsMatch(prior, messages)) messages = prior.payload.messages
   const valid = prior && prior.role === name && roleMessagesMatch(prior, messages)
     && !['INVALID_RESPONSE', 'ABANDONED_UNVERIFIED'].includes(prior.phase)
-  if (!valid) state = runner.graph.updateSupervision(state, { ...state.supervision, roleRunId: `revision_${name}_${randomUUID()}` })
+  const editingRules = state.graph.state.plan.hierarchy.version === 2 && logicalName === 'scope_update' && flow?.stage === 'UPDATE'
+  if (!valid) {
+    const roleRunId = 'revision_' + name + '_' + randomUUID()
+    state = runner.graph.updateSupervision(state, { ...state.supervision, roleRunId,
+      ...(editingRules ? { hierarchy: { ...flow, ruleDraftRunId: roleRunId } } : {}) })
+  }
   const runId = state.supervision.roleRunId, directory = path.join(runner.config.directory, 'revisions', runId)
   // Only final group/root audits receive this capability. Old paused inputs
   // without the marker retain their exact tool contract when resumed.
   const workspace = logicalName === 'group_audit' && messages[0].content.includes(WORKSPACE_AUDIT_MARKER)
     ? workspaceAuditTools(runner, directory, catalog, signal, { images: readRoleRecord(runner, runId)?.imageTools ?? !readRoleRecord(runner, runId) }) : null
   const records = catalog && blockageTools(catalog, directory, signal)
-  const editor = state.graph.state.plan.hierarchy.version === 2 && logicalName === 'scope_update' && state.supervision.hierarchy?.stage === 'UPDATE'
-    ? layerRuleTools(runner, state, state.supervision.hierarchy.scopeId) : null
-  const readOnlyTools = editor ? { tools: [...records.tools, ...editor.tools], execute: call => Object.hasOwn(ruleTools, call.function.name) ? editor.execute(call) : records.execute(call) } : workspace ? { tools: [...records.tools, ...workspace.tools], auditArtifacts: workspace.auditArtifacts, execute: tool =>
-    workspace.tools.some(row => row.function.name === tool.function.name) ? workspace.execute(tool) : records.execute(tool) } : records
+  const editor = editingRules ? layerRuleTools(runner, state, flow.scopeId) : null
+  const readOnlyTools = editor ? { tools: [...records.tools, ...editor.tools], execute: (call, _modelConfig, ordinal) => Object.hasOwn(ruleTools, call.function.name) ? editor.execute(call, ordinal) : records.execute(call) } : workspace ? { tools: [...records.tools, ...workspace.tools], auditArtifacts: workspace.auditArtifacts, execute: (tool, modelConfig) =>
+    workspace.tools.some(row => row.function.name === tool.function.name) ? workspace.execute(tool, modelConfig) : records.execute(tool) } : records
   try {
     const value = await directRevisionRole(runner, { runId, role: name, messages, signal, validateOutput: true,
-      validateResult: value => { const result = validateResult(value); workspace?.checkCurrent(result); return result },
+      validateResult: value => { const result = validateResult(value, state); workspace?.checkCurrent(result); return result },
       revalidateCompleted: Boolean(workspace), ...(readOnlyTools ? { readOnlyTools } : {}) })
     signal.throwIfAborted()
     if (runner.graph.read().checksum !== state.checksum) fail('HIERARCHY_ROLE_STALE_BASE')
@@ -221,6 +230,7 @@ export function publishHierarchyReport(runner, receipt = runner.graph.read()?.su
 /** Called under the existing direct lease. Each request uses the same pause,
  * compaction, accounting and main-chat observation path as existing roles. */
 export async function advanceHierarchy(runner, signal, assertAuthority = () => {}) {
+  const attemptedRevisions = new Set()
   for (;;) {
     signal.throwIfAborted(); assertAuthority()
     let state = runner.graph.read()
@@ -245,6 +255,12 @@ export async function advanceHierarchy(runner, signal, assertAuthority = () => {
       return summary(runner, 'TASK_REPORTED', { goalReached: rootOutcome !== 'FAILED', report: checked.value })
     }
     let flow = state.supervision.hierarchy
+    if (flow?.stage === 'UPDATE' && flow.feedback) {
+      const signature = digest({ revision: state.revision, scope: flow.scopeId, feedback: flow.feedback, approvals: flow.baselineReviews })
+      if (attemptedRevisions.has(signature)) fail('WORKFLOW_NO_PROGRESS', { scopeId: flow.scopeId,
+        reason: 'The same plan review feedback returned without a change to the graph or its approvals.' })
+      attemptedRevisions.add(signature)
+    }
     const gate = state.graph.state.hierarchy.pending
     if (!flow) {
       if (!gate) {
@@ -323,7 +339,10 @@ export async function advanceHierarchy(runner, signal, assertAuthority = () => {
           instruction += '\n' + (input.auditMandate.level === 'graph' ? GRAPH_OUTCOME_AUDIT : GROUP_OUTCOME_AUDIT)
         }
       }
-      if (group && state.graph.state.plan.ruleVersion) instruction = instruction.replaceAll('COMPLETE','PASS').replaceAll('BLOCKED','FAILED') + '\nRULE_GROUP_AUDIT_V1：验收处置只提交 PASS 或 FAILED。FAILED 给出 summary、unmetCriterion、evidence，引用直属子项。未进入的子项用 NOT_SELECTED，并引用其 route 记录中的 BLOCK 依据。各组单独终审。路线 BLOCK 由程序计算。'
+      if (group && state.graph.state.plan.ruleVersion) instruction = instruction
+        .replaceAll('BLOCKED/FAILED', '由程序判定的 BLOCK 或已确认的 FAILED')
+        .replaceAll('COMPLETE', 'PASS').replaceAll('BLOCKED', 'FAILED') +
+          '\nRULE_GROUP_AUDIT_V1：验收处置只提交 PASS 或 FAILED。FAILED 给出 summary、unmetCriterion、evidence，引用直属子项。未进入的子项用 NOT_SELECTED，并引用其 route 记录中的 BLOCK 依据。各组单独终审。路线 BLOCK 由程序计算。'
       if (units && group) {
         instruction += '\n提交组审计时先数清本层 children 和合同 requirements。每个必需条目保留一行，已有单条证据足以证明时只引这一条。子单元优先引自己的已审报告；目标优先引直接证明该项的实测结果或交付物。只有结论必须组合多份独立证据时才再加引用。每个 reason 用一句说明事实与条件的对应，quote 截取能定位该事实的连续短原文，散列与路径按工具原值填全。summary 写总判定和仍有的限制。把篇幅留给覆盖所有必需项；近似证据、重复摘要和回执全文无需逐条转录。'
         const terminal = state.graph.state.plan.nodes.find(node => node.id === state.graph.state.plan.nodes.find(row => row.id === flow.scopeId).terminal)
@@ -422,12 +441,12 @@ export async function advanceHierarchy(runner, signal, assertAuthority = () => {
         input.approvedUnitBaseline = flow.rebaseline; instruction += '\n在 REVISE.baseline 中原样提交获准基线，编写本层的新一轮子图并指定新一轮可执行的终点。' }
       if (input.unitRoute && !units) instruction += '\n单元路由者请求先规划此单元。核对其理由，提交本层候选蓝图；若现有安排已足够，说明 NO_CHANGE 的依据。'
       if (input.approvedBaselines) instruction += '\n基线已获独立批准。按 approvedBaselines 重新规划本层，提交包含这些基线的完整 REVISE 候选，随后由独立变更审计者核验。'
-      const checked = await role(runner, state, 'scope_update', instruction, input, catalog, value => {
+      const checked = await role(runner, state, 'scope_update', instruction, input, catalog, (value, current) => {
         const result = (currentProtocol ? runtimeScopeProposalSchema : scopeProposalSchema).parse(value)
         if (units && (flow.routeRunId || flow.rebaseline) && result.action !== 'REVISE') fail('UNIT_CHILD_PLAN_REQUIRED')
         if (units && digest(result.baseline ?? null) !== digest(flow.rebaseline?.baseline ?? null)) fail('UNIT_BASELINE_APPROVAL_REQUIRED')
         if (result.action === 'REVISE') {
-          const candidate = prepareScopeProposal(runner, state, flow.scopeId, result, catalog)
+          const candidate = prepareScopeProposal(runner, current, flow.scopeId, result, catalog)
           if (units && flow.rebaseline && runtimeRules(state.graph.state).outcome(state.graph.state.plan.nodes.find(node => node.key === result.terminal)?.id ?? flow.scopeId) !== null) fail('UNIT_NEW_TERMINAL_REQUIRED')
           if (input.approvedBaselines) {
             const changes = changedUnitBaselines(state, flow.scopeId, candidate)
@@ -467,10 +486,10 @@ export async function advanceHierarchy(runner, signal, assertAuthority = () => {
           : globalFlow(state, [...new Set([...(flow.reviewedScopes ?? []), flow.scopeId])])); continue
       }
       const candidate = state.unitRoleVersion && prepareScopeProposal(runner, checked.state, flow.scopeId, checked.value, catalog)
-      const missing = candidate && changedUnitBaselines(checked.state, flow.scopeId, candidate).find(change =>
-        !(flow.rebaseline?.auditRunId && change.baseline.unitId === flow.scopeId && change.baseline.field === 'baseline') && !flow.baselineReviews?.some(review => review.hash === change.hash))
-      update(runner, checked.state, { ...flow, stage: missing ? 'BASELINE_AUDIT' : 'UPDATE_AUDIT',
-        ...(missing ? { baselineUnitId: missing.baseline.unitId } : {}), updaterRunId: checked.runId, proposalHash: digest(checked.value) }); continue
+      const missing = candidate && pendingBaselineChanges(checked.state, flow, candidate)[0]
+      update(runner, checked.state, { ...checked.state.supervision.hierarchy, stage: missing ? 'BASELINE_AUDIT' : 'UPDATE_AUDIT',
+        ...(missing ? { baselineUnitId: missing.baseline.unitId, baselineCandidateHash: missing.hash } : {}),
+        updaterRunId: checked.runId, proposalHash: digest(checked.value) }); continue
     }
     if (flow.stage === 'UPDATE_AUDIT' || flow.stage === 'BASELINE_AUDIT') {
       const record = readRoleRecord(runner, flow.updaterRunId)
@@ -479,27 +498,34 @@ export async function advanceHierarchy(runner, signal, assertAuthority = () => {
       if (digest(value) !== flow.proposalHash || record.resultHash !== flow.proposalHash) fail('SCOPED_UPDATER_RECEIPT_CHANGED')
       const candidate = prepareScopeProposal(runner, state, flow.scopeId, value, catalog)
       if (flow.stage === 'BASELINE_AUDIT') {
-        const changes = changedUnitBaselines(state, flow.scopeId, candidate)
-        const pending = changes.find(change => change.baseline.unitId === flow.baselineUnitId)
+        const changes = pendingBaselineChanges(state, flow, candidate)
+        const pending = changes.find(change => change.baseline.unitId === flow.baselineUnitId &&
+          (!flow.baselineCandidateHash || change.hash === flow.baselineCandidateHash))
+        if (!pending && !flow.baselineCandidateHash && flow.rebaseline?.auditRunId && flow.baselineUnitId === flow.scopeId) {
+          // Older checkpoints may have queued the already-approved parent.
+          const { baselineUnitId, updaterRunId, proposalHash, ...rest } = flow
+          const next = changes[0]
+          update(runner, state, next ? { ...flow, baselineUnitId: next.baseline.unitId, baselineCandidateHash: next.hash }
+            : { ...rest, stage: 'UPDATE' }); continue
+        }
         if (!pending || !state.unitRoleVersion) fail('UNIT_BASELINE_CANDIDATE_CHANGED')
         const audit = baselineAuditInput(runner, state, flow.scopeId, pending, catalog)
         const checked = await role(runner, state, 'baseline_audit', BASELINE_AUDIT_PROMPT, audit, null,
           result => checkedIssues(result, audit), signal)
         assertAuthority()
-        const { baselineUnitId, baselineReviews = [], updaterRunId, proposalHash, ...rest } = flow
+        const { baselineUnitId, baselineCandidateHash, baselineReviews = [], updaterRunId, proposalHash, ...rest } = flow
         if (checked.value.verdict === 'REJECT') {
           update(runner, checked.state, { ...rest, stage: 'UPDATE', feedback: JSON.stringify({ baseline: pending.baseline, review: checked.value }) })
           continue
         }
         const reviews = [...baselineReviews, { unitId: baselineUnitId, hash: pending.hash, runId: checked.runId }]
-        const next = changes.find(change => !reviews.some(review => review.hash === change.hash))
+        const next = pendingBaselineChanges(state, { ...flow, baselineReviews: reviews }, candidate)[0]
         update(runner, checked.state, next
-          ? { ...flow, baselineReviews: reviews, baselineUnitId: next.baseline.unitId }
+          ? { ...flow, baselineReviews: reviews, baselineUnitId: next.baseline.unitId, baselineCandidateHash: next.hash }
           : { ...rest, stage: 'UPDATE', baselineReviews: reviews })
         continue
       }
-      if (state.unitRoleVersion && changedUnitBaselines(state, flow.scopeId, candidate).some(change =>
-        !(flow.rebaseline?.auditRunId && change.baseline.unitId === flow.scopeId && change.baseline.field === 'baseline') && !flow.baselineReviews?.some(review => review.hash === change.hash))) fail('UNIT_BASELINE_APPROVAL_REQUIRED')
+      if (state.unitRoleVersion && pendingBaselineChanges(state, flow, candidate).length) fail('UNIT_BASELINE_APPROVAL_REQUIRED')
       const auditInput = { contract: input.contract, acceptance: input.acceptance, scopeId: flow.scopeId,
         ...(flow.blockageSignal ? { blockageSignal: flow.blockageSignal } : {}),
         ...(flow.baselineReviews ? { approvedBaselines: flow.baselineReviews.map(review => approvedBaseline(runner, review)) } : {}),

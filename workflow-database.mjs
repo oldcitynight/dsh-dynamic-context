@@ -10,6 +10,10 @@ export const sha256 = (data) => createHash('sha256').update(data).digest('hex')
 export function storageError(code) {
   throw Object.assign(new Error(code), { code })
 }
+export function sqliteLockContention(error) {
+  const code = Number.isInteger(error?.errcode) ? error.errcode & 255 : null
+  return code === 5 || code === 6
+}
 const word = new Uint32Array(256)
 let seed = 11711
 for (let i = 0; i < word.length; i++) {
@@ -73,7 +77,7 @@ export function withStorageLock(file, shared, timeoutMs, busyCode, operation) {
       guard.exec(shared ? 'BEGIN' : 'BEGIN EXCLUSIVE')
       guard.prepare('PRAGMA schema_version').get()
     } catch (error) {
-      if ((error.errcode & 255) === 5 || (error.errcode & 255) === 6) storageError(busyCode)
+      if (sqliteLockContention(error)) storageError(busyCode)
       throw error
     }
     return operation()

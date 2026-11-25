@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { fixtureState } from '../testing/harness.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -107,7 +108,8 @@ test('a human command may reconsider a previous native choice, but missing histo
   await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const graphFile = runner.graph.store.file
   // Damage the actual ledger, preserving its witness and session receipts.
-  fs.writeFileSync(graphFile, 'broken ledger')
+  if (runner.storage) runner.storage.db.put('graph/state', 'broken ledger')
+  else fs.writeFileSync(graphFile, 'broken ledger')
   const count = f.h.backend.requests.length
   assert.equal((await invoke()).result.kind, 'error')
   assert.equal(f.h.backend.requests.length, count)
@@ -266,7 +268,7 @@ test('task-only proposal falls back to original graph tools without committing a
   const result = await f.call(agent, 'dynamic_context_submit', { proposal: { taskGraph } })
   assert.equal(result.status, 'TASK_GRAPH_ONLY'); assert.equal(result.committed, false)
   assert.equal(result.nextTool, 'transaction_graph_create'); assert.deepEqual(result.arguments.definition, taskGraph)
-  assert.equal(child.graph.read(), null)
+  assert.equal(fixtureState(child), null)
   assert.equal(f.h.runner.interaction.mode(agent), 'task-graph')
   assert.equal(schemaNames(f.h.ctx, agent).includes('dynamic_context_run_next'), false)
   assert.equal(schemaNames(f.h.ctx, agent).includes('transaction_graph_create'), true)
@@ -282,7 +284,7 @@ for (const fallback of ['回退到原生状态', '不回退，补齐任务图', 
   assert.equal(result.code, 'CONTEXT_GRAPH_REQUIRES_TASK_GRAPH')
   assert.equal(f.questions.length, 2); assert.match(f.questions[1][0].question, /缺少前置任务图/)
   assert.equal(f.h.runner.interaction.mode(agent), fallback === '回退到原生状态' ? 'native' : 'full')
-  assert.equal(child.graph.read(), null); assert.equal(f.h.backend.requests.length, 0)
+  assert.equal(fixtureState(child), null); assert.equal(f.h.backend.requests.length, 0)
 })
 
 test('unanswered initial question never selects the recommended full mode', async t => {
@@ -335,7 +337,7 @@ test('mode switches cannot release an active leaf and base loss blocks further r
 })
 
 for (const answer of ['恢复已核验快照（推荐）', '暂停并保留现场', null]) test(`committed graph loss requires recovery consent: ${answer}`, async t => {
-  const f = await fixture(t, { choice: (_request, count) => count === 1 ? 'full' : answer })
+  const f = await fixture(t, { config: { storageFormat: 'files' }, choice: (_request, count) => count === 1 ? 'full' : answer })
   const { agent } = await f.agent('lost-graph')
   await f.selectMode(agent, { reason: '项目任务' })
   await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
@@ -357,7 +359,7 @@ for (const answer of ['恢复已核验快照（推荐）', '暂停并保留现�
 })
 
 test('session commit receipt prevents fresh creation after both graph and witness are removed', async t => {
-  const f = await fixture(t), { agent } = await f.agent('double-loss')
+  const f = await fixture(t, { config: { storageFormat: 'files' } }), { agent } = await f.agent('double-loss')
   await f.selectMode(agent, { reason: '项目任务' })
   await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const child = f.h.runner.interaction.entries.get(agent).runner
@@ -454,7 +456,7 @@ test('the Web status RPC displays the committed linked graph for its session, in
 })
 
 test('the Web status RPC does not repair an unresolved witness or hide a missing committed graph as empty', async t => {
-  const f = await fixture(t), { agent } = await f.agent('web-recovery')
+  const f = await fixture(t, { config: { storageFormat: 'files' } }), { agent } = await f.agent('web-recovery')
   await f.selectMode(agent, { reason: '项目任务' })
   await f.call(agent, 'dynamic_context_submit', { proposal: rootTask() })
   const { graph } = f.h.runner.interaction.entries.get(agent).runner

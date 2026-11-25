@@ -54,7 +54,7 @@ const pointer = parts => '/' + parts.map(part => String(part).replaceAll('~', '~
 // snapshots, previous execution segments and scoped blueprints.
 const pinned = new Set(['contract', 'runtimeSemantics', 'task', 'taskContract', 'verificationPlan',
   'contexts', 'sharedContexts', 'currentSharedFacts', 'contextGraph', 'instruction', 'systemPrompt',
-  'roleInstruction', 'acceptance', 'aliasContracts', 'finalAuditMandate', 'userGuidance', 'originalUserGuidance'])
+  'roleInstruction', 'acceptance', 'aliasContracts', 'finalAuditMandate', 'userGuidance', 'originalUserGuidance', 'materialNavigation'])
 function protectedValues(value, parts = [], result = []) {
   if (parts.length && pinned.has(parts.at(-1))) { result.push({ location: pointer(parts), value }); return result }
   if (Array.isArray(value) && parts.at(-1) === 'tools') return result
@@ -98,7 +98,7 @@ function fitEnd(text, start, end, fits) {
   return boundary(text, low)
 }
 
-export function createRoleContext({ config, messages, directory, call, signal, role, observeTool, inspectTool, readOnlyTools, inputIndex, toolPolicy, toolScope = {}, toolHostContext = {}, beforeTool, contextText = (_role, _slot, text) => text, limitImageBatch = () => true, compactionInstruction = COMPACTION_INSTRUCTION, imageTools = false, structuredToolErrors = false, formattedReports = false, reportTemplate, reportReceipts, validateSubmission, directorySnapshots = false, measureTokens = async payload => rolePressureTokens(payload) }) {
+export function createRoleContext({ config, messages, directory, call, signal, role, observeTool, inspectTool, readOnlyTools, inputIndex, materialNavigation = true, toolPolicy, toolScope = {}, toolHostContext = {}, beforeTool, contextText = (_role, _slot, text) => text, limitImageBatch = () => true, compactionInstruction = COMPACTION_INSTRUCTION, imageTools = false, structuredToolErrors = false, formattedReports = false, reportTemplate, reportReceipts, validateSubmission, directorySnapshots = false, measureTokens = async payload => rolePressureTokens(payload) }) {
   const spec = roleWindow(config), original = structuredClone(messages)
   let data, structured = true, history = [], enabled = false
   try { data = JSON.parse(original[1].content) } catch { data = original[1].content; structured = false }
@@ -311,7 +311,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
         if (!selectTools().some(tool => tool.function.name === EVIDENCE_TOOL)) fail('ROLE_MATERIAL_READER_REQUIRED', { role, tool: EVIDENCE_TOOL, limit })
         const source = archive(bundle.text, '/materialSummary', 'json')
         const reader = { tool: EVIDENCE_TOOL, arguments: { id: source.id, start: 0, end: Math.min(1024, bundle.text.length) } }
-        data = materialView(data, bundle, reader, limit)
+        data = materialView(data, bundle, reader, limit, materialNavigation)
         anchors = protectedValues(data); anchorHash = digest(anchors)
       }
       budgetPrepared = true
@@ -398,7 +398,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     if (end <= args.start) fail('REVISION_CONTEXT_READ_CANNOT_FIT')
     return page(end)
   }
-  async function executeBuiltin(tool) {
+  async function executeBuiltin(tool, ordinal) {
     if (inputReader && tool.function.name === INDEX_READER) {
       let source
       try { source = parseModelJSON(tool.function.arguments).value?.source } catch { /* The reader returns the exact argument diagnostic. */ }
@@ -408,7 +408,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
       : tool.function.name === EVIDENCE_TOOL ? await read(tool.function.arguments)
       : tool.function.name === EVIDENCE_SEARCH_TOOL ? search(tool.function.arguments)
       : tool.function.name === DIRECTORY_SNAPSHOT_TOOL ? directorySnapshot(tool)
-      : readOnlyTools?.tools.some(row => row.function.name === tool.function.name) ? await readOnlyTools.execute(tool)
+      : readOnlyTools?.tools.some(row => row.function.name === tool.function.name) ? await readOnlyTools.execute(tool, ordinal)
       : [REPORT_SUBMIT, REPORT_GENERATE].includes(tool.function.name) && batchSize !== 1
         ? { error: 'REPORT_SUBMIT_MUST_BE_ALONE', unchanged: true, diagnostic: { protocol: 'validation-feedback-v1', code: 'REPORT_SUBMIT_MUST_BE_ALONE', category: 'program', issues: [{ path: '/tool_calls', reason: 'Submit the draft in its own response after all read/edit calls have finished.' }] } }
         : draft.execute(tool.function.name, tool.function.arguments)
@@ -421,6 +421,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
     beforeTool?.()
     history.push(completed.message); batchSize = completed.message.tool_calls.length
     const excess = limitImageBatch() ? excessImageCalls(completed.message.tool_calls) : undefined
+    const rejections = []
     for (const tool of completed.message.tool_calls) {
       beforeTool?.()
       const identity = { callId: tool.id, name: tool.function.name }
@@ -429,6 +430,13 @@ export function createRoleContext({ config, messages, directory, call, signal, r
         const { value, ordinal } = await toolValue(exposedTools, tool, excess)
         const result = roleImageResult(tool.function.name, value, structuredToolErrors), content = result.content
         history.push({ role: 'tool', tool_call_id: tool.id, ...result })
+        if (value.error) {
+          let args
+          try { args = { value: parseModelJSON(tool.function.arguments).value } }
+          catch { args = { raw: tool.function.arguments } }
+          rejections.push({ tool: tool.function.name, arguments: args, code: value.error,
+            issues: value.diagnostic?.issues?.map(({ path, rule, reason }) => ({ path, rule, reason })) ?? [] })
+        }
         try { observeTool?.('tool/result', { ...identity, content, isError: Boolean(value.error) }) } catch {}
         inspectTool?.(role, tool, value, ordinal)
       } catch (error) {
@@ -436,6 +444,7 @@ export function createRoleContext({ config, messages, directory, call, signal, r
         throw error
       }
     }
+    return rejections.length === batchSize ? rejections : []
   }
   return { prepare, continueRead, reject(completed, error) { if (completed.message.tool_calls?.length) draft?.reopen(); else history.push(completed.message); history.push({ role: 'user', content: feedbackText(error, { stage: role }) + '\nCorrect only the indicated part of your own submission; original input and permissions are unchanged.' }) }, spec, actions, sources, submitted: () => draft?.result(),
     snapshot: () => ({ protocol, protectedInputSha256: anchorHash, actions, sources: sources.map(({ text, file, ...source }) => source), historySha256: digest(history),

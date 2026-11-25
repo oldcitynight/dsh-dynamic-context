@@ -175,13 +175,33 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     else contract.approveCheckpoint(checkpoint)
   }
   checkDirectHistory(messages, contract.checkpoints)
+  const permits = (tool, args) => contract.definitions.has(tool) && toolAdmission?.(tool, args) !== false
+  const readFact = (fact, inline) => {
+    const shared = 'dynamic_context_shared_read', args = { id: fact.id, revision: fact.revision }
+    if (permits(shared, args)) return { tool: shared, arguments: args }
+    if (inline) return
+    const source = 'dynamic_context_source_read'
+    // The agentless reader is restricted to the sealed initial material. Native
+    // archives can hold later revisions within this exact execution attempt.
+    if (journal && permits(source) && contract.definitions.get(source).execute !== readLocalSource) {
+      const page = { message_index: 0, field: 'content', offset: 0, length: Math.min(1024, fact.content.length || 1) }
+      const archive = journal.archive([{ role: 'user', content: fact.content }], archive_id => {
+        for (let offset = 0; offset < Math.max(fact.content.length, 1); offset += page.length)
+          if (!permits(source, { archive_id, ...page, offset })) return false
+        return true
+      })
+      if (archive) return { tool: source, arguments: { archive_id: archive.id, ...page } }
+    }
+    fail('WORKFLOW_FACT_READER_REQUIRED', { id: fact.id, revision: fact.revision })
+  }
+  const currentGuidance = () => userGuidance?.(readFact) ?? []
   const hasNewGuidance = () => {
-    const current = userGuidance?.() ?? []
+    const current = currentGuidance()
     const last = messages.findLast(row => guidanceData(row))
     return current.length > 0 && digest(guidanceData(last ?? {})?.guidance ?? []) !== digest(current)
   }
   const refreshGuidance = () => {
-    const guidance = userGuidance?.()
+    const guidance = currentGuidance()
     if (!guidance?.length) return
     const message = { role: 'user', content: JSON.stringify({ protocol: GUIDANCE_MESSAGE_PROTOCOL,
       taskId: contract.assembly.task.id, attemptId: contract.assembly.task.attemptId, contextVersion: contract.assembly.contextVersion,
@@ -231,13 +251,13 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       ...(reportText === undefined ? {} : { reportText }) }
     return { state, record: journal.checkpoint(phase, state) }
   }
-  const pause = async () => {
+  const pause = async reason => {
     if (!journal) fail('DIRECT_PAUSE_REQUIRES_DURABILITY')
     const saved = await snapshot('READY')
-    record('task/paused', { nextRequest: nextStep + 1, noPendingEffects: true })
+    record('task/paused', { nextRequest: nextStep + 1, noPendingEffects: true, ...(reason ? { reason } : {}) })
     trace.status = 'PAUSED_AT_CHECKPOINT'; persist()
     saved.state.trace = structuredClone(trace)
-    return { paused: true, continuationState: saved.state }
+    return { paused: true, continuationState: saved.state, ...(reason ? { reason } : {}) }
   }
   const requestBoundary = () => { if (shouldPause?.(nextStep)) fail('WORKFLOW_PAUSE_REQUESTED') }
   const resumableSummaries = continuation ? trace.events.filter(row => row.type === 'compaction/response').map(row => row.data) : []
@@ -439,6 +459,8 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       try { beforeTool?.() } catch (error) { if (error.code === 'WORKFLOW_GUIDANCE_REQUESTED') return await pause(); throw error }
       return reportText
     }
+    if (reportDraft?.needsPlanReview() && calls.some(call => [REPORT_GENERATE, REPORT_SUBMIT].includes(call.function.name)))
+      return await pause('WORKFLOW_PLAN_REVIEW_REQUIRED')
     await snapshot('READY')
   }
   try {
@@ -451,7 +473,7 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
       return previousReport
     }
     if (continuation && hasNewGuidance()) {
-      const reopened = reportDraft?.reopenForGuidance(userGuidance())
+      const reopened = reportDraft?.reopenForGuidance(currentGuidance())
       if (reopened) record('task/report-reopened', reopened)
     }
     execution?.start(contract)
@@ -570,6 +592,10 @@ export async function runDirect({ ctx, config, contract, trace, control, persist
     }
     fail('TASK_REQUEST_LIMIT')
   } catch (error) {
+    if (error.code === 'WORKFLOW_FACT_READER_REQUIRED') {
+      record('task/fact-reader-required', error.details)
+      return await pause(error.code)
+    }
     if (error.code === 'WORKFLOW_PAUSE_REQUESTED') return await pause()
     throw error
   } finally { stopAccount(); bridge.close(); output?.interrupt({ sessionId: trace.sessionId }) }

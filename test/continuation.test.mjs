@@ -458,6 +458,30 @@ test('configuration changes and altered checkpoint bytes stop recovery before HT
   assert.equal(where.backend.requests.length, 1)
 })
 
+test('input meters with the same function source and different declared configuration stop durable resume', async t => {
+  const where = await location(t, ({ index }) => index === 1 ? writeResponse : { text: 'Safe result.' })
+  const meter = (tokens, configurationFingerprint) => ({
+    version: 'fixture-meter', configurationFingerprint, measure: () => ({ tokens, method: 'exact' })
+  })
+  const first = await where.open()
+  assert.throws(() => first.runner.registerInputMeter(meter(10, ' ')), { code: 'DIRECT_INPUT_METER_FINGERPRINT_INVALID' })
+  first.runner.registerInputMeter(meter(10, 'counting-table-a'))
+  first.runner.submit(runtimeProposal(['write']))
+  const paused = await first.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
+  await first.close()
+  const resume = runner => runner.resumeActive({ expectedRevision: 2, checkpointChecksum: paused.checkpoint.checksum })
+  const changed = await where.open()
+  changed.runner.registerInputMeter(meter(20, 'counting-table-b'))
+  await assert.rejects(resume(changed.runner), { code: 'DIRECT_RESUME_CONFIGURATION_CHANGED' })
+  assert.equal(changed.runner.checkpointStatus().checksum, paused.checkpoint.checksum)
+  assert.equal(where.backend.requests.length, 1)
+  await changed.close()
+  const same = await where.open()
+  same.runner.registerInputMeter(meter(10, 'counting-table-a'))
+  assert.equal((await resume(same.runner)).report.text, 'Safe result.')
+  assert.equal(where.backend.requests.length, 2)
+})
+
 const compactionConfig = {
   allowedTools: ['read', 'dynamic_context_source_read'], maxRequestsPerTask: 8, maxContextCharacters: 28000,
   direct: { compaction: { triggerCharacters: 14000, maxCheckpointCharacters: 10000, maxCompactions: 4 } },

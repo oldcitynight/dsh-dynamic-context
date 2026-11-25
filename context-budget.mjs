@@ -39,13 +39,30 @@ export function materialBundle(data, limit, fields) {
   return { text, bytes: size, sha256: createHash('sha256').update(text).digest('hex'), cards }
 }
 
-export function materialView(data, bundle, reader, limit) {
+export function materialView(data, bundle, reader, limit, withNavigation = false) {
   const projected = { ...data }
   for (const card of bundle.cards) delete projected[card.field]
   const access = { format: 'unit-context-material-v2', utf8Bytes: bundle.bytes, sha256: bundle.sha256,
     offsets: 'UTF-16', reader, fields: bundle.cards }
   if (bytes(JSON.stringify(access)) > limit) access.fields = bundle.cards.map(({ field, start, end }) => ({ field, start, end }))
   if (bytes(JSON.stringify(access)) > limit) { delete access.fields; access.summary = 'Top-level fields in one archived JSON object'; access.characters = bundle.text.length }
+  if (withNavigation) {
+    const navigation = {}
+    const identify = rows => Array.isArray(rows) ? rows.map(row => {
+      if (!row || typeof row !== 'object') return null
+      const id = row.id ?? row.requirementId ?? row.taskId, source = row.source ?? row._reportIndex?.source
+      return id || source ? { ...(id ? { id } : {}), ...(source ? { source } : {}),
+        ...(row.revision !== undefined ? { revision: row.revision } : {}), ...(row.required !== undefined ? { required: row.required } : {}) } : null
+    }).filter(Boolean) : []
+    for (const { field, summary, start, end } of bundle.cards) {
+      const value = data[field]
+      const entries = identify(Array.isArray(value) ? value : value?.requirements ?? value?.contexts ?? value?.tests)
+      if (entries.length || summary) navigation[field] = { start, end, ...(summary ? { summary } : {}), ...(entries.length ? { entries } : {}) }
+    }
+    const fits = () => bytes(JSON.stringify({ materialSummary: access, materialNavigation: navigation })) <= limit
+    if (!fits()) for (const item of Object.values(navigation)) delete item.entries
+    if (Object.keys(navigation).length && fits()) projected.materialNavigation = navigation
+  }
   return { ...projected, materialSummary: access }
 }
 

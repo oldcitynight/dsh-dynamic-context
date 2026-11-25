@@ -41,7 +41,12 @@ export function executionReportDraft(runner, trace, signal, persist, preceding =
     output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     execute(args) { const value = draft.execute(spec.name, JSON.stringify(args)); trace.reportDraft = draft.snapshot(); persist(); return value },
   }))
-  return { ...draft, definitions, reopenForGuidance(guidance) {
+  return { ...draft, definitions, needsPlanReview() {
+    const { assembly } = trace
+    return Boolean(assembly.unitBaseline && assembly.ruleVersion &&
+      runner.graph.read().contexts.bindings.find(binding => binding.taskId === assembly.task.id)?.tools.length === 0 &&
+      draft.snapshot().receipts.at(-1)?.result.error === 'RULE_FAILED_EVIDENCE_REQUIRED')
+  }, reopenForGuidance(guidance) {
     if (draft.result() === undefined) return null
     const snapshot = draft.snapshot(), marker = { receiptCount: snapshot.receipts.length, snapshotHash: digest(snapshot),
       resultHash: digest(draft.result()), guidanceHash: digest(guidance) }

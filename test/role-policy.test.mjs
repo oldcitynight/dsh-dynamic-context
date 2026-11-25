@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { RolePromptRegistry, RoleToolRegistry, ROLE_BOUNDARY } from '../role-policy.mjs'
 const base = { pluginId: 'skill/example', registrationId: 'style', role: 'result_check' }
 test('role prompts append or replace deterministically, retain a host boundary, and isolate scope and snapshots', () => {
@@ -56,6 +59,51 @@ test('extensions cannot shadow built-in tools or keep executing after disposal',
   await assert.rejects(view.execute(call({ id: 'x' })), /ROLE_TOOL_REGISTRATION_CHANGED/)
   const denied = new RoleToolRegistry(); denied.registerTool(extension({ authorize: () => false }))
   await assert.rejects(denied.tools('group_audit', null).execute(call({ id: 'x' })), /ROLE_TOOL_HOST_PERMISSION_DENIED/)
+})
+
+test('declared extension operands are checked before dispatch on both role tool surfaces', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'role-tool-paths-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const projectRoot = path.join(root, 'project'), work = path.join(projectRoot, 'work')
+  const privateRoot = path.join(work, 'private')
+  fs.mkdirSync(privateRoot, { recursive: true })
+  const publicFile = path.join(work, 'note.txt'), alternateFile = path.join(work, 'other.txt')
+  fs.writeFileSync(publicFile, 'public')
+  fs.writeFileSync(alternateFile, 'also public')
+  fs.writeFileSync(path.join(projectRoot, 'outside.txt'), 'outside the assigned work directory')
+  const alias = path.join(work, 'note-link')
+  fs.symlinkSync(publicFile, alias)
+  const config = { projectRoot, storageRoot: root, direct: { runtime: { cwd: 'work', privateReadRoots: [privateRoot] } } }
+  const context = { runner: { config } }
+  const tools = new RoleToolRegistry()
+  let authorized = 0, executed = 0
+  const registration = extension({
+    workspacePaths: ['/id'],
+    authorize: ({ workspacePaths, args }) => {
+      authorized++
+      assert.equal(workspacePaths['/id'], publicFile)
+      if (args.id === 'work/note-link') {
+        fs.unlinkSync(alias)
+        fs.symlinkSync(alternateFile, alias)
+      }
+      return true
+    },
+    execute: (_args, { workspacePaths }) => {
+      executed++
+      return { basename: path.basename(workspacePaths['/id']) }
+    }
+  })
+  assert.throws(() => tools.registerTool(registration), { code: 'ROLE_TOOL_WORKSPACE_REQUIRED' })
+  tools.registerTool({ ...registration, workspaceRoot: projectRoot })
+  const view = tools.tools('group_audit', null, {}, context)
+  const [native] = tools.nativeDefinitions('group_audit', {}, context)
+  await assert.rejects(view.execute(call({ id: 'outside.txt' })), { code: 'ROLE_TOOL_WORKSPACE_PATH_DENIED' })
+  await assert.rejects(native.execute({ id: 'work/private/record.txt' }, { callId: 'native1' }), { code: 'ROLE_TOOL_WORKSPACE_PATH_DENIED' })
+  assert.equal(authorized, 0)
+  assert.deepEqual(await native.execute({ id: 'work/note.txt' }, { callId: 'native2' }), { basename: 'note.txt' })
+  await assert.rejects(view.execute(call({ id: 'work/note-link' })), { code: 'ROLE_TOOL_WORKSPACE_PATH_CHANGED' })
+  assert.equal(authorized, 2)
+  assert.equal(executed, 1)
 })
 
 test('durable registered tools replay completed receipts and never repeat an uncertain effect', async t => {

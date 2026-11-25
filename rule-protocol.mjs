@@ -69,6 +69,6 @@ export function checkOutcome(version, result, source) {
     return
   throw located('RULE_FAILED_EVIDENCE_REQUIRED', {
     path: '/executionReport/tests',
-    reason: 'Cite an actual failed call or a failed criterion with an exact quote from an executed check.'
+    reason: 'Cite an actual failed call or a failed criterion with an exact quote from an executed check. If this unit has no declared work tools and no check can be executed, the program can pause for a plan review.'
   })
 }

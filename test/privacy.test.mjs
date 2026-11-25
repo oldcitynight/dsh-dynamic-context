@@ -8,7 +8,7 @@ import { createPrivatePathGuard } from '../execution-privacy.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'"
-async function fixture(t, options = {}) {
+async function fixture(t, { privateProvider = false, ...options } = {}) {
   const storageRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-private-paths-')))
   const projectRoot = storageRoot + '/workspace', home = projectRoot + '/.dsh'
   fs.mkdirSync(projectRoot); fs.mkdirSync(home)
@@ -16,8 +16,11 @@ async function fixture(t, options = {}) {
   fs.writeFileSync(credential, 'SYNTHETIC_SECRET_CREDENTIAL\n')
   fs.writeFileSync(home + '/toolchain.txt', 'NONSECRET_TOOLCHAIN\n')
   fs.writeFileSync(storageRoot + '/host-only.txt', 'SYNTHETIC_PRIVATE_HISTORY\n')
+  const providerRoot = path.join(projectRoot, 'provider-private')
+  if (privateProvider) fs.mkdirSync(providerRoot)
   const h = await createRuntimeHarness({ projectRoot, directory: storageRoot + '/state', ...options,
-    config: { storageRoot, timeoutMs: 20000, ...options.config } })
+    config: { storageRoot, timeoutMs: 20000, ...options.config,
+      ...(privateProvider ? { direct: { runtime: { privateReadRoots: [providerRoot] } } } : {}) } })
   t.after(async () => { await h.close(); fs.rmSync(storageRoot, { recursive: true, force: true }) })
   return { ...h, storageRoot, projectRoot, home, credential }
 }
@@ -106,6 +109,30 @@ print('ATOMIC_REFRESH_HIDDEN')`),
   const result = await pending
   assert.match(result.trace.events.find(e => e.type === 'tool/result').data.content[0].text, /ATOMIC_REFRESH_HIDDEN/)
   assert.equal(fs.readFileSync(h.credential, 'utf8'), 'SYNTHETIC_NEW_SECRET\n')
+})
+
+test('a configured private provider directory protects independently named files from native tools', async t => {
+  const file = 'provider-private/pending-write', publicFile = 'provider-notes.txt'
+  const h = await fixture(t, { privateProvider: true, respond: ({ index, payload }) => {
+    if (index === 1) return { tools: [{ name: 'read', arguments: { file_path: file } }] }
+    if (index === 2) {
+      assert.match(payload.messages.at(-1).content, /DIRECT_RUNTIME_PRIVATE_PATH_DENIED/)
+      return { tools: [{ name: 'bash', arguments: {
+        command: `test ! -e ${file} && test -r ${publicFile} && echo PROVIDER_ROOT_CHECKED`,
+        description: 'Check a private provider directory'
+      } }] }
+    }
+    const results = JSON.stringify(payload.messages.filter(row => row.role === 'tool'))
+    assert.match(results, /PROVIDER_ROOT_CHECKED/)
+    assert.doesNotMatch(results, /SYNTHETIC_PROVIDER_DATA/)
+    return { text: 'Independent provider directory checked.' }
+  } })
+  fs.writeFileSync(path.join(h.projectRoot, file), 'SYNTHETIC_PROVIDER_DATA')
+  fs.writeFileSync(path.join(h.projectRoot, publicFile), 'ordinary project notes')
+  h.runner.submit(runtimeProposal(['read', 'bash']))
+  const result = await h.runner.runNext({ expectedRevision: 1 })
+  assert.equal(result.report.text, 'Independent provider directory checked.')
+  assert.equal(fs.readFileSync(path.join(h.projectRoot, file), 'utf8'), 'SYNTHETIC_PROVIDER_DATA')
 })
 
 test('per-tool service wrapping leaves other sessions unchanged and detects replacement of its native methods', t => {

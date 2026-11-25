@@ -130,7 +130,7 @@ export async function readCompletion(response, { signal, model, direct, maxRespo
       if (finish !== null && (delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length)) fail('DIRECT_CONTENT_AFTER_FINISH')
       text += delta.content ?? ''; reasoning += delta.reasoning_content ?? delta.reasoning ?? ''
       for (const part of delta.tool_calls ?? []) {
-        if (!Number.isSafeInteger(part.index) || part.index < 0 || maxResponseBytes !== null && part.index >= 16 || part.type !== undefined && part.type !== 'function') fail('DIRECT_INVALID_TOOL_FRAGMENT')
+        if (!Number.isSafeInteger(part.index) || part.index < 0 || part.type !== undefined && part.type !== 'function') fail('DIRECT_INVALID_TOOL_FRAGMENT')
         const call = calls.get(part.index) ?? { id: '', type: 'function', function: { name: '', arguments: '' } }
         if (part.id !== undefined) {
           if (typeof part.id !== 'string' || call.id && call.id !== part.id) fail('DIRECT_TOOL_CALL_ID_CHANGED')
@@ -144,7 +144,7 @@ export async function readCompletion(response, { signal, model, direct, maxRespo
           if (typeof part.function.arguments !== 'string') fail('DIRECT_INVALID_TOOL_ARGUMENTS')
           call.function.arguments += part.function.arguments
         }
-        if (call.id.length > 128 || call.function.name.length > 128 || maxResponseBytes !== null && call.function.arguments.length > 32768) fail('DIRECT_TOOL_FRAGMENT_LIMIT')
+        if (call.id.length > 128 || call.function.name.length > 128) fail('DIRECT_TOOL_FRAGMENT_LIMIT')
         calls.set(part.index, call)
       }
       // Observation follows validation and cannot change request execution.

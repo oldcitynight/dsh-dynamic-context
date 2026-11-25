@@ -6,10 +6,10 @@
     "0.2.2-alpha.2"
   ],
   "schema": 1,
-  "updateRound": 0,
+  "updateRound": 1,
   "channel": "dsh-0.2.2-alpha.2",
-  "taskgraph": "0.3.2-rc.4",
-  "dynamicContext": "0.1.2-rc.4",
+  "taskgraph": "0.3.2-rc.14",
+  "dynamicContext": "0.1.2-rc.14",
   "hostPreparation": {
     "taskgraph": "scripts/patch-native-host.mjs",
     "dynamicContext": "scripts/patch-native-presentation.mjs"

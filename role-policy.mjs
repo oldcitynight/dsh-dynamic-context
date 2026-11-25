@@ -13,7 +13,8 @@ import { diagnostic, located, parseModelJSON } from 'dsh-better-task-grapth/vali
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { unitAllowedTools } from './image-content.mjs'
-import { toolName as toolId, toolSelector, policyPriority, policyAllows, snapshotAllowsCall, operationRules } from './policy-selectors.mjs'
+import { roleWorkspacePathResolver } from './execution-privacy.mjs'
+import { toolName as toolId, toolSelector, policyPriority, policyAllows, snapshotAllowsCall, operationRules, argumentPointer, argumentValue } from './policy-selectors.mjs'
 
 export const ROLE_PROMPTS_SERVICE = 'dynamicContextRolePrompts'
 export const ROLE_TOOLS_SERVICE = 'dynamicContextRoleTools'
@@ -81,6 +82,20 @@ const keyOf = value => JSON.stringify([value.pluginId, value.registrationId])
 const compare = (a, b) => (a.priority ?? 0) - (b.priority ?? 0) || keyOf(a).localeCompare(keyOf(b), 'en')
 const rejectedTool = error => Object.assign(error, { toolRejected: true })
 const rejectTool = (code, details) => rejectedTool(located(code, details))
+
+function resolveWorkspaceArguments(extension, args, runner) {
+  const denied = pointer => rejectTool('ROLE_TOOL_WORKSPACE_PATH_DENIED', { path: '/tool_calls/function/arguments' + pointer,
+    reason: 'Supply a path inside the permitted project workspace, outside private locations.' })
+  let resolve
+  try { resolve = roleWorkspacePathResolver(runner.config, runner.ctx?.get?.('credentials')) }
+  catch { throw denied('') }
+  return Object.freeze(Object.fromEntries(extension.workspacePaths.map(pointer => {
+    const requested = argumentValue(args, pointer)
+    if (typeof requested !== 'string' || !requested.trim() || requested.includes('\0')) throw denied(pointer)
+    try { return [pointer, resolve(requested)] }
+    catch { throw denied(pointer) }
+  })))
+}
 function writeReceipt(file, value) {
   if (writeStored(file, JSON.stringify(value), {exclusive:value.phase==='STARTED'})) return
   const temp = file + '.' + randomUUID() + '.tmp', fd = fs.openSync(temp, 'wx', 0o600)
@@ -177,7 +192,11 @@ export class RoleToolRegistry {
     const { schema, execute, authorize, previousParameters = [], ...metadata } = input
     const parsed = z.object({ pluginId: id, registrationId: id, toolId, roles: z.array(roleSchema).min(1),
       effect: z.enum(['read', 'report', 'work']), scope: scopeSchema.default({}),
-      workspaceRoot: z.string().refine(path.isAbsolute).optional(), auditArtifacts: z.literal(true).optional() }).strict().parse(metadata)
+      workspaceRoot: z.string().refine(path.isAbsolute).optional(),
+      workspacePaths: z.array(argumentPointer).nonempty().refine(paths => new Set(paths).size === paths.length).optional(),
+      auditArtifacts: z.literal(true).optional() }).strict().parse(metadata)
+    if (parsed.workspacePaths && !parsed.workspaceRoot)
+      throw located('ROLE_TOOL_WORKSPACE_REQUIRED', { path: '/workspaceRoot', reason: 'Declaring workspace paths requires an explicit workspace root.' })
     if (parsed.workspaceRoot) parsed.workspaceRoot = fs.realpathSync(parsed.workspaceRoot)
     if (parsed.auditArtifacts && (parsed.effect !== 'read' || !parsed.workspaceRoot))
       throw located('ROLE_TOOL_AUDIT_SCOPE_REQUIRED', { path: '/workspaceRoot', reason: 'An audit evidence tool needs a workspace and read effects.' })
@@ -272,7 +291,7 @@ export class RoleToolRegistry {
             throw rejectTool('ROLE_TOOL_DENIED', { path: '/tool_calls/function/arguments', item: name, reason: 'The role policy denies this operation.' })
         }
         const extension = owned.get(name)
-        if (!extension) return builtins.execute(tool)
+        if (!extension) return builtins.execute(tool, receiptKey)
         if (this.#tools.get(keyOf(extension)) !== extension) throw rejectTool('ROLE_TOOL_REGISTRATION_CHANGED', { path: '/tool_calls/function/name', item: name, reason: 'This tool registration was removed or replaced; request a fresh role invocation.' })
         let args
         try { args = parseModelJSON(tool.function.arguments, { path: '/tool_calls/function/arguments' }).value }
@@ -280,8 +299,15 @@ export class RoleToolRegistry {
         const toolSchema = schemas.get(name)
         const issues = validateJsonSchemaValue(toolSchema.function.parameters, args, '')
         if (issues.length) throw rejectTool('ROLE_TOOL_ARGUMENT_INVALID', { path: '/tool_calls/function/arguments', issues, reason: 'Arguments violate this registered tool schema.' })
-        const callContext = Object.freeze({ ...context, signal, role, scope: freeze(structuredClone(scope)), toolId: name, toolSchema, args: freeze(structuredClone(args)) })
+        const workspacePaths = extension.workspacePaths && resolveWorkspaceArguments(extension, args, context.runner)
+        const callContext = Object.freeze({ ...context, signal, role, scope: freeze(structuredClone(scope)), toolId: name, toolSchema,
+          args: freeze(structuredClone(args)), ...(workspacePaths ? { workspacePaths } : {}) })
         if (await extension.authorize(callContext) !== true) throw rejectTool('ROLE_TOOL_HOST_PERMISSION_DENIED', { path: '/tool_calls/function/name', item: name, reason: 'The registering plugin did not authorize this call under current host permissions.' })
+        if (workspacePaths) {
+          const currentPaths = resolveWorkspaceArguments(extension, args, context.runner)
+          if (extension.workspacePaths.some(pointer => workspacePaths[pointer] !== currentPaths[pointer]))
+            throw rejectTool('ROLE_TOOL_WORKSPACE_PATH_CHANGED', { path: '/tool_calls/function/arguments', reason: 'A declared path changed during host authorization. Submit a fresh call.' })
+        }
         if (this.#tools.get(keyOf(extension)) !== extension || !this.admits(snapshot, name, args, workspaceRoot))
           throw rejectTool('ROLE_TOOL_DENIED', { path: '/tool_calls/function/name', item: name, reason: 'The tool registration or policy changed during authorization.' })
         // Role replay reconstructs its old read/patch exchanges. Registered

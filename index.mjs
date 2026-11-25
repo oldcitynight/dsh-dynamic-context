@@ -172,7 +172,9 @@ export function durableConfigHash(config, meter, implementation) {
   const { workflowLimits: { maxUnits, maxDepth, ...materialLimits }, ...rest } = config
   const executionConfig = { ...rest, workflowLimits: materialLimits }
   return digest({ config: JSON.parse(JSON.stringify(executionConfig)), meter: meter ? { version: meter.version, implementation: sha256(Function.prototype.toString.call(meter.measure)),
-    observer: meter.observe ? sha256(Function.prototype.toString.call(meter.observe)) : null } : null, code: implementation ?? readPluginVersionsSync() })
+    observer: meter.observe ? sha256(Function.prototype.toString.call(meter.observe)) : null,
+    ...(meter.configurationFingerprint === undefined ? {} : { configurationFingerprint: meter.configurationFingerprint })
+  } : null, code: implementation ?? readPluginVersionsSync() })
 }
 
 export async function observeDurableConfigHash(config, meter) {
@@ -314,10 +316,13 @@ export class DynamicContextRuntime {
     } finally { await lease?.release(); this.busy = false; releaseDrain() }
   }
   subscribe(callback) { this.listeners.add(callback); return () => this.listeners.delete(callback) }
-  registerInputMeter({ version, measure, observe }) {
+  registerInputMeter({ version, measure, observe, configurationFingerprint }) {
     if (this.busy || this.inputMeter || typeof version !== 'string' || !version.trim() || version.length > 128 || typeof measure !== 'function') fail('DIRECT_INPUT_METER_REGISTRATION_INVALID')
     if (observe !== undefined && typeof observe !== 'function') fail('DIRECT_INPUT_OBSERVER_INVALID')
-    const meter = Object.freeze({ version, measure, ...(observe ? { observe } : {}) }); this.inputMeter = meter
+    if (configurationFingerprint !== undefined && (typeof configurationFingerprint !== 'string' || !configurationFingerprint.trim()))
+      fail('DIRECT_INPUT_METER_FINGERPRINT_INVALID')
+    const meter = Object.freeze({ version, measure, ...(observe ? { observe } : {}),
+      ...(configurationFingerprint === undefined ? {} : { configurationFingerprint }) }); this.inputMeter = meter
     return () => { if (this.busy) fail('DIRECT_INPUT_METER_IN_USE'); if (this.inputMeter === meter) this.inputMeter = null }
   }
   registerReconciliationVerifier({ version, verify }) {
@@ -571,6 +576,12 @@ export class DynamicContextRuntime {
         ? (continuation ? continuation.assembly.tools.filter(name => ['dynamic_context_source_read', 'dynamic_context_source_search'].includes(name))
           : ['dynamic_context_source_read', 'dynamic_context_source_search']) : []
       if (nativeArchiveTools.length) assembly = { ...assembly, tools: [...new Set([...assembly.tools, ...nativeArchiveTools])] }
+      const sharedReader = continuation ? continuation.assembly.tools.includes('dynamic_context_shared_read')
+        : assembly.unitBaseline && assembly.contexts.length && this.config.direct?.runtime?.modules.includes('state')
+          && unitBindingTools(this).includes('dynamic_context_shared_read')
+      if (sharedReader) {
+        assembly = { ...assembly, tools: [...new Set([...assembly.tools, 'dynamic_context_shared_read'])] }
+      }
       const formattedReports = this.config.transport === 'direct' && this.config.direct.runtime && (continuation ? continuation.assembly.formattedReports : Boolean(assembly.reportProtocol || assembly.completion))
       if (formattedReports) assembly = { ...assembly, formattedReports: true, tools: [...new Set([...assembly.tools, ...EXECUTION_REPORT_TOOLS])] }
       // New invocations receive visual evidence access independently of graph
@@ -625,8 +636,9 @@ export class DynamicContextRuntime {
         if (!assembly.tools.includes(INHERITED_REPORT_READER)) fail('EXECUTION_MATERIAL_READER_REQUIRED', { tool: INHERITED_REPORT_READER })
         const archive = journal.archive([{ role: 'user', content: background.text }])
         const reader = { tool: INHERITED_REPORT_READER, arguments: { archive_id: archive.id, message_index: 0, field: 'content', offset: 0, length: 1024 } }
-        const { materialSummary } = materialView(assembly, background, reader, materialLimit(this.config))
-        assembly = { ...assembly, materialSummary: { ...materialSummary, omittedFields: background.cards.map(card => card.field) } }
+        const { materialSummary, materialNavigation } = materialView(assembly, background, reader, materialLimit(this.config), true)
+        assembly = { ...assembly, materialSummary: { ...materialSummary, ...(materialNavigation ? { navigation: materialNavigation } : {}),
+          omittedFields: background.cards.map(card => card.field) } }
         trace.assembly = assembly
       }
       if (assembly.interruptedWork) {
@@ -658,6 +670,8 @@ export class DynamicContextRuntime {
       const allowedTools = unitBindingTools(this)
       if (this.config.transport === 'direct') execution = await prepareDirectRuntime({ ctx: this.ctx, config: reasoning.config,
         assembly, sessionId, sourceAgent, control, reportTools: reportDraft?.definitions ?? [], resumeState: continuation?.runtime, sourceReader: journal, correctionSource: correction, allowedTools,
+        credentialEnvironment: () => [this.config.direct.apiKeyEnv, reasoning.config.direct.apiKeyEnv,
+          ...this.roleModels.credentialEnvironment()],
         runtimeGuidance: base => {
           if (continuation) return trace.runtimePrompt?.content ?? base
           const snapshot = rolePrompt(this, executionRole, base, { task: assembly.task }, 'runtime')
@@ -708,7 +722,7 @@ export class DynamicContextRuntime {
           toolAdmission: admitCall,
           compactionToolAdmission: (name, args) => registry.admits(compactTools, name, args, this.config.projectRoot),
           beforeTool: () => this.workflowControl?.beforeTool?.(),
-          userGuidance: () => applicableGuidance(this, executionRole, { task: assembly.task }),
+          userGuidance: readFact => applicableGuidance(this, executionRole, { task: assembly.task }, readFact),
           shouldPause: step => this.pauseRequested || this.workflowControl?.guidancePending?.() || pauseAfterRequests !== undefined && step - startingStep >= pauseAfterRequests })
         if (reportText?.paused) {
           await execution?.close()
@@ -720,7 +734,8 @@ export class DynamicContextRuntime {
           const paused = journal.checkpoint('PAUSED', reportText.continuationState)
           persist()
           this.publish('paused')
-          return { paused: true, checkpoint: { phase: paused.phase, checksum: paused.checksum, snapshot: paused.data.snapshot },
+          return { paused: true, ...(reportText.reason ? { reason: reportText.reason } : {}),
+            checkpoint: { phase: paused.phase, checksum: paused.checksum, snapshot: paused.data.snapshot },
             trace, runDirectory, revision: this.graph.read().revision }
         }
         if (execution) { await execution.complete(); trace.executionEvents = structuredClone(execution.agent.session.snapshotEvents()) }

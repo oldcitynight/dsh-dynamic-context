@@ -7,6 +7,8 @@
 `workflowLimits.dynamicMaterialBytes` 是一次装配共享事实、执行报告、历史及其他背景材料的总字节预算，默认 65,536 字节。超限时提供来源摘要、字节数、SHA-256 和分页参数。角色后台使用 `dynamic_context_read_evidence`，执行者使用 `dynamic_context_source_read`，控制器和首次规划者使用各自状态或历史工具。应使用当前请求返回的工具和标识，按返回的下一偏移继续读取。配置的模型后端、角色权限及原文可见范围继续生效。
 
 
+执行中的单元收到绑定事实更正时，通知会给出事实 ID、修订号和内容摘要值。多条更正合计在材料预算内时，通知附原文。超限时优先使用本次执行获准的 `dynamic_context_shared_read` 读取指定修订，也可按通知参数通过 `dynamic_context_source_read` 分页读取本次执行归档。若当前权限不能交付原文，流程以 `WORKFLOW_FACT_READER_REQUIRED` 暂停并保留检查点。恢复已有读取权限后可以从原单元继续。
+
 此协议由动态上下文插件提供。任务图基础插件只增加通用的 `suspend` / `resolveSuspension` 事务端口，不包含 Skill、角色或引导业务；未使用端口的独立任务图行为不变。
 
 ## 随插件分发的默认上下文
@@ -170,9 +172,17 @@ const dispose = tools.registerTool({
 
 `effect` 为 read、report、work；审计者不能注册 work 工具。不能覆盖内建同名工具。执行者的额外工具还必须得到宿主 allowedTools 和叶绑定的许可。回调是受信任宿主代码，应调用其服务自身的权限入口，声明 read 不构成操作系统隔离。宿主注册不可代替原生权限。工具完成回执在恢复时复用；只存在 STARTED、没有已知结果的调用不会自动重放。
 
+工具接收路径时，可随 `workspaceRoot` 注册 `workspacePaths: ['/path', '/destination/file']`。每个 JSON Pointer 对应一个必填字符串参数。相对路径从项目根解析，且须处于配置的工作目录内。宿主检查原始位置和解析后的目标，排除凭据、工作流存储和私有根目录，并在异步授权返回后复查。回调使用 `context.workspacePaths['/path']` 取得核验后的绝对路径。插件遍历目录或派生新路径时，仍须通过自身权限入口校验每个实际访问的位置。
+
 只读扩展若需生成供本次审计查看的文件，在注册时指定 `workspaceRoot`、`effect: 'read'` 和 `auditArtifacts: true`。回调通过 `auditArtifacts.resolveInput(path)` 读取已授权的工作区文件，在 `auditArtifacts.outputDirectory` 下创建自己的子目录并写入成果，然后调用 `auditArtifacts.publish(folder, filenames)`。该方法记录指定文件的 SHA-256 并返回带末尾斜线的引用前缀。将前缀与原文件名拼接即可作为 `read_image` 的 `file_path` 返回给模型。文件名可以包含子目录或省略扩展名，图片格式和读图限制由 DSH 原生工具判定。每个引用只在签发它的审计中有效，文件内容改变后须重新签发。既有审计仍可读取自己的历史引用。
 
 领域工作步骤和示例放在提供该能力的插件 Skill 中。需要在只读角色中展示时，可在对应工具的说明中引用同一份 Skill 内容，并通过注册时的角色和工作区范围控制可见性。
+
+### 计量器与凭据
+
+通过 `runner.registerInputMeter({ version, measure, observe, configurationFingerprint })` 登记 Direct 输入计量器。最后一项可省略。计量函数或观察器依赖闭包配置、模型词表或外部规则时，传入可稳定重算的公开配置标识。影响结果的配置变化后更新该标识或 `version`。恢复时核对冻结的指纹，配置不符则在发送模型请求前阻塞。
+
+凭据文件及官方原子写入器使用点后缀的暂存文件和锁文件，均受私有路径保护。第三方凭据提供方使用独立文件名时，宜将所有暂存文件和凭据放在同一个专用目录，并将其绝对路径加入 `direct.runtime.privateReadRoots`，开启 `direct.runtime.protectPrivatePaths`。
 
 ## 用户引导
 

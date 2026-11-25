@@ -13,7 +13,9 @@ test('unbounded reception keeps complete large tool arguments and batches beyond
   const result = await readCompletion(response(), options)
   assert.equal(result.message.tool_calls.length, 17)
   assert.ok(result.message.tool_calls.every(call => call.function.arguments === args))
-  await assert.rejects(readCompletion(response(), { ...options, maxResponseBytes: 8388608 }), /DIRECT_TOOL_FRAGMENT_LIMIT/)
+  const bounded = await readCompletion(response(), { ...options, maxResponseBytes: 8388608 })
+  assert.deepEqual(bounded.message.tool_calls, result.message.tool_calls)
+  await assert.rejects(readCompletion(response(), { ...options, maxResponseBytes: 500000 }), { code: 'DIRECT_RESPONSE_BYTE_LIMIT' })
 })
 test('native-style idle timeout applies to stalled reads, retaining a partial receipt and cancelling the stream', async () => {
   let cancelled = false

@@ -10,6 +10,8 @@ const hash = z.string().regex(/^[a-f0-9]{64}$/)
 export const hierarchyControlSchema = z.object({ scopeId: id,
   stage: z.enum(['GATE', 'UPDATE', 'UPDATE_AUDIT', 'PAUSE_AUDIT', 'WAITING_USER', 'BLOCKAGE', 'UNIT_ROUTE', 'BASELINE_AUDIT', 'BASELINE_WRITE', 'BASELINE_REVIEW']),
   routeTaskId: id.optional(), routeAuthority: hash.optional(), routeRunId: id.optional(), baselineUnitId: id.optional(),
+  baselineCandidateHash: hash.optional(),
+  ruleDraftRunId: id.optional(),
   rebaseline: z.object({ baseline: unitBaselineSchema, reason: text, authorRunId: id, auditRunId: id.optional() }).strict().optional(),
   baselineReviews: z.array(z.object({ unitId: id, hash, runId: id }).strict()).optional(),
   decision: z.unknown().optional(), updaterRunId: id.optional(), triggerRunId: id.optional(),

@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { WorkflowDatabase, privateFile, sha256, storageError, withStorageLock } from './workflow-database.mjs'
 import { backupWorkflow } from './workflow-backup.mjs'
+import { isManagedRecord } from './workflow-record-paths.mjs'
 
 const instances = new Map()
 const markerName = '.workflow-storage-v1'
@@ -295,13 +296,15 @@ export function openWorkflowStorage({
   storageFormat = 'auto'
 }) {
   checkDir(storageRoot, directory)
+  const binding = sha256(JSON.stringify([storageRoot, directory]))
   const existing = instances.get(directory)
   if (existing) {
     if (storageFormat === 'files') storageError('WORKFLOW_STORAGE_FORMAT_CONFLICT')
+    if (existing.binding !== binding) storageError('WORKFLOW_STORAGE_IDENTITY_MISMATCH')
+    existing.db.check()
     existing.users++
     return existing
   }
-  const binding = sha256(JSON.stringify([storageRoot, directory]))
   const identity = externalIdentity(storageRoot, binding)
   const knownIdentity = exists(identity)
   if (knownIdentity) {
@@ -319,50 +322,57 @@ export function openWorkflowStorage({
   }
   let current,
     backedUp = db.q('SELECT 1 FROM files LIMIT 1').get() || db.q('PRAGMA user_version').get().user_version === 2 ? -1 : db.generation
+  const retryable = error => ['WORKFLOW_BACKUP_CHECKPOINT_BUSY', 'WORKFLOW_BACKUP_SNAPSHOT_CHANGED'].includes(error.code)
+  function capture(closing) {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL('./workflow-backup-worker.mjs', import.meta.url), {
+        workerData: { directory, binding, closing }, execArgv: []
+      })
+      let result
+      worker.once('message', value => { result = value })
+      worker.once('error', reject)
+      worker.once('exit', code => {
+        if (code || !result || result.error)
+          reject(Object.assign(Error(result?.message ?? 'Backup worker exited'), { code: result?.error ?? 'WORKFLOW_BACKUP_FAILED' }))
+        else resolve(result.result)
+      })
+    })
+  }
+  async function drain(closing) {
+    let result, retries = 0
+    while (backedUp !== db.generation) {
+      const target = db.generation
+      try {
+        result = await capture(closing)
+        backedUp = target
+        retries = 0
+      } catch (error) {
+        if (!retryable(error) || ++retries >= 4) throw error
+        await delay(20 * retries)
+      }
+    }
+    return result
+  }
   const handle = {
     db,
+    binding,
     users: 1,
     backup: () => backupWorkflow(db),
     async backupAtBoundary() {
-      if (current) return current
-      if (backedUp === db.generation) return
-      const target = db.generation
-      current = new Promise((resolve, reject) => {
-        const worker = new Worker(new URL('./workflow-backup-worker.mjs', import.meta.url), {
-          workerData: { directory, binding },
-          execArgv: []
-        })
-        let result
-        worker.once('message', (value) => {
-          result = value
-        })
-        worker.once('error', reject)
-        worker.once('exit', (code) => {
-          if (code || !result || result.error)
-            reject(
-              Object.assign(Error(result?.message ?? 'Backup worker exited'), {
-                code: result?.error ?? 'WORKFLOW_BACKUP_FAILED'
-              })
-            )
-          else {
-            backedUp = target
-            resolve(result.result)
-          }
-        })
-      }).finally(() => {
-        current = null
-      })
-      return current
+      let result
+      while (current || backedUp !== db.generation) {
+        current ??= drain().finally(() => { current = null })
+        result = await current
+      }
+      return result
     },
     async flushBackup() {
-      for (let i = 0; i < 4; i++) {
-        try {
-          await this.backupAtBoundary()
-          if (backedUp === db.generation) return
-        } catch (error) {
-          if (error.code !== 'WORKFLOW_BACKUP_CHECKPOINT_BUSY' || i === 3) throw error
-        }
-        await delay(20 * (i + 1))
+      // A background pass may have used its retries during active graph writes.
+      // Retry under the longer SQLite wait once the caller has drained its work.
+      try { await current } catch (error) { if (!retryable(error)) throw error }
+      while (current || backedUp !== db.generation) {
+        current ??= drain(true).finally(() => { current = null })
+        await current
       }
     },
     close() {
@@ -385,30 +395,11 @@ export function workflowLocation(file) {
     parent = path.dirname(parent)
   }
 }
-function isManagedFile(name) {
-  const [first] = name.split('/')
-  if (!/\.(json|txt)$/.test(name) || /\/(audit-artifacts|audit-frame-sheets)\//.test(name)) return false
-  return (
-    first.startsWith('attempt_') || /^unit-rules-[a-f0-9]{48}\.json$/.test(first) ||
-    [
-      'revisions',
-      'execution-view-v1',
-      'planning-history',
-      'context-material',
-      'planning-rules.json',
-      'suspensions',
-      'directory-snapshots',
-      'blockage',
-      'blockage-control.json',
-      'dynamic-context.json'
-    ].includes(first)
-  )
-}
 function record(file) {
   const entry = workflowLocation(file)
   if (!entry) return
   const info = entry.db.info(entry.name)
-  if (!info && isManagedFile(entry.name) && exists(file)) storageError('WORKFLOW_STORAGE_UNTRACKED_FILE')
+  if (!info && isManagedRecord(entry.name) && exists(file)) storageError('WORKFLOW_STORAGE_UNTRACKED_FILE')
   return info && { ...entry, info }
 }
 export function writeStored(file, bytes, options) {

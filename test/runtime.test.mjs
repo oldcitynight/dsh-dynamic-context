@@ -10,7 +10,8 @@ import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import * as RepeatReminder from '@deepseek-ai/dsh-repeat-tool-reminder'
 import WebRuntime from '@deepseek-ai/dsh-web'
 import { PtcExecutor } from '@deepseek-ai/dsh-tool-executor-ptc'
-import { executeFixtureTool } from '../testing/harness.mjs'
+import { executeFixtureTool, fixtureState } from '../testing/harness.mjs'
+import { readStored, namesStored, statStored } from '../workflow-io.mjs'
 import { createRuntimeHarness, runtimeProposal } from '../testing/runtime-harness.mjs'
 import { startFakeLlama } from '../testing/fake-llama.mjs'
 
@@ -55,8 +56,9 @@ test('an instruction file newly created within a tool batch is checked before th
 })
 function unresolved(h, requests) {
   assert.equal(h.backend.requests.length, requests)
-  assert.equal(h.runner.graph.read().reports.length, 0)
-  assert.ok(h.runner.graph.status().active)
+  const state = fixtureState(h.runner)
+  assert.equal(state.reports.length, 0)
+  assert.ok(state.graph.state.active)
 }
 
 test('direct runtime uses real native file tools with a genuine execution Agent and private HTTP history', async t => {
@@ -646,15 +648,17 @@ test('real shell confinement prevents a write outside its execution workspace', 
 
 test('the private graph ledger cannot be overwritten through the migrated shell', async t => {
   let h, committedBytes
+  const ledger = runner => runner.storage ? runner.storage.db.read('graph/state')
+    : readStored(path.join(runner.config.directory, 'dynamic-context.json'))
   h = await fixture(t, { config: { direct: { durable: true } }, respond: () => {
     const file = path.join(h.runner.config.directory, 'dynamic-context.json')
-    committedBytes = fs.readFileSync(file)
+    committedBytes = ledger(h.runner)
     return tool('bash', { command: `printf forged-ledger > '${file.replaceAll("'", "'\\''")}'`, timeoutMs: 1000 })
   } })
   h.runner.submit(runtimeProposal(['bash']))
   const result = await h.runner.runNext({ expectedRevision: 1, pauseAfterRequests: 1 })
   assert.equal(result.paused, true)
-  assert.deepEqual(fs.readFileSync(path.join(h.runner.config.directory, 'dynamic-context.json')), committedBytes)
+  assert.deepEqual(ledger(h.runner), committedBytes)
   unresolved(h, 1)
 })
 
@@ -818,9 +822,9 @@ test('a large uncompressed tool batch crosses 1 MiB without changing source role
   assert.equal(backend.requests[1].payload.messages.filter(m => m.role === 'user').length, 1)
   assert.equal(result.trace.events.filter(e => e.type === 'history/compacted').length, 0)
   const continuation = path.join(h.runner.config.directory, result.report.attemptId, 'continuation')
-  const files = fs.readdirSync(continuation)
+  const files = namesStored(continuation)
   assert.equal(files.filter(f => /^request-/.test(f)).length, 18)
-  const snapshots = files.filter(f => /^snapshot-/.test(f)).map(f => fs.statSync(path.join(continuation, f)).size)
+  const snapshots = files.filter(f => /^snapshot-/.test(f)).map(f => statStored(path.join(continuation, f)).size)
   assert.ok(Math.max(...snapshots) < 32 * 1024 * 1024)
 })
 

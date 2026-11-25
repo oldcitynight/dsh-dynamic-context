@@ -269,6 +269,7 @@ export async function directRevisionRole(runner, request) {
   }
   if (prior?.inputIndexVersion === 2 && !prior.inputIndex && prior.calls.length) fail('REVISION_ROLE_INDEX_RECEIPT_MISSING')
   if (!prior && indexesRoleInput(role)) record.inputIndexVersion = 2
+  if (!prior) record.materialNavigation = true
   record.contextPolicyVersion = 2
   record.structuredToolErrors ??= !prior
   if (blocked) {
@@ -297,7 +298,7 @@ export async function directRevisionRole(runner, request) {
   const images = record.imageTools && !suppliedTools?.tools.some(row => row.function.name === 'read_image')
     ? workspaceAuditTools({ ...runner, config }, path.join(directory, 'image-reader'), new Map(), signal, { imagesOnly: true, evidenceDirectory: directory }) : null
   const readOnlyTools = (images || suppliedTools) && { tools: [...(suppliedTools?.tools ?? []), ...(images?.tools ?? [])],
-    execute: tool => images && tool.function.name === 'read_image' ? images.execute(tool) : suppliedTools.execute(tool, config) }
+    execute: (tool, ordinal) => images && tool.function.name === 'read_image' ? images.execute(tool, config) : suppliedTools.execute(tool, config, ordinal) }
   const auditArtifacts = record.auditArtifacts ? (images ?? suppliedTools)?.auditArtifacts : undefined
   const persist = () => save(path.join(directory, 'role.json'), record)
   const policy = runner.toolErrorPolicy?.snapshot()
@@ -415,7 +416,7 @@ export async function directRevisionRole(runner, request) {
     record.context = context.snapshot(); persist()
   }
   try {
-    context = createRoleContext({ config, messages, directory, call, signal, role,
+    context = createRoleContext({ config, messages, directory, call, signal, role, materialNavigation: record.materialNavigation === true,
       inspectTool, structuredToolErrors: record.structuredToolErrors,
       contextText: (target, slot, base) => {
         const key = target + '/' + slot
@@ -454,7 +455,7 @@ export async function directRevisionRole(runner, request) {
         const measuredPayload = withUnitCapacityNotice(normalized, payload.response_format ? unitCapacityNotice(previousAt(logicalStep + 1)) : undefined)
         return rolePressureTokens(measuredPayload, await measureInput(runner.inputMeter, await prepareDirectRequest(measuredPayload, config, ctx, signal, { failures: imageFailures }), signal))
       } })
-    let lastRejection, forceCompaction = false, overflowRetries = 0, overflowError, rejectedPayloadHash
+    let lastRejection, lastToolRejection, forceCompaction = false, overflowRetries = 0, overflowError, rejectedPayloadHash
     for (;;) {
       const prepared = await context.prepare({ force: forceCompaction })
       forceCompaction = false
@@ -470,8 +471,16 @@ export async function directRevisionRole(runner, request) {
         forceCompaction = true; persist(); continue
       }
       if (completed.finish === 'tool_calls') {
-        await context.continueRead(completed)
+        const rejections = await context.continueRead(completed)
         persistCurrentContext()
+        const fingerprint = rejections.length ? digest(rejections) : undefined
+        const pausedHere = record.noProgress?.step === logicalStep && record.noProgress.generation === (record.contextGeneration ?? 0)
+        if (fingerprint && fingerprint === lastToolRejection && !replayingDelivered && !pausedHere) {
+          record.noProgress = { step: logicalStep, generation: record.contextGeneration ?? 0 }
+          fail('WORKFLOW_NO_PROGRESS', { reason: 'The role retried the same rejected tool arguments without making progress.',
+            role, rejections: rejections.map(({ tool, code }) => ({ tool, code })) })
+        }
+        lastToolRejection = pausedHere ? undefined : fingerprint
         const submitted = context.submitted()
         if (submitted !== undefined) {
           const receipt = record.calls.findLast(row => (row.logicalStep ?? row.sequence) === logicalStep && (row.contextGeneration ?? 0) === (record.contextGeneration ?? 0))
@@ -492,6 +501,7 @@ export async function directRevisionRole(runner, request) {
         }
         continue
       }
+      lastToolRejection = undefined
       record.response = completed; persist()
       if (completed.finish !== 'stop' || completed.message.tool_calls?.length) fail('REVISION_ROLE_TOOLS_FORBIDDEN')
       const recordedCall = record.calls.findLast(row => (row.logicalStep ?? row.sequence) === logicalStep
@@ -530,7 +540,7 @@ export async function directRevisionRole(runner, request) {
     record.error = error.code ?? error.message
     record.validationFeedback = diagnostic(error, { stage: role })
     if (error.code === 'DIRECT_TOOL_ERROR_BLOCKED') record.toolErrorBlock = error.details
-    record.phase = ['WORKFLOW_PAUSE_REQUESTED', 'WORKFLOW_GUIDANCE_REQUESTED', 'DIRECT_TOOL_ERROR_BLOCKED', 'COMPACTION_THINKING_ONLY_RETRY_EXHAUSTED'].includes(error.code) ? 'PAUSED'
+    record.phase = ['WORKFLOW_PAUSE_REQUESTED', 'WORKFLOW_GUIDANCE_REQUESTED', 'WORKFLOW_NO_PROGRESS', 'DIRECT_TOOL_ERROR_BLOCKED', 'COMPACTION_THINKING_ONLY_RETRY_EXHAUSTED'].includes(error.code) ? 'PAUSED'
       : record.calls.some(call => ['MODEL_PENDING', 'UNKNOWN_NO_REPLAY', 'RESPONSE_RECEIVED'].includes(call.phase)) ? 'UNKNOWN_NO_REPLAY'
       : record.calls.at(-1)?.phase === 'REJECTED' ? 'REJECTED'
       : record.calls.some(call => call.phase === 'COMPLETE') ? 'INVALID_RESPONSE' : 'NOT_SENT'

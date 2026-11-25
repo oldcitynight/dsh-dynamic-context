@@ -9,8 +9,8 @@
     "0.2.2-rc.2"
   ],
   "schema": 1,
-  "updateRound": 0,
+  "updateRound": 1,
   "channel": "latest",
-  "taskgraph": "0.3.2-rc.1",
-  "dynamicContext": "0.1.2-rc.1"
+  "taskgraph": "0.3.2-rc.11",
+  "dynamicContext": "0.1.2-rc.11"
 }

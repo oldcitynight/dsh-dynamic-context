@@ -1148,16 +1148,19 @@ test('unit v2 rebuilds a baseline after plan review, retries rejected drafts and
       baselineReviews++
       if (baselineReviews === 1) return answer({ verdict: 'REJECT', reason: 'Specify the evidence.', issues: [
         { path: '/baseline/after/objective', reason: 'Specify what to inspect.', expected: 'Revised evidence', observed: input.baseline.after.objective }] })
-      unitChange = input.baseline.after
+      if (!input.baseline.key) unitChange = input.baseline.after
+      else assert.equal(input.baseline.key, 'old_end')
       return answer({ verdict: 'APPROVE', reason: 'Revised objective covers the evidence.', issues: [] })
     }
     if (role === 'scope_update') {
       if (!input.approvedUnitBaseline) return answer(enterPlan(input, ['first', 'old_end']))
       const old = input.blueprint.value, plan = enterPlan(input, ['rechecked_end'])
       plan.nodes.unshift(...old.nodes)
-      plan.contextGraph.bindings.unshift(...old.contextGraph.bindings.filter(row => row.task !== old.scope.key))
+      plan.contextGraph.bindings.unshift(...old.contextGraph.bindings.filter(row => row.task !== old.scope.key)
+        .map(row => row.task === 'old_end' ? { ...row, baseline: { ...row.baseline, objective: 'Check the additional child evidence.' } } : row))
       plan.baseline = unitChange
       plan.modifications.push({ ...plan.modifications[0], path: '/contextGraph/bindings/' + old.scope.key })
+      plan.modifications.push({ ...plan.modifications[0], path: '/contextGraph/bindings/old_end' })
       return answer(plan)
     }
     if (role === 'scope_plan' && !planSignal) { planSignal = true; return answer({ verdict: 'REBASELINE' }) }
@@ -1169,7 +1172,7 @@ test('unit v2 rebuilds a baseline after plan review, retries rejected drafts and
   const id = r.graph.read().graph.state.plan.nodes[0].id
   for (let i = 0; i < 5 && !r.graph.read().supervision.finalReport; i++) await next(r)
   assert.equal(rewrite, 2)
-  assert.equal(baselineReviews, 2)
+  assert.equal(baselineReviews, 3)
   assert.deepEqual(r.graph.read().contexts.bindings.find(row => row.taskId === id).baseline, unitChange)
   assert.ok(r.graph.read().supervision.finalReport)
   assert.equal(h.calls.filter(call => call.role === 'scope_audit').length, 2)

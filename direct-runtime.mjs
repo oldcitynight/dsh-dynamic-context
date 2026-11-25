@@ -23,7 +23,7 @@ import { bytes, executionMaterial, materialBundle, materialView, materialLimit }
 import { DynamicContextError, contextText, fail } from './core.mjs'
 import { authorityInputs, inputDigestMatches } from './authority.mjs'
 import { normalizeLegacyStepOrder, recoverNativeToolPairs } from './native-recovery.mjs'
-import { createPrivatePathGuard } from './execution-privacy.mjs'
+import { createPrivatePathGuard, workflowCredentialFiles } from './execution-privacy.mjs'
 import { toolErrorContent } from './tool-error-policy.mjs'
 import { splitImageContent } from './image-content.mjs'
 import { jsonExample } from './format-examples.mjs'
@@ -108,7 +108,8 @@ const jsonTool = (name, description, parameters, execute) => defineTool({ name, 
     render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] }, execute })
 
 /** Real DSH execution identity, with no model loop or default prompt providers. */
-export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader, sharedContext, roleExtensions = [], reportTools = [], runtimeGuidance = text => text, correctionSource = false, allowedTools = config.allowedTools }) {
+export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, sourceAgent, control, record, resumeState, sourceReader, sharedContext, roleExtensions = [], reportTools = [], runtimeGuidance = text => text, correctionSource = false, allowedTools = config.allowedTools,
+  credentialEnvironment = () => [config.direct.apiKeyEnv] }) {
   const options = config.direct.runtime
   if (!options) return undefined
   const nativeArchives = config.direct.compaction?.strategy === 'dsh-native' || Boolean(assembly.unitBaseline || assembly.interruptedWork || assembly.materialSummary)
@@ -227,10 +228,8 @@ export async function prepareDirectRuntime({ ctx, config, assembly, sessionId, s
         || options.modules.includes('shell') && assembly.tools.includes('bash') ? subprocess : undefined,
       workspaceRoot: cwd, protectedRoots: [config.storageRoot ?? root, stateDirectory,
         path.join(config.storageRoot ?? root, '.dsh', 'workflow-witnesses-v1'), ...options.privateReadRoots],
-      credentialFiles: [serviceIdentity(credentials)?.spec?.filename,
-        path.join(resolveDshHome(), '.credentials.yaml'), path.join(instructionHomes.dshHome, '.credentials.yaml'),
-        path.join(root, '.dsh', '.credentials.yaml')].filter(value => typeof value === 'string' && path.isAbsolute(value)),
-      maskRoot: stateDirectory, mode: () => policy.sandboxMode,
+      credentialFiles: workflowCredentialFiles(config, credentials),
+      credentialEnvironment, maskRoot: stateDirectory, mode: () => policy.sandboxMode,
     })
     for (const name of options.modules) {
       if (!nativeModules[name]) continue

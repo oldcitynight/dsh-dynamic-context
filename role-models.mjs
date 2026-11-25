@@ -72,6 +72,10 @@ export class RoleModelRegistry {
       registrations: [...this.#plugins.entries()].sort(([a], [b]) => a < b ? -1 : 1).map(([, entry]) => entry.row),
       inherited: { compaction: 'triggering-role' } })
   }
+  credentialEnvironment() {
+    return [...this.#backends.values(), ...[...this.#defaults.values()].map(row => row.backend),
+      ...[...this.#plugins.values()].map(row => row.choice.backend)].map(row => row.direct?.apiKeyEnv).filter(Boolean)
+  }
 }
 
 const connectionFields = Object.keys(directConnection.shape)

@@ -10,6 +10,34 @@ import { DirectJournal } from '../durable-store.mjs'
 import { restoreWorkflow } from '../workflow-backup.mjs'
 import { openWorkflowStorage } from '../workflow-io.mjs'
 import { monitorHotPath } from '../testing/hot-path-probe.mjs'
+import { boundedSnapshot, readSnapshot } from '../context-budget.mjs'
+import { DatabaseSync } from 'node:sqlite'
+import { setTimeout as delay } from 'node:timers/promises'
+
+test('live reuse honors the storage root and backup includes changes made while the worker is active', async t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-backup-tail-')))
+  const nested = path.join(root, 'nested'), directory = path.join(nested, 'state')
+  fs.mkdirSync(nested)
+  let storage = openWorkflowStorage({ projectRoot: root, directory })
+  t.after(() => { storage?.close(); fs.rmSync(root, { recursive: true, force: true }) })
+  assert.throws(() => openWorkflowStorage({ projectRoot: root, storageRoot: nested, directory }), { code: 'WORKFLOW_STORAGE_IDENTITY_MISMATCH' })
+  const config = { projectRoot: root, directory }
+  const notice = boundedSnapshot({ config }, 'controller', { contents: 'archived fact' }, 'reader', undefined, 1)
+  const lock = new DatabaseSync(storage.db.file)
+  lock.exec('BEGIN IMMEDIATE')
+  const backup = storage.backupAtBoundary()
+  try { await delay(180) } finally { lock.exec('ROLLBACK'); lock.close() }
+  storage.db.put('tail', 'latest durable write')
+  await backup
+  storage.close(); storage = null
+  fs.rmSync(path.join(directory, 'context-material'), { recursive: true })
+  fs.unlinkSync(path.join(directory, 'workflow.sqlite'))
+  restoreWorkflow(path.join(directory, 'recovery'), path.join(directory, 'workflow.sqlite'))
+  assert.ok(fs.statSync(path.join(directory, 'context-material', 'controller')).isDirectory())
+  storage = openWorkflowStorage(config)
+  assert.deepEqual(JSON.parse(readSnapshot({ config }, 'controller', { source: notice.materialSummary.sha256 }).text), { contents: 'archived fact' })
+  assert.equal(storage.db.read('tail').toString(), 'latest durable write')
+})
 
 test('new instance checkpoints a real local tool effect, restarts and resumes once through Direct', async (t) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-sqlite-fake-')))

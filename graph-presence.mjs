@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { digest, copy, GraphError } from 'dsh-better-task-grapth/core'
-import { FileGraphStore } from 'dsh-better-task-grapth/store'
+import { acquireFileLease, FileGraphStore } from 'dsh-better-task-grapth/store'
 
 const fail = (code, presence) => { const error = new GraphError(code); error.presence = presence; throw error }
 export const GRAPH_COMMIT_RECORD = 'plugin:dsh-dynamic-context/graphs-committed-v1'
@@ -135,14 +135,16 @@ export class TrackedGraphStore {
       return { restored:true, revision:restored.revision, activeAttemptPreserved:Boolean(restored.graph.state.active), executionResumed:false }
     })
     this.raw.checkDirectory()
-    try { fs.mkdirSync(this.raw.lock, { mode: 0o700 }) } catch (error) { if (error.code === 'EEXIST') fail('CAS_LOCK_BUSY_NO_AUTOMATIC_STEAL'); throw error }
-    const identity = fs.lstatSync(this.raw.lock), temporary = path.join(this.directory, '.restore-' + randomUUID() + '.tmp')
+    const lease = acquireFileLease(this.raw.lock, { busy: 'CAS_LOCK_BUSY_NO_AUTOMATIC_STEAL',
+      invalid: 'LOCK_OWNERSHIP_CHANGED', unavailable: 'CAS_LOCK_UNAVAILABLE' })
+    const temporary = path.join(this.directory, '.restore-' + randomUUID() + '.tmp')
     let damaged
     try {
       if (this.witness.read()?.checksum !== expectedWitnessChecksum) fail('GRAPH_RECOVERY_WITNESS_CHANGED')
       const fd = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600)
       try { fs.writeFileSync(fd, JSON.stringify(unitSnapshotCodec.encode(witness.committed)) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
       this.raw.checkDirectory()
+      lease.check()
       if (fs.existsSync(this.file)) {
         const stat = fs.lstatSync(this.file)
         if (!stat.isFile() || stat.isSymbolicLink()) fail('GRAPH_RECOVERY_UNSAFE_TARGET')
@@ -154,10 +156,8 @@ export class TrackedGraphStore {
       return { restored: true, revision: restored.revision, activeAttemptPreserved: Boolean(restored.graph.state.active),
         ...(damaged ? { preservedDamagedFile: damaged } : {}), executionResumed: false }
     } finally {
-      if (fs.existsSync(temporary)) fs.unlinkSync(temporary)
-      const current = fs.lstatSync(this.raw.lock)
-      if (current.dev !== identity.dev || current.ino !== identity.ino) fail('LOCK_OWNERSHIP_CHANGED')
-      fs.rmdirSync(this.raw.lock); sync(this.directory)
+      try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary) }
+      finally { lease.release() }
     }
   }
 }

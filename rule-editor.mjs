@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { randomUUID } from 'node:crypto'
 import { canonical, digest, GraphError, normalizePlan } from 'dsh-better-task-grapth/core'
-import { diagnostic } from 'dsh-better-task-grapth/validation'
+import { diagnostic, parseModelJSON } from 'dsh-better-task-grapth/validation'
 import { terminalRuleIssue } from 'dsh-better-task-grapth/hierarchy'
 import { FileGraphStore } from 'dsh-better-task-grapth/store'
 import {
@@ -64,7 +64,9 @@ export class RuleDrafts {
       d.checksum = digest(d)
       const beforeWrite = () => {
         const state = this.runner.graph.read()
-        if (this.layer ? state?.revision !== this.layer.revision || state.supervision.hierarchy?.scopeId !== this.layer.scopeId || state.supervision.hierarchy?.stage !== 'UPDATE' : Boolean(state))
+        const flow = state?.supervision?.hierarchy
+        if (this.layer ? state?.revision !== this.layer.revision || flow?.scopeId !== this.layer.scopeId || flow?.stage !== 'UPDATE'
+          || this.layer.runId && flow.ruleDraftRunId !== this.layer.runId : Boolean(state))
           fail('RULE_GRAPH_ALREADY_COMMITTED', 'The workflow was committed before this draft write.')
         return d
       }
@@ -75,26 +77,45 @@ export class RuleDrafts {
     return this.db ? this.db.transaction(run) : run()
   }
   edit(tool, args, callId) {
+    if (tool === 'read_rules') return this.editIn(this.read(), tool, args, callId)
+    return this.update(doc => this.editIn(doc, tool, args, callId))
+  }
+  editIn(doc, tool, args, callId) {
     if (typeof args.target !== 'string' || !key.test(args.target)) fail('RULE_TARGET', 'Supply a stable node key.')
     if (tool === 'read_rules')
       return output(
-        this.read().targets.find((t) => t.target === args.target) ?? blank(args.target),
+        doc.targets.find((t) => t.target === args.target) ?? blank(args.target),
         args.format ?? 'both'
       )
-    return this.update((doc) => {
-      const target = doc.targets.find((t) => t.target === args.target) ?? blank(args.target)
-      const hash = digest({ tool, args })
-      if (callId && target.last?.id === callId) {
-        if (target.last.hash !== hash) fail('RULE_CALL_CHANGED', 'The same call ID has different arguments.')
-        return target.last.result
+    const index = doc.targets.findIndex(t => t.target === args.target)
+    // A rejected operation can still be recorded without retaining tentative edits.
+    const target = index === -1 ? blank(args.target) : structuredClone(doc.targets[index])
+    const hash = callId && digest({ tool, args })
+    if (callId && target.last?.id === callId) {
+      if (target.last.hash !== hash) fail('RULE_CALL_CHANGED', 'The same call ID has different arguments.')
+      return target.last.result
+    }
+    if (args.expected_revision !== target.revision)
+      fail('RULE_DRAFT_STALE', 'Use the current node draft revision.', { current: target.revision })
+    const result = editTarget(target, tool, args, doc, this.runner.graph?.workflowLimits ?? this.runner.config.workflowLimits)
+    if (index < 0) doc.targets.push(target)
+    else doc.targets[index] = target
+    delete doc.approval
+    delete doc.audit
+    if (callId) target.last = { id: callId, hash, result }
+    return result
+  }
+  executeLayer(call, ordinal, execute) {
+    const key = digest(ordinal ?? call.id), requestHash = digest(call)
+    return this.update(doc => {
+      const receipt = doc.receipts?.[key]
+      if (receipt) {
+        if (receipt.requestHash !== requestHash) fail('RULE_CALL_CHANGED', 'The recorded layer-tool call has different arguments or identity.')
+        return receipt.result
       }
-      if (args.expected_revision !== target.revision)
-        fail('RULE_DRAFT_STALE', 'Use the current node draft revision.', { current: target.revision })
-      const result = editTarget(target, tool, args, doc, this.runner.graph?.workflowLimits ?? this.runner.config.workflowLimits)
-      if (!doc.targets.includes(target)) doc.targets.push(target)
-      delete doc.approval
-      delete doc.audit
-      if (callId) target.last = { id: callId, hash, result }
+      const result = execute(doc)
+      doc.receipts ??= {}
+      doc.receipts[key] = { requestHash, result }
       return result
     })
   }
@@ -366,8 +387,10 @@ export function registerRuleTools(register, runner, layerDrafts) {
         if (layerDrafts) {
           const existing = state.graph.state.plan.nodes.find(node => node.key === args.target)
           if (existing && existing.parent !== layerDrafts.layer.scopeId) fail('RULE_TARGET_OUTSIDE_LAYER', 'Select a direct child of the current unit.')
-          if (tool === 'read_rules' && existing && !layerDrafts.read().targets.some(row => row.target === existing.key))
+          const doc = exec.draft ?? layerDrafts.read()
+          if (tool === 'read_rules' && existing && !doc.targets.some(row => row.target === existing.key))
             return output({ target: existing.key, revision: 0, status: 'committed', rows: existing.rules ?? [] }, args.format)
+          if (exec.draft) return layerDrafts.editIn(doc, tool, args)
           return layerDrafts.edit(tool, args, exec.callId)
         }
         if (state) {
@@ -395,25 +418,34 @@ const editableErrors = new Set([
   'RULE_REOPEN_REQUIRED', 'RULE_ROUTE_UNREACHABLE', 'RULE_SLOT', 'RULE_TARGET', 'RULE_TARGET_OUTSIDE_LAYER',
   'RULE_UNKNOWN_TARGET', 'RULE_UNUSED_PART', 'TERMINAL_AS_PREDECESSOR',
 ])
+function scopeDrafts(runner, state, scopeId) {
+  const runId = state.supervision?.hierarchy?.ruleDraftRunId
+  return new RuleDrafts(runner, { scopeId, revision: state.revision, ...(runId ? { runId } : {}) })
+}
 export function layerRuleTools(runner, state, scopeId) {
-  const drafts = new RuleDrafts(runner, { scopeId, revision: state.revision }), definitions = new Map(), tools = []
+  const drafts = scopeDrafts(runner, state, scopeId), definitions = new Map(), tools = []
   registerRuleTools((name, description, props, execute) => {
     const required = Object.keys(props).filter(key => props[key].required)
     const properties = Object.fromEntries(Object.entries(props).map(([key, { required, ...spec }]) => [key, spec]))
     tools.push({ type: 'function', function: { name, description, parameters: { type: 'object', properties, required, additionalProperties: false } } })
     definitions.set(name, execute)
   }, runner, drafts)
-  return { tools, execute(call) {
-    try {
-      return definitions.get(call.function.name)(JSON.parse(call.function.arguments), { callId: call.id })
-    } catch (error) {
-      if (!editableErrors.has(error.code)) throw error
-      return { error: error.code, diagnostic: diagnostic(error, { tool: call.function.name }) }
+  return { tools, execute(call, ordinal) {
+    const execute = draft => {
+      try {
+        const args = parseModelJSON(call.function.arguments, { path: '/tool_calls/function/arguments' }).value
+        if (!args || typeof args !== 'object' || Array.isArray(args)) fail('RULE_ARGUMENTS', 'Supply an object with the rule tool arguments.')
+        return definitions.get(call.function.name)(args, { callId: call.id, draft })
+      } catch (error) {
+        if (!editableErrors.has(error.code) && error.code !== 'RULE_ARGUMENTS' && !error.code?.startsWith('MODEL_JSON_')) throw error
+        return { error: error.code, diagnostic: diagnostic(error, { tool: call.function.name }) }
+      }
     }
+    return drafts.layer.runId ? drafts.executeLayer(call, ordinal, execute) : execute()
   } }
 }
 export function bindLayerRules(runner, state, scopeId, proposal) {
-  const { targets } = new RuleDrafts(runner, { scopeId, revision: state.revision }).read()
+  const { targets } = scopeDrafts(runner, state, scopeId).read()
   for (const target of targets) {
     const node = proposal.nodes.find(node => node.key === target.target)
     if (!node && target.status === 'confirmed' && !target.rows.length) continue

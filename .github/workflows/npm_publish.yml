@@ -99,6 +99,7 @@ jobs:
         run: |
           registry=https://registry.npmjs.org
           metadata="$(mktemp "$RUNNER_TEMP/npm-version.XXXXXX")"
+          download="$(mktemp "$RUNNER_TEMP/npm-tarball.XXXXXX")"
           read_version() {
             curl --silent --show-error --retry 3 --max-time 30 --header 'Cache-Control: no-cache' \
               --output "$metadata" --write-out '%{http_code}' "$registry/$PACKAGE/$VERSION"
@@ -112,10 +113,15 @@ jobs:
           delay=2
           while (( SECONDS < deadline )); do
             if [[ "$(read_version)" == 200 ]] &&
-              jq -e --arg expected "$INTEGRITY" '.dist.integrity == $expected' "$metadata" >/dev/null &&
+              jq -e --arg expected "$INTEGRITY" \
+                '.dist.integrity == $expected and .dist.attestations.provenance.predicateType == "https://slsa.dev/provenance/v1"' \
+                "$metadata" >/dev/null &&
               curl --fail --silent --show-error --max-time 20 --header 'Cache-Control: no-cache' \
                 "$registry/-/package/$PACKAGE/dist-tags" \
-                | jq -e --arg tag "$CHANNEL" --arg version "$VERSION" '.[$tag] == $version' >/dev/null; then
+                | jq -e --arg tag "$CHANNEL" --arg version "$VERSION" '.[$tag] == $version' >/dev/null &&
+              curl --fail --silent --show-error --max-time 30 --header 'Cache-Control: no-cache' \
+                --output "$download" "$registry/$PACKAGE/-/$PACKAGE-$VERSION.tgz" &&
+              [[ "sha512-$(openssl dgst -sha512 -binary "$download" | openssl base64 -A)" == "$INTEGRITY" ]]; then
               printf '%s@%s verified on npm with tag %s\n' "$PACKAGE" "$VERSION" "$CHANNEL"
               exit 0
             fi

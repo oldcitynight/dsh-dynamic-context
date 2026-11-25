@@ -131,13 +131,14 @@ function inspectResult(runner, state, facts, signal) {
   if (result.outcome !== 'FAILED' && result.failedCallId !== undefined) fail('SUPERVISION_UNEXPECTED_FAILURE_RECEIPT', { path: '/failedCallId', reason: 'failedCallId is only valid for the FAILED outcome.', observed: result.outcome })
   return inspected ?? { submission: { ...result, artifacts }, artifactContents: attached.map(({ source, text }) => ({ source, text })) }
 }
-function returned(runner, state, feedback, route = 'REPORT') {
+function returned(runner, state, feedback, route = 'REPORT', requiresPlanReview = false) {
   const control = state.supervision
   const rework = acceptanceEnabled(state) && route !== 'REPORT'
   const next = runner.graph.updateSupervision(state, { phase: rework ? 'REWORK_RESULT' : 'REPAIR_RESULT', outcomes: control.outcomes, pending: control.pending, feedback,
     ...(rework ? { correction: { id: 'correction_' + randomUUID(), route, previousReport: control.pending.report } } : {}) })
   runner.publish('result-returned')
-  return summary(runner, next, 'RESULT_RETURNED', { feedback })
+  return summary(runner, next, 'RESULT_RETURNED', { feedback,
+    ...(state.unitRoleVersion && (route === 'PLAN' || requiresPlanReview) ? { paused: true, reason: 'WORKFLOW_PLAN_REVIEW_REQUIRED' } : {}) })
 }
 
 async function supervisedRole(runner, state, role, instruction, input, schema, signal) {
@@ -180,7 +181,9 @@ async function checkResult(runner, state, sourceAgent, signal, admittedFacts) {
   try { inspected = inspectResult(runner, state, facts, signal) }
   catch (error) {
     signal.throwIfAborted()
-    return returned(runner, state, feedbackText(error, { stage: 'result-program-check' }))
+    const missingPlanEvidence = error.code === 'RULE_FAILED_EVIDENCE_REQUIRED' &&
+      state.contexts.bindings.find(binding => binding.taskId === report.taskId)?.tools.length === 0
+    return returned(runner, state, feedbackText(error, { stage: 'result-program-check' }), 'REPORT', missingPlanEvidence)
   }
   const result = inspected.submission
   const { execution, ...local } = leafRequest(runner, state, facts)

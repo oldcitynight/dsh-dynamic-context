@@ -163,6 +163,9 @@ function checkCriteriaDraft(state, raw, previous, scopeId) {
 
 /** Validate the one durable document holding both graphs and committed reports. */
 export function validateState(value) {
+  return validateStateDocument(value)
+}
+function validateStateDocument(value, cache) {
   const state = stateSchema.parse(value), { checksum, ...body } = state
   if (digest(body) !== checksum) fail('DYNAMIC_CONTEXT_CHECKSUM')
   validateDocument(state.graph)
@@ -171,8 +174,14 @@ export function validateState(value) {
     fail('UNIT_ROLES_REQUIRE_AUDITED_HIERARCHY')
   if (state.revision !== state.graph.revision) fail('GRAPH_REVISION_MISMATCH')
   checkContexts(state.contexts, state.graph)
+  const verifiedHistory = cache && new Set()
   for (const historical of state.contextHistory ?? []) {
-    validateDocument(historical.graph); checkContexts(historical.contexts, historical.graph)
+    const fingerprint = cache && digest(historical)
+    if (!cache?.history.has(fingerprint)) {
+      validateDocument(historical.graph)
+      checkContexts(historical.contexts, historical.graph)
+    }
+    verifiedHistory?.add(fingerprint)
   }
   const allNodes = new Map([...(state.contextHistory ?? []).flatMap(row => row.contexts.nodes), ...state.contexts.nodes].map(node => [node.id, node]))
   const historyNodes = new Map()
@@ -231,6 +240,7 @@ export function validateState(value) {
   }
   if (!unique((state.reportArchive ?? []).map(report => report.attemptId))) fail('REWORK_ARCHIVE_DUPLICATE')
   validateSupervision(state)
+  if (cache) cache.history = verifiedHistory
   return state
 }
 
@@ -381,8 +391,9 @@ export class DynamicContextGraph {
     this.supervisionEnabled = Boolean(supervision)
     this.reportScoped = supervisionContext === 'reports'
     this.owner = `owner_${randomUUID()}`
+    const verified = { history: new Set() }
     this.store = new TrackedGraphStore({ projectRoot: storageRoot, directory, fileName: 'dynamic-context.json',
-      validator: validateState, updateValidator: checkUpdate }, storeFactory)
+      validator: value => validateStateDocument(value, verified), updateValidator: checkUpdate }, storeFactory)
   }
   read(inspection) {
     const state = this.store.read(inspection)

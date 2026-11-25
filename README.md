@@ -8,7 +8,7 @@
 <!-- Generated from package.json and DSH-COMPATIBILITY.json. -->
 ## 选择与 DSH 配套的构建
 
-本包 `dsh-dynamic-context@0.1.2-rc.5` 的目标标签为 `dsh-0.2.1-alpha.4`。本线支持的 DSH 精确版本为 `0.2.1-alpha.4`、`0.2.1-alpha.3`。插件 Node.js 要求为 `^22.19.0 || >=24.0.0`，还须满足所选 DSH 本身的 Node.js 要求。
+本包 `dsh-dynamic-context@0.1.2-rc.15` 的目标标签为 `dsh-0.2.1-alpha.4`。本线支持的 DSH 精确版本为 `0.2.1-alpha.4`、`0.2.1-alpha.3`。插件 Node.js 要求为 `^22.19.0 || >=24.0.0`，还须满足所选 DSH 本身的 Node.js 要求。
 
 插件的 `latest` 跟随官方 DSH 的 `latest`，插件的 `next` 跟随官方 DSH 的 `alpha`。两个插件须使用同一行的 RC 后缀。npm 标签可移动，安装前先运行 `dsh --version`。[本构建兼容清单](DSH-COMPATIBILITY.json)
 
@@ -20,8 +20,8 @@
 
 ```sh
 dsh --profile task-context --from-default-profile web --dump-config
-dsh plugin --profile task-context add "$PWD/dsh-better-task-grapth-0.3.2-rc.5.tgz"
-dsh plugin --profile task-context add "$PWD/dsh-dynamic-context-0.1.2-rc.5.tgz"
+dsh plugin --profile task-context add "$PWD/dsh-better-task-grapth-0.3.2-rc.15.tgz"
+dsh plugin --profile task-context add "$PWD/dsh-dynamic-context-0.1.2-rc.15.tgz"
 dsh --profile task-context web
 ```
 
@@ -32,14 +32,14 @@ dsh --profile task-context web
 下面的查询会访问公共登记库。只有两包所需版本均已公开（独立安装只需基础包）时才运行安装。若查询返回 E404，使用上一节的本地包。
 
 ```sh
-npm view --registry=https://registry.npmjs.org/ dsh-better-task-grapth@0.3.2-rc.5 version && npm view --registry=https://registry.npmjs.org/ dsh-dynamic-context@0.1.2-rc.5 version &&
-dsh plugin --profile task-context add dsh-better-task-grapth@0.3.2-rc.5 &&
-dsh plugin --profile task-context add dsh-dynamic-context@0.1.2-rc.5
+npm view --registry=https://registry.npmjs.org/ dsh-better-task-grapth@0.3.2-rc.15 version && npm view --registry=https://registry.npmjs.org/ dsh-dynamic-context@0.1.2-rc.15 version &&
+dsh plugin --profile task-context add dsh-better-task-grapth@0.3.2-rc.15 &&
+dsh plugin --profile task-context add dsh-dynamic-context@0.1.2-rc.15
 ```
 
 ### 从对应版本的源码构建
 
-在该维护线源码目录内运行下列命令。配套任务图尚未进入公共登记库时，构建动态上下文前先用 `npm cache add ./dsh-better-task-grapth-0.3.2-rc.5.tgz` 缓存同批基础包。
+在该维护线源码目录内运行下列命令。配套任务图尚未进入公共登记库时，构建动态上下文前先用 `npm cache add ./dsh-better-task-grapth-0.3.2-rc.15.tgz` 缓存同批基础包。
 
 ```sh
 npm ci --prefer-offline
@@ -48,7 +48,7 @@ TMPDIR="$PWD/.test-tmp" npm test
 npm run pack:bundle
 ```
 
-产物为 `dist/dsh-dynamic-context-0.1.2-rc.5.tgz`。打开包内 [HTML 运行图谱](docs/UNIT_WORKFLOW_20261123.html) 可离线查阅流程、角色原文和联动指南。
+产物为 `dist/dsh-dynamic-context-0.1.2-rc.15.tgz`。打开包内 [HTML 运行图谱](docs/UNIT_WORKFLOW_20261123.html) 可离线查阅流程、角色原文和联动指南。
 <!-- dsh-install:end -->
 
 ## 从用户目标到最终报告

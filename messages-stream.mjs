@@ -73,8 +73,7 @@ export async function readMessages(response, { signal, model, direct, maxRespons
           block.id = string(value.id); block.name = string(value.name); block.input = object(value.input); block.json = ''
           block.toolIndex = [...blocks.values()].filter(row => row.type === 'tool_use').length
           if (!block.id || block.id.length > 128 || !/^[a-zA-Z0-9_-]{1,128}$/.test(block.name)
-              || [...blocks.values()].some(row => row.id === block.id)
-              || maxResponseBytes !== null && block.toolIndex >= 16) fail('DIRECT_INVALID_TOOL_CALL')
+              || [...blocks.values()].some(row => row.id === block.id)) fail('DIRECT_INVALID_TOOL_CALL')
           emit({ text: '', reasoning: '', tools: [{ index: block.toolIndex, id: block.id, type: 'function', function: { name: block.name, arguments: '' } }] })
         }
         blocks.set(event.index, block)
@@ -90,7 +89,6 @@ export async function readMessages(response, { signal, model, direct, maxRespons
           } else if (delta.type === 'signature_delta' && block.type === 'thinking') block.signature = (block.signature ?? '') + string(delta.signature)
           else if (delta.type === 'input_json_delta' && block.type === 'tool_use') {
             const part = string(delta.partial_json); block.json += part
-            if (maxResponseBytes !== null && block.json.length > 32768) fail('DIRECT_TOOL_FRAGMENT_LIMIT')
             emit({ text: '', reasoning: '', tools: [{ index: block.toolIndex, id: block.id, function: { arguments: part } }] })
           } else invalid('Delta does not match its block type')
         } else invalid('Unknown content event')

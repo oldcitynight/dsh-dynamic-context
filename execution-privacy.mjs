@@ -4,21 +4,49 @@ import path from 'node:path'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawnSync } from 'node:child_process'
 import { symbols } from '@deepseek-ai/cordis'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { fail } from './core.mjs'
 
 const active = new AsyncLocalStorage(), installations = new WeakMap()
 const inside = (root, value) => { const p = path.relative(root, value); return p === '' || p !== '..' && !p.startsWith('..' + path.sep) && !path.isAbsolute(p) }
 const original = value => value?.[symbols.original] ?? value
 const signature = stat => ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].map(k => String(stat[k])).join(':')
-function canonicalLocation(value) {
+function canonicalLocation(value, exists = fs.existsSync) {
   let current = path.resolve(value)
   const missing = []
-  while (!fs.existsSync(current)) {
+  while (!exists(current)) {
     const parent = path.dirname(current)
     if (parent === current) fail('DIRECT_PRIVATE_PATH_INVALID_TARGET')
     missing.unshift(path.basename(current)); current = parent
   }
   return path.join(fs.realpathSync(current), ...missing)
+}
+
+export function workflowCredentialFiles(config, credentials) {
+  const homes = [resolveDshHome(), config.direct?.runtime?.instructionHomes?.dshHome, path.join(config.projectRoot, '.dsh')]
+  return [original(credentials)?.spec?.filename, ...homes.filter(Boolean).map(home => path.join(home, '.credentials.yaml'))]
+    .filter(file => typeof file === 'string' && path.isAbsolute(file))
+}
+
+export function roleWorkspacePathResolver(config, credentials) {
+  const project = fs.realpathSync(config.projectRoot), runtime = config.direct?.runtime
+  const requestedCwd = path.resolve(project, runtime?.cwd ?? '.')
+  if (!inside(project, requestedCwd)) fail('DIRECT_RUNTIME_PATH_OUTSIDE_WORKSPACE')
+  const cwd = fs.realpathSync(requestedCwd)
+  if (!inside(project, cwd) || !fs.statSync(cwd).isDirectory()) fail('DIRECT_RUNTIME_PATH_OUTSIDE_WORKSPACE')
+  const storage = config.storageRoot ?? project
+  const privateRoots = [config.directory, path.join(storage, '.dsh', 'workflow-witnesses-v1'),
+    ...(runtime?.privateReadRoots ?? []), ...(canonicalLocation(storage) === project ? [] : [storage])]
+    .filter(Boolean).flatMap(root => [path.resolve(root), canonicalLocation(root)]).filter(root => inside(project, root))
+  const credentialsGuard = createPrivatePathGuard({ workspaceRoot: project, protectedRoots: [], credentialFiles: workflowCredentialFiles(config, credentials) })
+  return requested => {
+    const target = path.resolve(project, requested)
+    if (![requestedCwd, cwd].some(root => inside(root, target))) fail('DIRECT_RUNTIME_PATH_OUTSIDE_WORKSPACE')
+    const resolved = credentialsGuard.assertPath(target)
+    if (!inside(cwd, resolved)) fail('DIRECT_RUNTIME_PATH_OUTSIDE_WORKSPACE')
+    if (privateRoots.some(root => inside(root, target) || inside(root, resolved))) fail('DIRECT_RUNTIME_PRIVATE_PATH_DENIED')
+    return resolved
+  }
 }
 const runner = '/usr/bin/bwrap'
 let verifiedRunner
@@ -62,7 +90,8 @@ function hook(service, method, transform) {
 }
 
 /** Per-tool private mounts. Native write confinement remains an independent layer. */
-export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, protectedRoots, credentialFiles = [], maskRoot, mode = 'workspace-write' }) {
+export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, protectedRoots, credentialFiles = [],
+  credentialEnvironment = () => [], maskRoot, mode = 'workspace-write' }) {
   const processIsolation = Boolean(sandbox || subprocess)
   const runnerIdentity = processIsolation ? ensureRunner() : null, workspace = fs.realpathSync(workspaceRoot)
   const directories = [...new Set(protectedRoots.map(p => fs.realpathSync(p)))].sort((a, b) => a.length - b.length)
@@ -75,7 +104,7 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
   const refresh = () => {
     files = [...new Set(credentialLocations.filter(p => fs.existsSync(p)).map(p => fs.realpathSync(p)))]
     if (files.some(p => { const s = fs.statSync(p); return !s.isFile() || s.nlink !== 1 })) fail('DIRECT_PRIVATE_CREDENTIAL_PATH_INVALID')
-    locations = [...new Set([...credentialLocations.map(canonicalLocation), ...files])]
+    locations = [...new Set([...credentialLocations.map(file => canonicalLocation(file)), ...files])]
     credentialParents = [...new Set(locations.map(path.dirname))].filter(p => fs.existsSync(p) && !privateTarget(p)).sort((a, b) => a.length - b.length)
     // Rebuilding an ancestor of the project would change ordinary project writes.
     // Keep custom credential stores in a dedicated directory, as the SDK does.
@@ -97,7 +126,7 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
   }
   let closed = false
   const services = new Set([original(sandbox), original(subprocess)].filter(Boolean)), disposers = []
-  const scope = { services, check() {
+  const scope = { services, excludedEnvironment: () => new Set(credentialEnvironment().filter(Boolean)), check() {
     if (closed) fail('DIRECT_PRIVATE_PATH_GUARD_CLOSED')
     for (const [directory, dev, ino] of directoryPins) {
       const st = fs.statSync(directory)
@@ -110,7 +139,7 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
     }
     refresh()
     for (const h of disposers) h.check()
-  }, wrap(argv, effectiveMode = typeof mode === 'function' ? mode() : mode) {
+  }, wrap(argv, effectiveMode = typeof mode === 'function' ? mode() : mode, excluded = scope.excludedEnvironment()) {
     if (!Array.isArray(argv) || !argv.length) fail('DIRECT_PRIVATE_PATH_ARGV_INVALID')
     const nativeBwrap = path.basename(argv[0]) === 'bwrap'
     const boundary = nativeBwrap ? argv.indexOf('--') : -1
@@ -149,20 +178,27 @@ export function createPrivatePathGuard({ sandbox, subprocess, workspaceRoot, pro
       args.push('--remount-ro', parent)
     }
     for (const root of directories) args.push('--remount-ro', root)
+    for (const name of excluded) args.push('--unsetenv', name)
     return [...args, '--', ...(nativeBwrap ? argv.slice(boundary + 1) : argv)]
   } }
   try {
     if (sandbox) disposers.push(hook(sandbox, 'confine', (previous, receiver, args, scope) => Promise.resolve(Reflect.apply(previous, receiver, args))
       .then(value => ({ ...value, argv: scope.wrap(value.argv, args[1].mode) }))))
-    if (subprocess) disposers.push(hook(subprocess, 'spawn', (previous, receiver, [spec], scope) => Reflect.apply(previous, receiver, [{ ...spec, argv: scope.wrap([...spec.argv]) }])))
+    if (subprocess) disposers.push(hook(subprocess, 'spawn', (previous, receiver, [spec], scope) => {
+      const excluded = scope.excludedEnvironment()
+      const env = spec.env && Object.fromEntries(Object.entries(spec.env).filter(([name]) => !excluded.has(name)))
+      return Reflect.apply(previous, receiver, [{ ...spec, ...(env ? { env } : {}), argv: scope.wrap([...spec.argv], undefined, excluded) }])
+    }))
     return { facts: { kind: 'host-private-paths-v1', processIsolation, protectedRoots: directories, credentialFiles: credentialLocations,
       credentialParentPolicy: 'read-only-snapshot-without-credential-family', workspaceRoot: workspace },
       check: () => scope.check(), run: fn => active.run(scope, fn),
       assertPath(requested) {
         if (typeof requested !== 'string') fail('DIRECT_PRIVATE_PATH_INVALID_TARGET')
         scope.check()
-        const target = path.resolve(workspace, requested), resolved = canonicalLocation(target)
+        const target = path.resolve(workspace, requested)
+        const resolved = canonicalLocation(target, file => fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined)
         if (credentialTarget(target) || credentialTarget(resolved) || privateTarget(resolved)) fail('DIRECT_RUNTIME_PRIVATE_PATH_DENIED')
+        return resolved
       },
       close() {
         if (closed) return

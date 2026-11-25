@@ -11,6 +11,7 @@ jobs:
   publish:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: npm-publish-${{ github.ref_name }}
       cancel-in-progress: false
@@ -107,8 +108,9 @@ jobs:
             404) npm publish "$BUNDLE" --registry "$registry/" --access public --tag "$CHANNEL" --ignore-scripts --provenance ;;
             *) exit 1 ;;
           esac
-          for delay in 0 2 4 8 16 30; do
-            sleep "$delay"
+          deadline=$((SECONDS + 600))
+          delay=2
+          while (( SECONDS < deadline )); do
             if [[ "$(read_version)" == 200 ]] &&
               jq -e --arg expected "$INTEGRITY" '.dist.integrity == $expected' "$metadata" >/dev/null &&
               curl --fail --silent --show-error --max-time 20 --header 'Cache-Control: no-cache' \
@@ -117,5 +119,10 @@ jobs:
               printf '%s@%s verified on npm with tag %s\n' "$PACKAGE" "$VERSION" "$CHANNEL"
               exit 0
             fi
+            sleep "$delay"
+            if (( delay < 30 )); then
+              delay=$((delay * 2))
+            fi
           done
+          printf '::error::npm did not expose %s@%s with tag %s within ten minutes. Re-run to verify the same version.\n' "$PACKAGE" "$VERSION" "$CHANNEL"
           exit 1
